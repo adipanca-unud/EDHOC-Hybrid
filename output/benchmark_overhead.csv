@@ -1,0 +1,5 @@
+type,role,cpu_time_us,memory_bytes,memory_note
+Type0_SigSig,Initiator,29497.126,5596,estimated_stack_heap
+Type0_SigSig,Responder,28767.727,5596,estimated_stack_heap
+Type3_MACMAC,Initiator,20214.628,5084,estimated_stack_heap
+Type3_MACMAC,Responder,20710.854,5084,estimated_stack_heap

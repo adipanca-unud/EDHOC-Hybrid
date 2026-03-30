@@ -23,6 +23,7 @@
  *   ./build/edhoc_hybrid       # Interactive menu
  *   ./build/edhoc_hybrid 1     # Run Type 0 (Sig-Sig) directly
  *   ./build/edhoc_hybrid 2     # Run Type 3 (MAC-MAC) directly
+ *   ./build/edhoc_hybrid 3     # Run Benchmark (Type 0 + Type 3)
  */
 
 #include <stdio.h>
@@ -32,6 +33,7 @@
 #include "edhoc_common.h"
 #include "edhoc_type0_classic.h"
 #include "edhoc_type3_classic.h"
+#include "edhoc_benchmark.h"
 
 static void print_banner(void)
 {
@@ -60,6 +62,11 @@ static void print_menu(void)
 	printf("      %sMethod 3 | Suite 0 | X25519 (Static DH + MAC)%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
+	printf("  %s[3]%s Benchmark (Type 0 + Type 3)\n",
+	       CLR_GREEN, CLR_RESET);
+	printf("      %sMeasure operations, overhead, handshake → 3 CSV files%s\n",
+	       CLR_CYAN, CLR_RESET);
+	printf("\n");
 	printf("  %s[0]%s Exit\n", CLR_RED, CLR_RESET);
 	printf("\n");
 	printf("  %s> Choice: %s", CLR_BOLD, CLR_RESET);
@@ -86,7 +93,7 @@ int main(int argc, char *argv[])
 				while ((c = getchar()) != '\n' && c != EOF)
 					;
 				printf("\n");
-				print_error("Invalid input. Please enter 0, 1, or 2.");
+				print_error("Invalid input. Please enter 0, 1, 2, or 3.");
 				choice = -1;
 				continue;
 			}
@@ -113,9 +120,16 @@ int main(int argc, char *argv[])
 			}
 			break;
 
+		case 3:
+			result = run_edhoc_benchmark();
+			if (result != 0) {
+				print_error("Benchmark failed!");
+			}
+			break;
+
 		default:
 			printf("\n");
-			print_error("Invalid choice. Please enter 0, 1, or 2.");
+			print_error("Invalid choice. Please enter 0, 1, 2, or 3.");
 			break;
 		}
 

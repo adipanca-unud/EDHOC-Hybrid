@@ -23,6 +23,7 @@ APP_SRCS  = $(SRC_DIR)/main.c
 APP_SRCS += $(SRC_DIR)/edhoc_common.c
 APP_SRCS += $(SRC_DIR)/edhoc_type0_classic.c
 APP_SRCS += $(SRC_DIR)/edhoc_type3_classic.c
+APP_SRCS += $(SRC_DIR)/edhoc_benchmark.c
 
 TV_SRCS = $(TV_DIR)/edhoc_test_vectors_rfc9529.c
 
@@ -124,6 +125,7 @@ run: all
 clean:
 	rm -f $(BUILD_DIR)/main.o $(BUILD_DIR)/edhoc_common.o
 	rm -f $(BUILD_DIR)/edhoc_type0_classic.o $(BUILD_DIR)/edhoc_type3_classic.o
+	rm -f $(BUILD_DIR)/edhoc_benchmark.o
 	rm -f $(BUILD_DIR)/tv_*.o $(TARGET)
 
 lib-clean:

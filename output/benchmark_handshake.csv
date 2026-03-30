@@ -1,0 +1,5 @@
+type,role,processing_us,txrx_us,precomputation_us,total_us
+Type0_SigSig,Initiator,23452.780,13514.150,6033.215,43000.145
+Type0_SigSig,Responder,22629.582,29601.881,6131.257,58362.720
+Type3_MACMAC,Initiator,15547.486,14055.742,6049.591,35652.818
+Type3_MACMAC,Responder,15509.371,22304.879,5930.133,43744.384
