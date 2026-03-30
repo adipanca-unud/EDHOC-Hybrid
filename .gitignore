@@ -1,0 +1,12 @@
+# Build output
+build/
+
+# Object files
+*.o
+*.a
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/

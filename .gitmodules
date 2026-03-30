@@ -1,0 +1,3 @@
+[submodule "lib/uoscore-uedhoc"]
+	path = lib/uoscore-uedhoc
+	url = https://github.com/eriptic/uoscore-uedhoc.git
