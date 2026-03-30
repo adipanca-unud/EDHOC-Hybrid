@@ -65,4 +65,17 @@
  */
 int run_edhoc_benchmark(void);
 
+/**
+ * @brief Menjalankan benchmark lengkap: Classic + PQ (4 varian).
+ *
+ * Mengukur semua 4 varian EDHOC:
+ *   - Type 0 Classic (Sig-Sig)
+ *   - Type 3 Classic (MAC-MAC)
+ *   - Type 0 PQ (KEM-based Sig-Sig, ML-KEM-768)
+ *   - Type 3 PQ (KEM-based MAC-MAC, ML-KEM-768)
+ *
+ * @return 0 jika sukses, -1 jika gagal
+ */
+int run_edhoc_benchmark_full(void);
+
 #endif /* EDHOC_BENCHMARK_H */

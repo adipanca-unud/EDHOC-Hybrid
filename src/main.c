@@ -33,6 +33,8 @@
 #include "edhoc_common.h"
 #include "edhoc_type0_classic.h"
 #include "edhoc_type3_classic.h"
+#include "edhoc_type0_pq.h"
+#include "edhoc_type3_pq.h"
 #include "edhoc_benchmark.h"
 
 static void print_banner(void)
@@ -62,9 +64,24 @@ static void print_menu(void)
 	printf("      %sMethod 3 | Suite 0 | X25519 (Static DH + MAC)%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
-	printf("  %s[3]%s Benchmark (Type 0 + Type 3)\n",
+	printf("  %s[3]%s Benchmark Classic (Type 0 + Type 3)\n",
 	       CLR_GREEN, CLR_RESET);
 	printf("      %sMeasure operations, overhead, handshake → 3 CSV files%s\n",
+	       CLR_CYAN, CLR_RESET);
+	printf("\n");
+	printf("  %s[4]%s EDHOC Type 0 PQ - KEM-based Sig-Sig (ML-KEM-768)\n",
+	       CLR_GREEN, CLR_RESET);
+	printf("      %sPost-Quantum | ML-KEM-768 | KEM Encaps/Decaps + MAC%s\n",
+	       CLR_CYAN, CLR_RESET);
+	printf("\n");
+	printf("  %s[5]%s EDHOC Type 3 PQ - KEM-based MAC-MAC (ML-KEM-768)\n",
+	       CLR_GREEN, CLR_RESET);
+	printf("      %sPost-Quantum | ML-KEM-768 | KEM Encaps/Decaps + MAC%s\n",
+	       CLR_CYAN, CLR_RESET);
+	printf("\n");
+	printf("  %s[6]%s Full Benchmark (Classic + PQ)\n",
+	       CLR_GREEN, CLR_RESET);
+	printf("      %sAll 4 variants → 3 CSV files (operations, overhead, handshake)%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
 	printf("  %s[0]%s Exit\n", CLR_RED, CLR_RESET);
@@ -93,7 +110,7 @@ int main(int argc, char *argv[])
 				while ((c = getchar()) != '\n' && c != EOF)
 					;
 				printf("\n");
-				print_error("Invalid input. Please enter 0, 1, 2, or 3.");
+				print_error("Invalid input. Please enter 0-6.");
 				choice = -1;
 				continue;
 			}
@@ -127,9 +144,30 @@ int main(int argc, char *argv[])
 			}
 			break;
 
+		case 4:
+			result = run_edhoc_type0_pq();
+			if (result != 0) {
+				print_error("Type 0 PQ (KEM Sig-Sig) failed!");
+			}
+			break;
+
+		case 5:
+			result = run_edhoc_type3_pq();
+			if (result != 0) {
+				print_error("Type 3 PQ (KEM MAC-MAC) failed!");
+			}
+			break;
+
+		case 6:
+			result = run_edhoc_benchmark_full();
+			if (result != 0) {
+				print_error("Full Benchmark (Classic + PQ) failed!");
+			}
+			break;
+
 		default:
 			printf("\n");
-			print_error("Invalid choice. Please enter 0, 1, 2, or 3.");
+			print_error("Invalid choice. Please enter 0-6.");
 			break;
 		}
 

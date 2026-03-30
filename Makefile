@@ -18,12 +18,19 @@ EXT_DIR     = $(LIB_DIR)/externals
 
 TARGET = $(BUILD_DIR)/edhoc_hybrid
 
+# liboqs directory
+LIBOQS_DIR  = $(PROJ_DIR)/lib/liboqs
+LIBOQS_BUILD = $(LIBOQS_DIR)/build
+
 # Source files
 APP_SRCS  = $(SRC_DIR)/main.c
 APP_SRCS += $(SRC_DIR)/edhoc_common.c
 APP_SRCS += $(SRC_DIR)/edhoc_type0_classic.c
 APP_SRCS += $(SRC_DIR)/edhoc_type3_classic.c
 APP_SRCS += $(SRC_DIR)/edhoc_benchmark.c
+APP_SRCS += $(SRC_DIR)/edhoc_pq_kem.c
+APP_SRCS += $(SRC_DIR)/edhoc_type0_pq.c
+APP_SRCS += $(SRC_DIR)/edhoc_type3_pq.c
 
 TV_SRCS = $(TV_DIR)/edhoc_test_vectors_rfc9529.c
 
@@ -63,6 +70,7 @@ C_INCLUDES += -I$(EXT_DIR)/mbedtls/include
 C_INCLUDES += -I$(EXT_DIR)/mbedtls/include/mbedtls
 C_INCLUDES += -I$(EXT_DIR)/mbedtls/include/psa
 C_INCLUDES += -I$(EXT_DIR)/zcbor/include
+C_INCLUDES += -I$(LIBOQS_BUILD)/include
 
 CFLAGS  = -std=c11 -g3 -O0
 CFLAGS += -DUNIT_TEST -DZCBOR -DZCBOR_CANONICAL -DOSCORE_NVM_SUPPORT
@@ -74,7 +82,7 @@ CFLAGS += -DSUITES_I_SIZE=1
 CFLAGS += -Wno-unused-parameter -Wno-sign-conversion -Wno-conversion
 CFLAGS += -Wno-cast-qual -Wno-missing-field-initializers -Wno-pointer-arith
 
-LDFLAGS  = -L$(LIB_BUILD) -luoscore-uedhoc -lpthread -lm
+LDFLAGS  = -L$(LIB_BUILD) -luoscore-uedhoc -L$(LIBOQS_BUILD)/lib -loqs -lpthread -lm
 
 .PHONY: all clean lib lib-clean run help
 
@@ -126,6 +134,7 @@ clean:
 	rm -f $(BUILD_DIR)/main.o $(BUILD_DIR)/edhoc_common.o
 	rm -f $(BUILD_DIR)/edhoc_type0_classic.o $(BUILD_DIR)/edhoc_type3_classic.o
 	rm -f $(BUILD_DIR)/edhoc_benchmark.o
+	rm -f $(BUILD_DIR)/edhoc_pq_kem.o $(BUILD_DIR)/edhoc_type0_pq.o $(BUILD_DIR)/edhoc_type3_pq.o
 	rm -f $(BUILD_DIR)/tv_*.o $(TARGET)
 
 lib-clean:
