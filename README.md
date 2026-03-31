@@ -1,140 +1,129 @@
-# EDHOC-Hybrid: EDHOC Protocol Implementation (RFC 9528)
+# EDHOC-Hybrid (RFC 9528)
 
-Implementation of the EDHOC (Ephemeral Diffie-Hellman Over COSE) protocol
-according to [RFC 9528](https://www.rfc-editor.org/rfc/rfc9528) using the
-[uoscore-uedhoc](https://github.com/eriptic/uoscore-uedhoc) library.
+Hybrid EDHOC implementation (classic + post-quantum) built on top of
+[uoscore-uedhoc](https://github.com/eriptic/uoscore-uedhoc). Classic paths use
+libsodium for X25519/Ed25519/HKDF-SHA256; PQ paths use PQClean (ML-KEM-768 &
+ML-DSA-65) with mbedTLS AES-CCM for symmetric encryption.
 
-## Supported EDHOC Types
+## Variants & Crypto Stacks
 
-| Type | Name | Method | Initiator Auth | Responder Auth | Suite | Curve |
-|------|------|--------|---------------|---------------|-------|-------|
-| 0 | Signature-Signature (Classic) | INITIATOR_SK_RESPONDER_SK | Signature Key | Signature Key | Suite 0 | X25519 + EdDSA |
-| 3 | MAC-MAC (Classic) | INITIATOR_SDHK_RESPONDER_SDHK | Static DH Key | Static DH Key | Suite 0 | X25519 (Static DH + MAC) |
+| Menu | Variant | Key Agreement / Auth | Sign / MAC | HKDF & Hash | AEAD |
+|------|---------|----------------------|------------|-------------|------|
+| 1 | Type 0 Classic (Sig-Sig) | X25519 (ephemeral) | Ed25519 | HKDF-HMAC-SHA256 (libsodium) | AES-CCM-16-64-128 (mbedTLS) |
+| 2 | Type 3 Classic (MAC-MAC) | X25519 (static DH for MAC) | HMAC/X25519 | HKDF-HMAC-SHA256 (libsodium) | AES-CCM-16-64-128 (mbedTLS) |
+| 4 | Type 0 PQ (KEM Sig-like) | ML-KEM-768 (PQClean) + long-term KEM auth | ML-DSA-65 (PQClean) | HKDF-HMAC-SHA256 (libsodium) / SHA-256 | AES-CCM-16-64-128 (mbedTLS) |
+| 5 | Type 3 PQ (KEM MAC-MAC) | ML-KEM-768 (PQClean) | MAC with KEM-derived keys | HKDF-HMAC-SHA256 (libsodium) / SHA-256 | AES-CCM-16-64-128 (mbedTLS) |
+
+Menu **3** runs classic benchmarks (Types 0 & 3). Menu **6** runs full benchmarks
+(classic + PQ) and writes CSVs under `output/`.
 
 ## Prerequisites
 
-- GCC (C11 compatible)
-- GNU Make
-- Git (for submodule management)
+- GCC (C11), GNU Make
+- Git (for submodules)
+- `libsodium-dev` (X25519, Ed25519, HKDF-SHA256)
 - pthreads (POSIX threads)
+- Python 3 (for `verify_benchmark.py`)
 
-## Getting Started
+## Clone with Submodules (liboqs removed)
 
-### Clone with submodules
+This repo vendors only the pieces we use: `uoscore-uedhoc` and `PQClean`
+(plus nested deps inside `uoscore-uedhoc`). The `liboqs` submodule has been
+removed; PQ flows rely on PQClean by default.
 
 ```bash
 git clone --recursive https://github.com/<your-user>/EDHOC-Hybrid.git
 cd EDHOC-Hybrid
-```
-
-Or if you already cloned without `--recursive`:
-
-```bash
+# If you pulled without --recursive
 git submodule update --init --recursive
 ```
 
-### Build
+## Build
 
 ```bash
-make          # Build everything (library + externals + application)
-make clean    # Clean application objects only
-make lib-clean # Clean everything including library
+make                    # Build (default: USE_PQCLEAN=1, libsodium HKDF)
+make USE_PQCLEAN=1 -j$(nproc)   # Explicit PQClean path
+make clean              # Clean application objects
+make lib-clean          # Clean everything (app + uoscore-uedhoc build)
 ```
 
-To enable verbose protocol debug output, uncomment `DEBUG_PRINT` in
-`lib/uoscore-uedhoc/makefile_config.mk` or add `-DDEBUG_PRINT` to CFLAGS
-in the Makefile.
+Notes:
+- liboqs is **not** vendored anymore. The supported/tested path is `USE_PQCLEAN=1`
+        (default). If you experiment with `USE_PQCLEAN=0`, install liboqs separately
+        and adjust include/library paths as needed.
+- Enable verbose protocol debug by uncommenting `DEBUG_PRINT` in
+        `lib/uoscore-uedhoc/makefile_config.mk` or adding `-DDEBUG_PRINT` to `CFLAGS`.
 
 ## Run
 
-### Interactive mode (with menu):
+Interactive menu:
+
 ```bash
 ./build/edhoc_hybrid
 ```
 
-### Direct mode (skip menu):
+Direct (skip menu):
+
 ```bash
-./build/edhoc_hybrid 1    # Run Type 0 (Sig-Sig)
-./build/edhoc_hybrid 2    # Run Type 3 (MAC-MAC)
+./build/edhoc_hybrid 1   # Type 0 Classic (Sig-Sig)
+./build/edhoc_hybrid 2   # Type 3 Classic (MAC-MAC)
+./build/edhoc_hybrid 3   # Benchmark Classic (Types 0 & 3)
+./build/edhoc_hybrid 4   # Type 0 PQ (ML-KEM-768 + ML-DSA-65)
+./build/edhoc_hybrid 5   # Type 3 PQ (ML-KEM-768 MAC-MAC)
+./build/edhoc_hybrid 6   # Full Benchmark (Classic + PQ)
 ```
 
-## Project Structure
+Benchmark output CSVs:
+
+- `output/benchmark_operations.csv`
+- `output/benchmark_overhead.csv`
+- `output/benchmark_handshake.csv`
+
+## Verify Benchmark Consistency
+
+```bash
+python3 verify_benchmark.py
+```
+
+Runs six cross-table checks (operations ↔ overhead ↔ handshake) with 1 µs tolerance.
+
+## Project Structure (trimmed)
 
 ```
 EDHOC-Hybrid/
-├── .gitmodules                        # Git submodule configuration
+├── Makefile                  # Top-level build (defaults to PQClean)
 ├── README.md
-├── Makefile
 ├── include/
-│   ├── edhoc_common.h                 # Common utilities, transport, print helpers
-│   ├── edhoc_type0_classic.h          # Type 0 Sig-Sig header
-│   ├── edhoc_type3_classic.h          # Type 3 MAC-MAC header
-│   └── edhoc_type3_x25519_testvec.h   # X25519 test vectors for Type 3
+│   ├── edhoc_common.h        # Shared helpers
+│   ├── edhoc_type0_classic.h # Classic Sig-Sig
+│   ├── edhoc_type3_classic.h # Classic MAC-MAC
+│   ├── edhoc_type0_pq.h      # PQ KEM Sig-like
+│   └── edhoc_type3_pq.h      # PQ KEM MAC-MAC
 ├── src/
-│   ├── main.c                         # Entry point with interactive menu
-│   ├── edhoc_common.c                 # Shared tx/rx (pthread), print utilities, OSCORE key derivation
-│   ├── edhoc_type0_classic.c          # Type 0 Sig-Sig (RFC 9529 test vectors, Suite 0)
-│   └── edhoc_type3_classic.c          # Type 3 MAC-MAC (X25519 static DH keys, Suite 0)
+│   ├── main.c                # Menu + dispatcher (1–6)
+│   ├── edhoc_common.c
+│   ├── edhoc_type0_classic.c
+│   ├── edhoc_type3_classic.c
+│   ├── edhoc_type0_pq.c
+│   ├── edhoc_type3_pq.c
+│   └── edhoc_benchmark.c     # Benchmark harness
 ├── lib/
-│   └── uoscore-uedhoc/  [Git submodule] # Core EDHOC/OSCORE library
-│       ├── src/                       # Library source (EDHOC initiator/responder, OSCORE)
-│       ├── inc/                       # Library headers
-│       ├── test_vectors/              # RFC 9529 + P-256 test vectors
-│       └── externals/   [Git submodules]
-│           ├── zcbor/                 # CBOR encoder/decoder
-│           ├── compact25519/          # (legacy) X25519/EdDSA; replaced by libsodium backend
-│           └── mbedtls/               # P-256/ES256/AES crypto (Suite 2)
-└── build/                             # Build output (edhoc_hybrid binary)
+│   ├── PQClean/              # PQ KEM/Signature (ML-KEM-768, ML-DSA-65)
+│   └── uoscore-uedhoc/       # Core EDHOC/OSCORE library + nested externals
+└── output/                   # Benchmark CSVs
 ```
 
-### External Dependencies (Git Submodules)
+### External Dependencies (via submodules or system)
 
-| Submodule | Path | Repository | Purpose |
-|-----------|------|------------|---------|
-| uoscore-uedhoc | `lib/uoscore-uedhoc` | [eriptic/uoscore-uedhoc](https://github.com/eriptic/uoscore-uedhoc) | Core EDHOC/OSCORE protocol library |
-| mbedtls | `lib/uoscore-uedhoc/externals/mbedtls` | [ARMmbed/mbedtls](https://github.com/ARMmbed/mbedtls) | AES-CCM, SHA-256, P-256/ES256 crypto |
-| zcbor | `lib/uoscore-uedhoc/externals/zcbor` | [NordicSemiconductor/zcbor](https://github.com/NordicSemiconductor/zcbor) | CBOR encoding/decoding |
-| cantcoap | `lib/uoscore-uedhoc/externals/cantcoap` | [staropram/cantcoap](https://github.com/staropram/cantcoap) | CoAP message parsing (optional) |
-| tinycrypt | `lib/uoscore-uedhoc/externals/tinycrypt` | [intel/tinycrypt](https://github.com/intel/tinycrypt) | Lightweight crypto (alternative engine) |
-| libsodium | system (`libsodium-dev`) | [jedisct1/libsodium](https://github.com/jedisct1/libsodium) | X25519 + Ed25519 backend for Suite 0 |
-
-## Architecture
-
-Each EDHOC type runs Initiator and Responder as **separate pthreads** communicating
-through a shared message buffer with mutex/condition variable synchronization,
-simulating real network message exchange.
-
-### Message Flow (3-message handshake per RFC 9528):
-
-```
-Initiator (Thread 1)                    Responder (Thread 2)
-        |                                        |
-        |  ---- message_1 (METHOD, SUITES_I, G_X, C_I) --->  |
-        |                                        |
-        |  <--- message_2 (G_Y, C_R, Enc_2) --- |
-        |                                        |
-        |  ---- message_3 (Enc_3) ------------->  |
-        |                                        |
-        | Both derive PRK_out → prk_exporter     |
-        | → OSCORE Master Secret + Salt          |
-```
-
-### Method Types:
-- **Method 0** (Sig-Sig): Both parties use signature keys (EdDSA with X25519 DH)
-- **Method 3** (MAC-MAC): Both parties use static DH keys for MAC-based authentication (X25519 DH)
-
-### Key Derivation:
-After successful EDHOC exchange, both sides derive:
-1. **PRK_out** — Protocol output key
-2. **prk_exporter** — Exporter secret (via `prk_out2exporter`)
-3. **OSCORE Master Secret** (16 bytes) — For OSCORE protected communication
-4. **OSCORE Master Salt** (8 bytes) — For OSCORE security context
-
-## Test Vectors
-
-- **Type 0**: Uses RFC 9529 test vectors (Test 1, Method 0, Suite 0)
-- **Type 3**: Uses X25519 generated keys (Method 3, Suite 0) with RFC 9529 credentials
+| Component | Source | Purpose |
+|-----------|--------|---------|
+| uoscore-uedhoc | submodule | Core EDHOC/OSCORE logic
+| PQClean | submodule | ML-KEM-768, ML-DSA-65 implementations
+| mbedTLS | `lib/uoscore-uedhoc/externals/mbedtls` | AES-CCM, PSA crypto
+| zcbor | `lib/uoscore-uedhoc/externals/zcbor` | CBOR codec
+| tinycrypt | `lib/uoscore-uedhoc/externals/tinycrypt` | Lightweight crypto (optional paths)
+| libsodium | system (`libsodium-dev`) | X25519, Ed25519, HKDF-HMAC-SHA256
 
 ## License
 
-This project uses the uoscore-uedhoc library which is dual-licensed under Apache-2.0 and MIT.
+uoscore-uedhoc is dual-licensed under Apache-2.0 and MIT; follow upstream terms.
