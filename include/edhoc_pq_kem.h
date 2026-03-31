@@ -3,23 +3,36 @@
  * EDHOC-Hybrid: Post-Quantum KEM Wrapper
  * =============================================================================
  *
- * Abstraksi KEM (Key Encapsulation Mechanism) menggunakan ML-KEM-768 dari
- * liboqs (Open Quantum Safe). Modul ini menyediakan fungsi-fungsi:
+ * Abstraksi KEM (Key Encapsulation Mechanism) dan Signature menggunakan
+ * ML-KEM-768 dan ML-DSA-65 dari liboqs (Open Quantum Safe).
  *
- *   - pq_kem_keygen()   : Generate PQ key pair (pk, sk)
+ * KEM functions:
+ *   - pq_kem_keygen()   : Generate PQ KEM key pair (pk, sk)
  *   - pq_kem_encaps()   : Encapsulate shared secret → (ct, ss)
  *   - pq_kem_decaps()   : Decapsulate ciphertext → ss
+ *
+ * Signature functions (ML-DSA-65, for Type 0 PQ SigSig):
+ *   - pq_sig_keygen()   : Generate PQ signature key pair (pk, sk)
+ *   - pq_sig_sign()     : Sign a message
+ *   - pq_sig_verify()   : Verify a signature
+ *
+ * Symmetric functions:
  *   - pq_hkdf_extract() : HKDF-Extract (SHA-256) wrapper
  *   - pq_hkdf_expand()  : HKDF-Expand (SHA-256) wrapper
  *   - pq_aead_encrypt() : AES-CCM-16-64-128 encrypt
  *   - pq_aead_decrypt() : AES-CCM-16-64-128 decrypt
  *   - pq_hash()         : SHA-256 hash
  *
- * Algoritma: ML-KEM-768 (NIST Level 3, ~AES-192 equivalent)
+ * KEM Algorithm: ML-KEM-768 (NIST Level 3, ~AES-192 equivalent)
  *   - Public key  : 1184 bytes
  *   - Secret key  : 2400 bytes
  *   - Ciphertext  : 1088 bytes
  *   - Shared secret: 32 bytes
+ *
+ * Signature Algorithm: ML-DSA-65 (NIST Level 3, ~AES-192 equivalent)
+ *   - Public key  : 1952 bytes
+ *   - Secret key  : 4032 bytes
+ *   - Signature   : up to 3309 bytes
  *
  * =============================================================================
  */
@@ -36,15 +49,19 @@
 #define PQ_KEM_CT_LEN         1088
 #define PQ_KEM_SS_LEN         32
 
-/* HKDF/Hash sizes */
+/* ML-DSA-65 sizes (NIST Level 3 — matching ML-KEM-768 security level) */
+#define PQ_SIG_PK_LEN         1952
+#define PQ_SIG_SK_LEN         4032
+#define PQ_SIG_MAX_LEN        3309
+
+/* Algorithm names for display */
+#define PQ_KEM_ALG_NAME       "ML-KEM-768"
+#define PQ_SIG_ALG_NAME       "ML-DSA-65"
 #define PQ_HASH_LEN           32    /* SHA-256 output */
 #define PQ_PRK_LEN            32    /* PRK size = hash output */
 #define PQ_AEAD_KEY_LEN       16    /* AES-CCM-16-64-128 key */
 #define PQ_AEAD_NONCE_LEN     13    /* AES-CCM nonce */
 #define PQ_AEAD_TAG_LEN       8     /* AES-CCM tag (64-bit) */
-
-/* Algorithm name for display */
-#define PQ_KEM_ALG_NAME       "ML-KEM-768"
 
 /**
  * @brief Generate a PQ KEM key pair.
@@ -140,5 +157,46 @@ int pq_aead_decrypt(const uint8_t *key, const uint8_t *nonce,
  * @return 0 on success, -1 on error
  */
 int pq_hash_sha256(const uint8_t *data, size_t data_len, uint8_t *hash_out);
+
+/* =============================================================================
+ * PQ Signature Operations (ML-DSA-65 via liboqs)
+ * Used by Type 0 PQ (Signature-based authentication, analogous to Classic
+ * Type 0 SigSig which uses EdDSA).
+ * =============================================================================
+ */
+
+/**
+ * @brief Generate a PQ signature key pair (ML-DSA-65).
+ * @param[out] pk  Public key buffer (PQ_SIG_PK_LEN bytes)
+ * @param[out] sk  Secret key buffer (PQ_SIG_SK_LEN bytes)
+ * @return 0 on success, -1 on error
+ */
+int pq_sig_keygen(uint8_t *pk, uint8_t *sk);
+
+/**
+ * @brief Sign a message using ML-DSA-65.
+ * @param[in]  msg      Message to sign
+ * @param[in]  msg_len  Message length
+ * @param[in]  sk       Secret key (PQ_SIG_SK_LEN bytes)
+ * @param[out] sig      Signature buffer (PQ_SIG_MAX_LEN bytes)
+ * @param[out] sig_len  Actual signature length
+ * @return 0 on success, -1 on error
+ */
+int pq_sig_sign(const uint8_t *msg, size_t msg_len,
+                const uint8_t *sk,
+                uint8_t *sig, size_t *sig_len);
+
+/**
+ * @brief Verify a signature using ML-DSA-65.
+ * @param[in] msg      Message that was signed
+ * @param[in] msg_len  Message length
+ * @param[in] sig      Signature
+ * @param[in] sig_len  Signature length
+ * @param[in] pk       Public key (PQ_SIG_PK_LEN bytes)
+ * @return 0 on success (valid), -1 on error (invalid)
+ */
+int pq_sig_verify(const uint8_t *msg, size_t msg_len,
+                  const uint8_t *sig, size_t sig_len,
+                  const uint8_t *pk);
 
 #endif /* EDHOC_PQ_KEM_H */

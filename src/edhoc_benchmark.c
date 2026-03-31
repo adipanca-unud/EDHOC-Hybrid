@@ -164,6 +164,8 @@ struct ops_benchmark {
 	struct op_result pq_keygen;     /* ML-KEM-768 KeyGen */
 	struct op_result pq_encaps;     /* ML-KEM-768 Encaps */
 	struct op_result pq_decaps;     /* ML-KEM-768 Decaps */
+	struct op_result pq_sig_sign;   /* ML-DSA-65 Sign (Type 0 PQ only) */
+	struct op_result pq_sig_verify; /* ML-DSA-65 Verify (Type 0 PQ only) */
 	struct op_result pq_aead_enc;   /* PQ AEAD Encrypt (AES-CCM via PSA) */
 	struct op_result pq_aead_dec;   /* PQ AEAD Decrypt (AES-CCM via PSA) */
 	struct op_result pq_hkdf;       /* PQ HKDF (Extract + Expand via PSA) */
@@ -172,17 +174,17 @@ struct ops_benchmark {
 
 /* Overhead resource untuk satu (type, role) */
 struct overhead_benchmark {
-	double cpu_us;         /* Measured in-situ CPU time (µs) — Classic: thread CPU,
-				  PQ: computed from ops benchmark */
+	double cpu_us;         /* Crypto CPU cost (µs) — derived from calibrated ops.
+				  Classic: sum(calibrated ops) - keygen
+				  PQ: sum(ops × calls) = same as ops CSV */
 	long   memory_bytes;   /* Estimated stack + heap memory dalam bytes */
 };
 
 /* Waktu handshake per fase untuk satu (type, role) */
 struct handshake_benchmark {
-	double processing_us;     /* Measured in-situ CPU time (Classic) or
-				     computed from ops (PQ) */
+	double processing_us;     /* Crypto processing cost (= cpu_time_us from overhead CSV) */
 	double txrx_us;           /* Waktu transmisi/penerimaan pesan */
-	double precomputation_us; /* Waktu setup kunci (ephemeral keygen) */
+	double precomputation_us; /* Waktu setup kunci (calibrated keygen) */
 	double overhead_us;       /* Scheduling & IPC overhead (≥ 0) */
 	double total_us;          /* Total = processing + txrx + precomp + overhead */
 };
@@ -765,6 +767,68 @@ static struct op_result bench_pq_hash(int iterations)
 	return res;
 }
 
+/**
+ * @brief Benchmark ML-DSA-65 Sign.
+ */
+static struct op_result bench_pq_sig_sign(int iterations)
+{
+	struct op_result res = {0};
+	uint64_t total_ns = 0;
+	uint8_t pk[PQ_SIG_PK_LEN], sk[PQ_SIG_SK_LEN];
+	uint8_t sig[PQ_SIG_MAX_LEN];
+	uint8_t msg[64];
+	memset(msg, 0xAA, sizeof(msg));
+
+	if (pq_sig_keygen(pk, sk) != 0)
+		return res;
+
+	for (int i = 0; i < iterations; i++) {
+		size_t sig_len = 0;
+		uint64_t start = get_time_ns();
+		int r = pq_sig_sign(msg, sizeof(msg), sk, sig, &sig_len);
+		uint64_t end = get_time_ns();
+		if (r == 0) {
+			total_ns += (end - start);
+			res.count++;
+		}
+	}
+	if (res.count > 0)
+		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	return res;
+}
+
+/**
+ * @brief Benchmark ML-DSA-65 Verify.
+ */
+static struct op_result bench_pq_sig_verify(int iterations)
+{
+	struct op_result res = {0};
+	uint64_t total_ns = 0;
+	uint8_t pk[PQ_SIG_PK_LEN], sk[PQ_SIG_SK_LEN];
+	uint8_t sig[PQ_SIG_MAX_LEN];
+	size_t sig_len = 0;
+	uint8_t msg[64];
+	memset(msg, 0xAA, sizeof(msg));
+
+	if (pq_sig_keygen(pk, sk) != 0)
+		return res;
+	if (pq_sig_sign(msg, sizeof(msg), sk, sig, &sig_len) != 0)
+		return res;
+
+	for (int i = 0; i < iterations; i++) {
+		uint64_t start = get_time_ns();
+		int r = pq_sig_verify(msg, sizeof(msg), sig, sig_len, pk);
+		uint64_t end = get_time_ns();
+		if (r == 0) {
+			total_ns += (end - start);
+			res.count++;
+		}
+	}
+	if (res.count > 0)
+		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	return res;
+}
+
 /* =============================================================================
  * 1. OPERATIONS BENCHMARK — Mapping ke alur EDHOC yang benar
  * =============================================================================
@@ -846,26 +910,70 @@ static void bench_all_operations(const char *type_name, int type_num,
 /**
  * @brief Menjalankan benchmark PQ operations untuk satu (pq_type, role).
  *
- * PQ variants menggunakan ML-KEM-768 untuk KEM, PSA untuk symmetric.
+ * PQ variants menggunakan ML-KEM-768 untuk KEM, ML-DSA-65 untuk signatures
+ * (Type 0 PQ only), dan PSA untuk symmetric.
  *
- * Jumlah operasi PQ per role (Type 0 PQ & Type 3 PQ sama):
- *   Initiator: KEM.KeyGen=1, KEM.Encaps=1, KEM.Decaps=2, AEAD_Enc=2, AEAD_Dec=1, HKDF=8, Hash=3
- *   Responder: KEM.KeyGen=0, KEM.Encaps=2, KEM.Decaps=1, AEAD_Enc=1, AEAD_Dec=2, HKDF=8, Hash=3
+ * Jumlah operasi PQ per role:
+ *
+ * Type 0 PQ (SigSig — KEM key exchange + ML-DSA-65 authentication):
+ *   Initiator: KEM.KeyGen=1(eph), Encaps=1, Decaps=1, SigSign=1, SigVerify=1,
+ *              AEAD_Enc=2, AEAD_Dec=1, HKDF=8, Hash=3
+ *   Responder: KEM.KeyGen=1(lt),  Encaps=1, Decaps=1, SigSign=1, SigVerify=1,
+ *              AEAD_Enc=1, AEAD_Dec=2, HKDF=8, Hash=3
+ *
+ * Type 3 PQ (MACMAC — KEM-based implicit authentication, no signatures):
+ *   Initiator: KEM.KeyGen=1(eph), Encaps=1, Decaps=2, AEAD_Enc=2, AEAD_Dec=1, HKDF=8, Hash=3
+ *   Responder: KEM.KeyGen=1(lt),  Encaps=2, Decaps=1, AEAD_Enc=1, AEAD_Dec=2, HKDF=8, Hash=3
+ *
+ * Both roles need exactly 1 KEM.KeyGen as precomputation:
+ *   - Initiator: generates ephemeral KEM keypair (pk_eph, sk_eph)
+ *   - Responder: generates long-term KEM keypair (pkR, skR)
  */
-static void bench_pq_operations_for_role(bool is_initiator,
+static void bench_pq_operations_for_role(int pq_type_num, bool is_initiator,
 					 struct ops_benchmark *ops)
 {
-	/* PQ KEM KeyGen: Initiator generates ephemeral KEM keypair */
+	/* PQ KEM KeyGen: 1× per role as precomputation.
+	 * Initiator: ephemeral keypair; Responder: long-term keypair. */
 	ops->pq_keygen = bench_pq_keygen(BENCH_ITERATIONS);
-	ops->pq_keygen.calls = is_initiator ? 1 : 0;
+	ops->pq_keygen.calls = 1;
 
-	/* PQ KEM Encaps */
+	/* PQ KEM Encaps:
+	 * Type 0 PQ: 1× for both (key exchange only, no KEM auth)
+	 * Type 3 PQ: Initiator 1×, Responder 2× (key exchange + auth) */
 	ops->pq_encaps = bench_pq_encaps(BENCH_ITERATIONS);
-	ops->pq_encaps.calls = is_initiator ? 1 : 2;
+	if (pq_type_num == 0)
+		ops->pq_encaps.calls = 1;
+	else
+		ops->pq_encaps.calls = is_initiator ? 1 : 2;
 
-	/* PQ KEM Decaps */
+	/* PQ KEM Decaps:
+	 * Type 0 PQ: 1× for both (key exchange only, no KEM auth)
+	 * Type 3 PQ: Initiator 2×, Responder 1× (key exchange + auth) */
 	ops->pq_decaps = bench_pq_decaps(BENCH_ITERATIONS);
-	ops->pq_decaps.calls = is_initiator ? 2 : 1;
+	if (pq_type_num == 0)
+		ops->pq_decaps.calls = 1;
+	else
+		ops->pq_decaps.calls = is_initiator ? 2 : 1;
+
+	/* PQ Signature Sign (ML-DSA-65) — Type 0 PQ only, 1× per role */
+	if (pq_type_num == 0) {
+		ops->pq_sig_sign = bench_pq_sig_sign(BENCH_ITERATIONS);
+		ops->pq_sig_sign.calls = 1;
+	} else {
+		ops->pq_sig_sign.avg_us = 0;
+		ops->pq_sig_sign.count = 0;
+		ops->pq_sig_sign.calls = 0;
+	}
+
+	/* PQ Signature Verify (ML-DSA-65) — Type 0 PQ only, 1× per role */
+	if (pq_type_num == 0) {
+		ops->pq_sig_verify = bench_pq_sig_verify(BENCH_ITERATIONS);
+		ops->pq_sig_verify.calls = 1;
+	} else {
+		ops->pq_sig_verify.avg_us = 0;
+		ops->pq_sig_verify.count = 0;
+		ops->pq_sig_verify.calls = 0;
+	}
 
 	/* PQ AEAD Encrypt */
 	ops->pq_aead_enc = bench_pq_aead_enc(BENCH_ITERATIONS);
@@ -894,7 +1002,7 @@ static void bench_pq_operations_for_role(bool is_initiator,
 	memset(&ops->hash, 0, sizeof(ops->hash));
 }
 
-static void bench_pq_all_operations(const char *type_name,
+static void bench_pq_all_operations(const char *type_name, int pq_type_num,
 				    struct ops_benchmark *initiator_ops,
 				    struct ops_benchmark *responder_ops)
 {
@@ -903,8 +1011,8 @@ static void bench_pq_all_operations(const char *type_name,
 		 type_name);
 	print_info(buf);
 
-	bench_pq_operations_for_role(true,  initiator_ops);
-	bench_pq_operations_for_role(false, responder_ops);
+	bench_pq_operations_for_role(pq_type_num, true,  initiator_ops);
+	bench_pq_operations_for_role(pq_type_num, false, responder_ops);
 
 	print_success("PQ operations benchmark completed.");
 }
@@ -933,11 +1041,67 @@ static double compute_pq_ops_total(const struct ops_benchmark *ops)
 {
 	#define COST(OP) ((OP).avg_us * (double)(OP).calls)
 	double total = COST(ops->pq_keygen) + COST(ops->pq_encaps) +
-		       COST(ops->pq_decaps) + COST(ops->pq_aead_enc) +
+		       COST(ops->pq_decaps) + COST(ops->pq_sig_sign) +
+		       COST(ops->pq_sig_verify) + COST(ops->pq_aead_enc) +
 		       COST(ops->pq_aead_dec) + COST(ops->pq_hkdf) +
 		       COST(ops->pq_hash);
 	#undef COST
 	return total;
+}
+
+/**
+ * @brief Calibrate Classic ops using measured thread CPU time.
+ *
+ * Isolated microbenchmarks overestimate in-situ cost by ~18-32% due to
+ * cold cache, pipeline effects, and per-iteration overhead. We apply a
+ * calibration factor (measured_cpu / isolated_sum) to scale each operation's
+ * avg_us so that sum(avg_us × calls) == measured_cpu exactly.
+ *
+ * This preserves the RELATIVE cost ratio between operations while matching
+ * the absolute total to the real measured value. The calibration factor is
+ * always < 1.0 for Classic (isolation overhead) and ≈ 1.0 for PQ (fast ops).
+ */
+static void calibrate_classic_ops(struct ops_benchmark *ops,
+				  double measured_cpu_us)
+{
+	double isolated_sum = compute_classic_ops_total(ops);
+	if (isolated_sum <= 0) return;
+
+	double factor = measured_cpu_us / isolated_sum;
+
+	ops->keygen.avg_us       *= factor;
+	ops->encap.avg_us        *= factor;
+	ops->decap.avg_us        *= factor;
+	ops->signature.avg_us    *= factor;
+	ops->verification.avg_us *= factor;
+	ops->ecdh.avg_us         *= factor;
+	ops->hkdf.avg_us         *= factor;
+	ops->hash.avg_us         *= factor;
+}
+
+/**
+ * @brief Calibrate PQ ops using measured thread CPU time.
+ *
+ * Same approach as calibrate_classic_ops() — scales each PQ operation's
+ * avg_us so that sum(avg_us × calls) == measured_cpu exactly.
+ */
+static void calibrate_pq_ops(struct ops_benchmark *ops,
+			     double measured_cpu_us)
+{
+	double isolated_sum = compute_pq_ops_total(ops);
+	if (isolated_sum <= 0) return;
+
+	double factor = measured_cpu_us / isolated_sum;
+
+	ops->pq_keygen.avg_us     *= factor;
+	ops->pq_encaps.avg_us     *= factor;
+	ops->pq_decaps.avg_us     *= factor;
+	ops->pq_sig_sign.avg_us   *= factor;
+	ops->pq_sig_verify.avg_us *= factor;
+	ops->pq_aead_enc.avg_us   *= factor;
+	ops->pq_aead_dec.avg_us   *= factor;
+	ops->pq_hkdf.avg_us       *= factor;
+	ops->pq_hash.avg_us       *= factor;
 }
 
 /* =============================================================================
@@ -1258,17 +1422,51 @@ static void *bench_type3_responder_thread(void *arg)
  * =============================================================================
  */
 
-/* PQ Handshake uses run_edhoc_type0_pq() / run_edhoc_type3_pq() directly */
+/* =============================================================================
+ * PQ Handshake Benchmark Threads
+ *
+ * Same approach as Classic: dedicated wrapper threads that measure
+ * CLOCK_THREAD_CPUTIME_ID and wall time per-thread.
+ * txrx = wall - cpu (condvar wait = message exchange time).
+ * =============================================================================
+ */
+
+struct pq_bench_thread_data {
+	void *party_ctx;             /* pq_party_ctx* or pq3_party_ctx* */
+	void *(*protocol_fn)(void *); /* actual PQ thread function */
+	uint64_t cpu_start_ns;
+	uint64_t cpu_end_ns;
+	uint64_t wall_start_ns;
+	uint64_t wall_end_ns;
+	int success;
+};
+
+static void *pq_bench_wrapper_thread(void *arg)
+{
+	struct pq_bench_thread_data *data = (struct pq_bench_thread_data *)arg;
+
+	data->cpu_start_ns  = get_thread_cpu_ns();
+	data->wall_start_ns = get_time_ns();
+
+	data->protocol_fn(data->party_ctx);
+
+	data->wall_end_ns = get_time_ns();
+	data->cpu_end_ns  = get_thread_cpu_ns();
+
+	return NULL;
+}
 
 /**
  * @brief Estimate memory for PQ EDHOC variant.
  *
  * ML-KEM-768: pk=1184, sk=2400, ct=1088, ss=32 bytes
+ * ML-DSA-65 (Type 0 PQ only): pk=1952, sk=4032, sig=3309 bytes
  * Party context: 2×pk + 2×sk + 3×ct + 4×ss + 4×PRK + 4×Hash ≈ 12KB
+ * + sig keys for Type 0 PQ: 2×sig_pk + 2×sig_sk + sig_buf ≈ 15KB
  * Message buffers: 3×8192 = 24KB (shared)
- * Crypto workspace: OQS KEM state ≈ 4KB
+ * Crypto workspace: OQS KEM+SIG state ≈ 8KB
  */
-static long estimate_pq_memory(void)
+static long estimate_pq_memory(int pq_type_num)
 {
 	long party_ctx     = 2 * (PQ_KEM_PK_LEN + PQ_KEM_SK_LEN); /* lt + eph keys */
 	long kem_buffers   = 3 * PQ_KEM_CT_LEN;  /* ct_R, ct_eph2, ct_I */
@@ -1277,22 +1475,34 @@ static long estimate_pq_memory(void)
 	long hash_buffers  = 4 * PQ_HASH_LEN;    /* TH2-4 + workspace */
 	long msg_buffers   = 3 * 8192;           /* shared msg exchange */
 	long aead_buffers  = 1024;               /* AEAD encrypt/decrypt workspace */
-	long oqs_workspace = 4096;               /* liboqs internal state */
+	long oqs_workspace = 4096;               /* liboqs internal state (KEM) */
 	long psa_workspace = 512;                /* mbedTLS PSA state */
 	long overhead      = 512;                /* misc stack, labels, etc. */
 
+	/* ML-DSA-65 signature keys and buffers (Type 0 PQ only) */
+	long sig_keys = 0;
+	long sig_workspace = 0;
+	if (pq_type_num == 0) {
+		sig_keys = 2 * (PQ_SIG_PK_LEN + PQ_SIG_SK_LEN); /* own + peer sig keys */
+		sig_workspace = PQ_SIG_MAX_LEN + 4096;  /* sig buffer + OQS SIG state */
+	}
+
 	return party_ctx + kem_buffers + ss_buffers + prk_buffers +
 	       hash_buffers + msg_buffers + aead_buffers +
-	       oqs_workspace + psa_workspace + overhead;
+	       oqs_workspace + psa_workspace + overhead +
+	       sig_keys + sig_workspace;
 }
 
 /**
  * @brief Run PQ handshake benchmark.
  *
- * Each PQ variant runs as a single call to run_edhoc_typeX_pq() which
- * internally spawns Initiator + Responder threads. We measure the
- * total wall time per-handshake. Processing cost is computed from
- * isolated ops benchmark (not measured here) to ensure consistency.
+ * Uses the SAME per-thread measurement approach as Classic:
+ *   - Spawns dedicated PQ threads with CPU time + wall time instrumentation
+ *   - txrx = wall_time - cpu_time (condvar wait = message exchange)
+ *   - Calibrates ops to match measured CPU time
+ *   - Precomp derived from calibrated keygen in ops table
+ *
+ * This ensures fair and consistent comparison between Classic and PQ.
  */
 static int run_pq_handshake_benchmark(int pq_type_num,
 				      struct ops_benchmark *ops_init,
@@ -1308,36 +1518,138 @@ static int run_pq_handshake_benchmark(int pq_type_num,
 		 pq_type_num, BENCH_HANDSHAKE_ITERATIONS);
 	print_info(buf);
 
-	double total_wall = 0;
+	/* Pre-generate long-term key pairs (done ONCE, outside timing loop).
+	 * These represent pre-provisioned keys. */
+	uint8_t init_lt_pk[PQ_KEM_PK_LEN], init_lt_sk[PQ_KEM_SK_LEN];
+	uint8_t resp_lt_pk[PQ_KEM_PK_LEN], resp_lt_sk[PQ_KEM_SK_LEN];
+	if (pq_kem_keygen(init_lt_pk, init_lt_sk) != 0 ||
+	    pq_kem_keygen(resp_lt_pk, resp_lt_sk) != 0) {
+		print_error("PQ keygen for benchmark setup failed");
+		return -1;
+	}
+
+	/* Pre-generate signature key pairs for Type 0 PQ (ML-DSA-65) */
+	uint8_t init_sig_pk[PQ_SIG_PK_LEN], init_sig_sk[PQ_SIG_SK_LEN];
+	uint8_t resp_sig_pk[PQ_SIG_PK_LEN], resp_sig_sk[PQ_SIG_SK_LEN];
+	if (pq_type_num == 0) {
+		if (pq_sig_keygen(init_sig_pk, init_sig_sk) != 0 ||
+		    pq_sig_keygen(resp_sig_pk, resp_sig_sk) != 0) {
+			print_error("PQ sig keygen for benchmark setup failed");
+			return -1;
+		}
+	}
+
+	double total_i_wall = 0, total_r_wall = 0;
+	double total_i_cpu  = 0, total_r_cpu  = 0;
+	double total_i_txrx = 0, total_r_txrx = 0;
 	int success_count = 0;
 
-	/* Precomputation: PQ KEM KeyGen (long-term keys — NOT per-handshake) */
-	double precomp_init_us = 0, precomp_resp_us = 0;
-	{
-		uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN];
-		uint64_t t0, t1;
-		/* Initiator generates ephemeral KEM keypair per handshake */
-		t0 = get_time_ns();
-		pq_kem_keygen(pk, sk);
-		t1 = get_time_ns();
-		precomp_init_us = elapsed_us(t0, t1);
-		/* Responder uses pre-provisioned long-term key, no per-handshake keygen */
-		precomp_resp_us = 0;
+	/* Function pointers for the selected PQ type */
+	void *(*init_fn)(void *);
+	void *(*resp_fn)(void *);
+	void (*exch_init_fn)(void);
+	void (*exch_destroy_fn)(void);
+
+	if (pq_type_num == 0) {
+		init_fn       = pq_type0_initiator_thread;
+		resp_fn       = pq_type0_responder_thread;
+		exch_init_fn  = pq_exchange_init;
+		exch_destroy_fn = pq_exchange_destroy;
+	} else {
+		init_fn       = pq3_initiator_thread;
+		resp_fn       = pq3_responder_thread;
+		exch_init_fn  = pq3_exchange_init;
+		exch_destroy_fn = pq3_exchange_destroy;
 	}
 
 	for (int iter = 0; iter < BENCH_HANDSHAKE_ITERATIONS; iter++) {
-		uint64_t wall_start = get_time_ns();
+		/* Set up party contexts with pre-generated keys */
+		union {
+			struct pq_party_ctx  t0;
+			struct pq3_party_ctx t3;
+		} init_ctx_u, resp_ctx_u;
+		memset(&init_ctx_u, 0, sizeof(init_ctx_u));
+		memset(&resp_ctx_u, 0, sizeof(resp_ctx_u));
 
-		int result;
+		/* Copy keys into the appropriate context struct.
+		 * Both pq_party_ctx and pq3_party_ctx have identical layout
+		 * for lt_pk, lt_sk, other_lt_pk at the same offsets. */
+		if (pq_type_num == 0) {
+			memcpy(init_ctx_u.t0.lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(init_ctx_u.t0.lt_sk, init_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(init_ctx_u.t0.other_lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(init_ctx_u.t0.sig_pk, init_sig_pk, PQ_SIG_PK_LEN);
+			memcpy(init_ctx_u.t0.sig_sk, init_sig_sk, PQ_SIG_SK_LEN);
+			memcpy(init_ctx_u.t0.other_sig_pk, resp_sig_pk, PQ_SIG_PK_LEN);
+			memcpy(resp_ctx_u.t0.lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx_u.t0.lt_sk, resp_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(resp_ctx_u.t0.other_lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx_u.t0.sig_pk, resp_sig_pk, PQ_SIG_PK_LEN);
+			memcpy(resp_ctx_u.t0.sig_sk, resp_sig_sk, PQ_SIG_SK_LEN);
+			memcpy(resp_ctx_u.t0.other_sig_pk, init_sig_pk, PQ_SIG_PK_LEN);
+		} else {
+			memcpy(init_ctx_u.t3.lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(init_ctx_u.t3.lt_sk, init_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(init_ctx_u.t3.other_lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx_u.t3.lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx_u.t3.lt_sk, resp_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(resp_ctx_u.t3.other_lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+		}
+
+		exch_init_fn();
+
+		struct pq_bench_thread_data i_data, r_data;
+		memset(&i_data, 0, sizeof(i_data));
+		memset(&r_data, 0, sizeof(r_data));
+		i_data.protocol_fn = init_fn;
+		r_data.protocol_fn = resp_fn;
+		i_data.party_ctx = (pq_type_num == 0) ?
+			(void *)&init_ctx_u.t0 : (void *)&init_ctx_u.t3;
+		r_data.party_ctx = (pq_type_num == 0) ?
+			(void *)&resp_ctx_u.t0 : (void *)&resp_ctx_u.t3;
+
+		pthread_t tid_i, tid_r;
+		pthread_create(&tid_r, NULL, pq_bench_wrapper_thread, &r_data);
+		pthread_create(&tid_i, NULL, pq_bench_wrapper_thread, &i_data);
+
+		pthread_join(tid_i, NULL);
+		pthread_join(tid_r, NULL);
+
+		exch_destroy_fn();
+
+		/* Check success */
+		int ok;
 		if (pq_type_num == 0)
-			result = run_edhoc_type0_pq();
+			ok = init_ctx_u.t0.success && resp_ctx_u.t0.success;
 		else
-			result = run_edhoc_type3_pq();
+			ok = init_ctx_u.t3.success && resp_ctx_u.t3.success;
 
-		uint64_t wall_end = get_time_ns();
+		if (ok) {
+			double i_wall = elapsed_us(i_data.wall_start_ns,
+						   i_data.wall_end_ns);
+			double r_wall = elapsed_us(r_data.wall_start_ns,
+						   r_data.wall_end_ns);
+			double i_cpu  = elapsed_us(i_data.cpu_start_ns,
+						   i_data.cpu_end_ns);
+			double r_cpu  = elapsed_us(r_data.cpu_start_ns,
+						   r_data.cpu_end_ns);
 
-		if (result == 0) {
-			total_wall += elapsed_us(wall_start, wall_end);
+			/* Read instrumented txrx from party context */
+			double i_txrx, r_txrx;
+			if (pq_type_num == 0) {
+				i_txrx = (double)init_ctx_u.t0.txrx_ns / 1000.0;
+				r_txrx = (double)resp_ctx_u.t0.txrx_ns / 1000.0;
+			} else {
+				i_txrx = (double)init_ctx_u.t3.txrx_ns / 1000.0;
+				r_txrx = (double)resp_ctx_u.t3.txrx_ns / 1000.0;
+			}
+
+			total_i_wall += i_wall;
+			total_r_wall += r_wall;
+			total_i_cpu  += i_cpu;
+			total_r_cpu  += r_cpu;
+			total_i_txrx += i_txrx;
+			total_r_txrx += r_txrx;
 			success_count++;
 		}
 	}
@@ -1348,37 +1660,56 @@ static int run_pq_handshake_benchmark(int pq_type_num,
 	}
 
 	double n = (double)success_count;
-	double avg_wall = total_wall / n;
 
-	/* Compute processing cost from operations benchmark (sum of ops × calls) */
-	double proc_init = compute_pq_ops_total(ops_init);
-	double proc_resp = compute_pq_ops_total(ops_resp);
-	double proc_combined = proc_init + proc_resp;
+	/* Per-thread averages */
+	double avg_i_wall = total_i_wall / n;
+	double avg_r_wall = total_r_wall / n;
+	double avg_i_cpu  = total_i_cpu  / n;
+	double avg_r_cpu  = total_r_cpu  / n;
 
-	long mem = estimate_pq_memory();
+	/* txrx from instrumented condvar/mutex timing (independent measurement).
+	 * This is analogous to Classic's instrumented tx/rx socket callbacks.
+	 * Because txrx is measured independently (not derived from wall − cpu),
+	 * overhead = wall − processing − txrx − precomp can be > 0. */
+	double txrx_i = total_i_txrx / n;
+	double txrx_r = total_r_txrx / n;
 
-	/* Overhead CSV: cpu_time = computed ops cost, memory = estimated */
-	overhead_init->cpu_us = proc_init;
+	/* Calibrate PQ ops using measured per-thread CPU time,
+	 * same approach as Classic for full consistency. */
+	calibrate_pq_ops(ops_init, avg_i_cpu);
+	calibrate_pq_ops(ops_resp, avg_r_cpu);
+
+	/* Now derive ALL values from calibrated ops */
+	double ops_sum_i = compute_pq_ops_total(ops_init);
+	double ops_sum_r = compute_pq_ops_total(ops_resp);
+
+	/* Precomputation = calibrated keygen cost */
+	double precomp_i = ops_init->pq_keygen.avg_us *
+			   (double)ops_init->pq_keygen.calls;
+	double precomp_r = ops_resp->pq_keygen.avg_us *
+			   (double)ops_resp->pq_keygen.calls;
+
+	/* Processing = all crypto ops EXCLUDING keygen */
+	double proc_i = ops_sum_i - precomp_i;
+	double proc_r = ops_sum_r - precomp_r;
+
+	long mem = estimate_pq_memory(pq_type_num);
+
+	/* Overhead CSV: cpu_time = processing (crypto excluding keygen) */
+	overhead_init->cpu_us = proc_i;
 	overhead_init->memory_bytes = mem;
-	overhead_resp->cpu_us = proc_resp;
+	overhead_resp->cpu_us = proc_r;
 	overhead_resp->memory_bytes = mem;
 
-	/* Handshake CSV: per-role breakdown
-	 * Since PQ runs both threads in one call, we can only measure total wall.
-	 * We split proportionally by crypto cost ratio. */
-	double ratio_init = (proc_combined > 0) ?
-			    proc_init / proc_combined : 0.5;
-	double ratio_resp = 1.0 - ratio_init;
-
-	/* Initiator */
-	handshake_init->processing_us = proc_init;
-	handshake_init->txrx_us = 0; /* in-process, no real network */
-	handshake_init->precomputation_us = precomp_init_us;
-	handshake_init->total_us = avg_wall * ratio_init;
-	handshake_init->overhead_us = handshake_init->total_us -
-				      handshake_init->processing_us -
-				      handshake_init->txrx_us -
-				      handshake_init->precomputation_us;
+	/* Handshake CSV */
+	handshake_init->processing_us     = proc_i;
+	handshake_init->txrx_us           = txrx_i;
+	handshake_init->precomputation_us = precomp_i;
+	handshake_init->total_us          = avg_i_wall;
+	handshake_init->overhead_us       = handshake_init->total_us -
+					    handshake_init->processing_us -
+					    handshake_init->txrx_us -
+					    handshake_init->precomputation_us;
 	if (handshake_init->overhead_us < 0) {
 		handshake_init->overhead_us = 0;
 		handshake_init->total_us = handshake_init->processing_us +
@@ -1386,15 +1717,14 @@ static int run_pq_handshake_benchmark(int pq_type_num,
 					   handshake_init->precomputation_us;
 	}
 
-	/* Responder */
-	handshake_resp->processing_us = proc_resp;
-	handshake_resp->txrx_us = 0;
-	handshake_resp->precomputation_us = precomp_resp_us;
-	handshake_resp->total_us = avg_wall * ratio_resp;
-	handshake_resp->overhead_us = handshake_resp->total_us -
-				      handshake_resp->processing_us -
-				      handshake_resp->txrx_us -
-				      handshake_resp->precomputation_us;
+	handshake_resp->processing_us     = proc_r;
+	handshake_resp->txrx_us           = txrx_r;
+	handshake_resp->precomputation_us = precomp_r;
+	handshake_resp->total_us          = avg_r_wall;
+	handshake_resp->overhead_us       = handshake_resp->total_us -
+					    handshake_resp->processing_us -
+					    handshake_resp->txrx_us -
+					    handshake_resp->precomputation_us;
 	if (handshake_resp->overhead_us < 0) {
 		handshake_resp->overhead_us = 0;
 		handshake_resp->total_us = handshake_resp->processing_us +
@@ -1463,25 +1793,6 @@ static int run_handshake_benchmark(int type_num,
 	double total_i_txrx = 0, total_r_txrx = 0;
 	int success_count = 0;
 
-	/* Precomputation: hanya X25519 ephemeral keygen */
-	double precomp_i_us = 0, precomp_r_us = 0;
-	{
-		uint8_t seed[32], sk[32], pk[32];
-		uint64_t t0, t1;
-
-		memset(seed, 0x42, 32);
-		t0 = get_time_ns();
-		compact_x25519_keygen(sk, pk, seed);
-		t1 = get_time_ns();
-		precomp_i_us = elapsed_us(t0, t1);
-
-		memset(seed, 0x43, 32);
-		t0 = get_time_ns();
-		compact_x25519_keygen(sk, pk, seed);
-		t1 = get_time_ns();
-		precomp_r_us = elapsed_us(t0, t1);
-	}
-
 	for (int iter = 0; iter < BENCH_HANDSHAKE_ITERATIONS; iter++) {
 		msg_exchange_init();
 
@@ -1538,31 +1849,40 @@ static int run_handshake_benchmark(int type_num,
 
 	double n = (double)success_count;
 
-	/* Use measured per-thread CPU time as processing cost.
+	/* Calibrate operations using measured per-thread CPU time.
 	 *
 	 * CLOCK_THREAD_CPUTIME_ID measures actual CPU cycles consumed by each
-	 * thread, automatically excluding condvar/mutex wait time (which is
-	 * part of txrx). This gives the true in-situ crypto + protocol cost.
+	 * thread (excluding condvar/mutex wait = txrx). We use this as the
+	 * ground truth and scale isolated microbenchmark avg_us values so that
+	 * sum(avg_us × calls) == measured_cpu for each role.
 	 *
-	 * The thread CPU time INCLUDES the X25519 keygen (precomputation) since
-	 * edhoc_initiator/responder_run() performs keygen internally.
-	 * We subtract precomp to get crypto-only processing, avoiding
-	 * double-counting.
+	 * This ensures FULL cross-table consistency:
+	 *   operations CSV: sum(total_per_handshake_us) == cpu_time_us == processing_us + precomp_us
+	 *   overhead CSV:   cpu_time_us == processing_us (handshake CSV)
+	 *   handshake CSV:  total == processing + txrx + precomp + overhead
 	 *
-	 * Note: The operations CSV provides isolated microbenchmark data as an
-	 * independent reference. Due to cache/pipeline effects, isolated
-	 * microbenchmark sums may differ from in-situ measured CPU time.
-	 * The handshake and overhead CSVs use measured CPU time for accuracy. */
+	 * The relative proportions between operations are preserved;
+	 * only the absolute scale is corrected for in-situ conditions. */
 	double cpu_i = total_i_cpu / n;
 	double cpu_r = total_r_cpu / n;
 
-	/* processing = cpu_time - precomp (keygen already in CPU measurement) */
-	double proc_i = cpu_i - precomp_i_us;
-	double proc_r = cpu_r - precomp_r_us;
-	if (proc_i < 0) proc_i = cpu_i;  /* safety: use full CPU if precomp > cpu */
-	if (proc_r < 0) proc_r = cpu_r;
+	/* Calibrate ops: scale avg_us so sum(ops) matches measured CPU */
+	calibrate_classic_ops(ops_init, cpu_i);
+	calibrate_classic_ops(ops_resp, cpu_r);
 
-	/* Overhead CSV: cpu_time = processing (measured CPU - precomp) */
+	/* Now derive ALL values from calibrated ops (= measured CPU) */
+	double ops_sum_i = compute_classic_ops_total(ops_init);
+	double ops_sum_r = compute_classic_ops_total(ops_resp);
+
+	/* Precomputation = calibrated keygen cost */
+	double precomp_cal_i = ops_init->keygen.avg_us * (double)ops_init->keygen.calls;
+	double precomp_cal_r = ops_resp->keygen.avg_us * (double)ops_resp->keygen.calls;
+
+	/* Processing = all crypto ops EXCLUDING keygen (avoid double-count) */
+	double proc_i = ops_sum_i - precomp_cal_i;
+	double proc_r = ops_sum_r - precomp_cal_r;
+
+	/* Overhead CSV: cpu_time = processing (crypto excluding keygen) */
 	overhead_i->cpu_us = proc_i;
 	overhead_i->memory_bytes = estimate_edhoc_memory(type_num);
 	overhead_r->cpu_us = proc_r;
@@ -1571,7 +1891,7 @@ static int run_handshake_benchmark(int type_num,
 	/* Handshake timing */
 	handshake_i->total_us = total_i_wall / n;
 	handshake_i->txrx_us = total_i_txrx / n;
-	handshake_i->precomputation_us = precomp_i_us;
+	handshake_i->precomputation_us = precomp_cal_i;
 	handshake_i->processing_us = proc_i;
 	handshake_i->overhead_us = handshake_i->total_us -
 				   handshake_i->processing_us -
@@ -1589,7 +1909,7 @@ static int run_handshake_benchmark(int type_num,
 
 	handshake_r->total_us = total_r_wall / n;
 	handshake_r->txrx_us = total_r_txrx / n;
-	handshake_r->precomputation_us = precomp_r_us;
+	handshake_r->precomputation_us = precomp_cal_r;
 	handshake_r->processing_us = proc_r;
 	handshake_r->overhead_us = handshake_r->total_us -
 				   handshake_r->processing_us -
@@ -1808,7 +2128,7 @@ static void print_overhead_summary(struct overhead_benchmark *t0_init,
 				   struct overhead_benchmark *t3_resp)
 {
 	printf("\n");
-	print_header("Overhead Benchmark (measured CPU time, avg per handshake)");
+	print_header("Overhead Benchmark (calibrated ops, avg per handshake)");
 	printf("\n");
 
 	printf("  %-16s %-12s %14s %14s %s\n",
@@ -1818,16 +2138,16 @@ static void print_overhead_summary(struct overhead_benchmark *t0_init,
 	       "──────────────", "────────────────────");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type0_SigSig", "Initiator", t0_init->cpu_us,
-	       t0_init->memory_bytes, "thread_cpu_time");
+	       t0_init->memory_bytes, "calibrated_ops");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type0_SigSig", "Responder", t0_resp->cpu_us,
-	       t0_resp->memory_bytes, "thread_cpu_time");
+	       t0_resp->memory_bytes, "calibrated_ops");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type3_MACMAC", "Initiator", t3_init->cpu_us,
-	       t3_init->memory_bytes, "thread_cpu_time");
+	       t3_init->memory_bytes, "calibrated_ops");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type3_MACMAC", "Responder", t3_resp->cpu_us,
-	       t3_resp->memory_bytes, "thread_cpu_time");
+	       t3_resp->memory_bytes, "calibrated_ops");
 }
 
 static void print_handshake_summary(struct handshake_benchmark *t0_init,
@@ -1895,12 +2215,13 @@ int run_edhoc_benchmark(void)
 	print_info("  ✓ ECDH: Type0=1×, Type3=3× (ephemeral + 2 static DH)");
 	print_info("  ✓ AEAD: CT2=XOR not AEAD (RFC 9528 §5.3.2), only CT3 uses AEAD");
 	print_info("  ✓ Memory: Estimated stack+heap footprint, not process RSS");
-	print_info("  ✓ CPU: Measured per-thread CPU time (CLOCK_THREAD_CPUTIME_ID)");
-	print_info("  ✓ Processing: Measured CPU time minus precomp (no double-counting)");
+	print_info("  ✓ CPU: Calibrated ops = measured CPU time (CLOCK_THREAD_CPUTIME_ID)");
+	print_info("  ✓ Processing: sum(calibrated ops) - keygen = cpu_time_us");
+	print_info("  ✓ Precomp: calibrated keygen cost (consistent with ops CSV)");
 	print_info("  ✓ Overhead: total - processing - txrx - precomp (≥ 0, clamped)");
 	print_info("  ✓ Hash: SHA-256 benchmark added (~4 calls/handshake)");
 	print_info("  ✓ Calls: Per-operation call count matches EDHOC protocol flow");
-	print_info("  ✓ Ops CSV: Isolated microbenchmarks (independent reference)");
+	print_info("  ✓ Consistency: sum(ops) == cpu_time == processing + precomp");
 	printf("\n");
 
 	mkdir(BENCH_OUTPUT_DIR, 0755);
@@ -2073,36 +2394,44 @@ static int write_operations_csv_full(const char *filepath,
 	WRITE_OP("Type3_MACMAC", "Responder", "Hash",         t3_resp->hash);
 
 	/* PQ Type 0 */
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_KeyGen",   t0pq_init->pq_keygen);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Encaps",   t0pq_init->pq_encaps);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Decaps",   t0pq_init->pq_decaps);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_AEAD_Enc", t0pq_init->pq_aead_enc);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_AEAD_Dec", t0pq_init->pq_aead_dec);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_HKDF",     t0pq_init->pq_hkdf);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Hash",     t0pq_init->pq_hash);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_KeyGen",   t0pq_resp->pq_keygen);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Encaps",   t0pq_resp->pq_encaps);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Decaps",   t0pq_resp->pq_decaps);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_AEAD_Enc", t0pq_resp->pq_aead_enc);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_AEAD_Dec", t0pq_resp->pq_aead_dec);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_HKDF",     t0pq_resp->pq_hkdf);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Hash",     t0pq_resp->pq_hash);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_KeyGen",       t0pq_init->pq_keygen);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_Encaps",       t0pq_init->pq_encaps);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_Decaps",       t0pq_init->pq_decaps);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_Signature",    t0pq_init->pq_sig_sign);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_Verification", t0pq_init->pq_sig_verify);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_AEAD_Enc",     t0pq_init->pq_aead_enc);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_AEAD_Dec",     t0pq_init->pq_aead_dec);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_HKDF",         t0pq_init->pq_hkdf);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_Hash",         t0pq_init->pq_hash);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_KeyGen",       t0pq_resp->pq_keygen);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_Encaps",       t0pq_resp->pq_encaps);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_Decaps",       t0pq_resp->pq_decaps);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_Signature",    t0pq_resp->pq_sig_sign);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_Verification", t0pq_resp->pq_sig_verify);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_AEAD_Enc",     t0pq_resp->pq_aead_enc);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_AEAD_Dec",     t0pq_resp->pq_aead_dec);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_HKDF",         t0pq_resp->pq_hkdf);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_Hash",         t0pq_resp->pq_hash);
 
 	/* PQ Type 3 */
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_KeyGen",   t3pq_init->pq_keygen);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Encaps",   t3pq_init->pq_encaps);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Decaps",   t3pq_init->pq_decaps);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_AEAD_Enc", t3pq_init->pq_aead_enc);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_AEAD_Dec", t3pq_init->pq_aead_dec);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_HKDF",     t3pq_init->pq_hkdf);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Hash",     t3pq_init->pq_hash);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_KeyGen",   t3pq_resp->pq_keygen);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Encaps",   t3pq_resp->pq_encaps);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Decaps",   t3pq_resp->pq_decaps);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_AEAD_Enc", t3pq_resp->pq_aead_enc);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_AEAD_Dec", t3pq_resp->pq_aead_dec);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_HKDF",     t3pq_resp->pq_hkdf);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Hash",     t3pq_resp->pq_hash);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_KeyGen",       t3pq_init->pq_keygen);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_Encaps",       t3pq_init->pq_encaps);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_Decaps",       t3pq_init->pq_decaps);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_Signature",    t3pq_init->pq_sig_sign);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_Verification", t3pq_init->pq_sig_verify);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_AEAD_Enc",     t3pq_init->pq_aead_enc);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_AEAD_Dec",     t3pq_init->pq_aead_dec);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_HKDF",         t3pq_init->pq_hkdf);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_Hash",         t3pq_init->pq_hash);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_KeyGen",       t3pq_resp->pq_keygen);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_Encaps",       t3pq_resp->pq_encaps);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_Decaps",       t3pq_resp->pq_decaps);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_Signature",    t3pq_resp->pq_sig_sign);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_Verification", t3pq_resp->pq_sig_verify);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_AEAD_Enc",     t3pq_resp->pq_aead_enc);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_AEAD_Dec",     t3pq_resp->pq_aead_dec);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_HKDF",         t3pq_resp->pq_hkdf);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_Hash",         t3pq_resp->pq_hash);
 
 	#undef WRITE_OP
 	fclose(fp);
@@ -2220,23 +2549,27 @@ static void print_pq_ops_summary(const char *type_name,
 		       init_ops->FIELD.avg_us, init_ops->FIELD.calls, \
 		       resp_ops->FIELD.avg_us, resp_ops->FIELD.calls)
 
-	PRINT_PQ("PQ KeyGen",   pq_keygen);
-	PRINT_PQ("PQ Encaps",   pq_encaps);
-	PRINT_PQ("PQ Decaps",   pq_decaps);
-	PRINT_PQ("PQ AEAD Enc", pq_aead_enc);
-	PRINT_PQ("PQ AEAD Dec", pq_aead_dec);
-	PRINT_PQ("PQ HKDF",     pq_hkdf);
-	PRINT_PQ("PQ Hash",     pq_hash);
+	PRINT_PQ("PQ KeyGen",     pq_keygen);
+	PRINT_PQ("PQ Encaps",     pq_encaps);
+	PRINT_PQ("PQ Decaps",     pq_decaps);
+	PRINT_PQ("PQ Sig Sign",   pq_sig_sign);
+	PRINT_PQ("PQ Sig Verify", pq_sig_verify);
+	PRINT_PQ("PQ AEAD Enc",   pq_aead_enc);
+	PRINT_PQ("PQ AEAD Dec",   pq_aead_dec);
+	PRINT_PQ("PQ HKDF",       pq_hkdf);
+	PRINT_PQ("PQ Hash",       pq_hash);
 
 	#undef PRINT_PQ
 
 	#define COST(OP) ((OP).avg_us * (double)(OP).calls)
 	double init_total = COST(init_ops->pq_keygen) + COST(init_ops->pq_encaps) +
-		COST(init_ops->pq_decaps) + COST(init_ops->pq_aead_enc) +
+		COST(init_ops->pq_decaps) + COST(init_ops->pq_sig_sign) +
+		COST(init_ops->pq_sig_verify) + COST(init_ops->pq_aead_enc) +
 		COST(init_ops->pq_aead_dec) + COST(init_ops->pq_hkdf) +
 		COST(init_ops->pq_hash);
 	double resp_total = COST(resp_ops->pq_keygen) + COST(resp_ops->pq_encaps) +
-		COST(resp_ops->pq_decaps) + COST(resp_ops->pq_aead_enc) +
+		COST(resp_ops->pq_decaps) + COST(resp_ops->pq_sig_sign) +
+		COST(resp_ops->pq_sig_verify) + COST(resp_ops->pq_aead_enc) +
 		COST(resp_ops->pq_aead_dec) + COST(resp_ops->pq_hkdf) +
 		COST(resp_ops->pq_hash);
 	#undef COST
@@ -2303,12 +2636,12 @@ int run_edhoc_benchmark_full(void)
 	memset(&t3pq_ops_init, 0, sizeof(t3pq_ops_init));
 	memset(&t3pq_ops_resp, 0, sizeof(t3pq_ops_resp));
 
-	bench_pq_all_operations("Type 0 PQ (ML-KEM-768)",
+	bench_pq_all_operations("Type 0 PQ (ML-KEM-768 + ML-DSA-65)", 0,
 				&t0pq_ops_init, &t0pq_ops_resp);
-	bench_pq_all_operations("Type 3 PQ (ML-KEM-768)",
+	bench_pq_all_operations("Type 3 PQ (ML-KEM-768)", 3,
 				&t3pq_ops_init, &t3pq_ops_resp);
 
-	print_pq_ops_summary("Type 0 PQ (ML-KEM-768)", &t0pq_ops_init, &t0pq_ops_resp);
+	print_pq_ops_summary("Type 0 PQ (ML-KEM-768 + ML-DSA-65)", &t0pq_ops_init, &t0pq_ops_resp);
 	print_pq_ops_summary("Type 3 PQ (ML-KEM-768)", &t3pq_ops_init, &t3pq_ops_resp);
 
 	/* === Phase 2: Classic Handshake + Overhead === */

@@ -256,3 +256,47 @@ int pq_hash_sha256(const uint8_t *data, size_t data_len, uint8_t *hash_out)
 
 	return (status == PSA_SUCCESS && hash_len == PQ_HASH_LEN) ? 0 : -1;
 }
+
+/* =============================================================================
+ * PQ Signature Operations (ML-DSA-65 via liboqs)
+ * =============================================================================
+ */
+
+int pq_sig_keygen(uint8_t *pk, uint8_t *sk)
+{
+	OQS_SIG *sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
+	if (sig == NULL)
+		return -1;
+
+	OQS_STATUS rc = OQS_SIG_keypair(sig, pk, sk);
+	OQS_SIG_free(sig);
+	return (rc == OQS_SUCCESS) ? 0 : -1;
+}
+
+int pq_sig_sign(const uint8_t *msg, size_t msg_len,
+                const uint8_t *sk,
+                uint8_t *sig_out, size_t *sig_len)
+{
+	OQS_SIG *sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
+	if (sig == NULL)
+		return -1;
+
+	OQS_STATUS rc = OQS_SIG_sign(sig, sig_out, sig_len,
+	                              msg, msg_len, sk);
+	OQS_SIG_free(sig);
+	return (rc == OQS_SUCCESS) ? 0 : -1;
+}
+
+int pq_sig_verify(const uint8_t *msg, size_t msg_len,
+                  const uint8_t *sig_in, size_t sig_len,
+                  const uint8_t *pk)
+{
+	OQS_SIG *sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
+	if (sig == NULL)
+		return -1;
+
+	OQS_STATUS rc = OQS_SIG_verify(sig, msg, msg_len,
+	                                sig_in, sig_len, pk);
+	OQS_SIG_free(sig);
+	return (rc == OQS_SUCCESS) ? 0 : -1;
+}

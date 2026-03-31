@@ -48,20 +48,35 @@
  *     2. PRK_out = KDF(PRK3, TH4)
  *
  * === Crypto Operations (same as Type 0 PQ) ===
- *   Initiator: KeyGen=1, Encaps=1, Decaps=2, HKDF≈8, AEAD_Enc=2, AEAD_Dec=1, Hash=3
- *   Responder: KeyGen=0, Encaps=2, Decaps=1, HKDF≈8, AEAD_Enc=1, AEAD_Dec=2, Hash=3
+ *   Initiator: KeyGen=1(eph), Encaps=1, Decaps=2, HKDF≈8, AEAD_Enc=2, AEAD_Dec=1, Hash=3
+ *   Responder: KeyGen=1(lt),  Encaps=2, Decaps=1, HKDF≈8, AEAD_Enc=1, AEAD_Dec=2, Hash=3
  *
  * =============================================================================
  */
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 199309L
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "edhoc_pq_kem.h"
 #include "edhoc_type3_pq.h"
 #include "edhoc_common.h"
+
+/* Per-thread txrx timing counter (same approach as Type 0 PQ) */
+static inline uint64_t pq3_get_time_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+__thread uint64_t pq3_txrx_ns = 0;
 
 /* ── PQ Message Exchange ── */
 #define PQ_MSG_BUF_SIZE 8192
@@ -84,7 +99,7 @@ struct pq3_msg_exchange {
 
 static struct pq3_msg_exchange g_pq3_exchange;
 
-static void pq3_exchange_init(void)
+void pq3_exchange_init(void)
 {
 	memset(&g_pq3_exchange, 0, sizeof(g_pq3_exchange));
 	pthread_mutex_init(&g_pq3_exchange.mutex, NULL);
@@ -93,30 +108,13 @@ static void pq3_exchange_init(void)
 	pthread_cond_init(&g_pq3_exchange.cond_msg3_ready, NULL);
 }
 
-static void pq3_exchange_destroy(void)
+void pq3_exchange_destroy(void)
 {
 	pthread_mutex_destroy(&g_pq3_exchange.mutex);
 	pthread_cond_destroy(&g_pq3_exchange.cond_msg1_ready);
 	pthread_cond_destroy(&g_pq3_exchange.cond_msg2_ready);
 	pthread_cond_destroy(&g_pq3_exchange.cond_msg3_ready);
 }
-
-/* ── Party Context ── */
-struct pq3_party_ctx {
-	uint8_t lt_pk[PQ_KEM_PK_LEN];
-	uint8_t lt_sk[PQ_KEM_SK_LEN];
-	uint8_t other_lt_pk[PQ_KEM_PK_LEN];
-	uint8_t eph_pk[PQ_KEM_PK_LEN];
-	uint8_t eph_sk[PQ_KEM_SK_LEN];
-	uint8_t prk1[PQ_PRK_LEN];
-	uint8_t prk2[PQ_PRK_LEN];
-	uint8_t prk3[PQ_PRK_LEN];
-	uint8_t th2[PQ_HASH_LEN];
-	uint8_t th3[PQ_HASH_LEN];
-	uint8_t th4[PQ_HASH_LEN];
-	uint8_t prk_out[PQ_PRK_LEN];
-	int success;
-};
 
 /* Info labels */
 static const uint8_t T3PQ_K1[]   = "EDHOC-T3PQ-K1";
@@ -147,10 +145,13 @@ static int t3pq_derive_key_iv(const uint8_t *prk,
  * Initiator Thread (Type 3 PQ)
  * =============================================================================
  */
-static void *pq3_initiator_thread(void *arg)
+void *pq3_initiator_thread(void *arg)
 {
 	struct pq3_party_ctx *ctx = (struct pq3_party_ctx *)arg;
 	int ret;
+
+	/* Reset per-thread txrx counter */
+	pq3_txrx_ns = 0;
 
 	/* ── Step 1: Generate ephemeral + Encaps to pkR ── */
 	ret = pq_kem_keygen(ctx->eph_pk, ctx->eph_sk);
@@ -182,27 +183,35 @@ static void *pq3_initiator_thread(void *arg)
 	if (ret != 0) { print_error("T3PQ Init: AEAD enc msg1 failed"); return NULL; }
 
 	/* ── Send msg1 ── */
-	pthread_mutex_lock(&g_pq3_exchange.mutex);
 	{
-		uint8_t *p = g_pq3_exchange.msg1_buf;
-		uint32_t off = 0;
-		memcpy(p + off, ctx->eph_pk, PQ_KEM_PK_LEN); off += PQ_KEM_PK_LEN;
-		memcpy(p + off, ct_R, PQ_KEM_CT_LEN);        off += PQ_KEM_CT_LEN;
-		p[off++] = (uint8_t)(ct1_aead_len >> 8);
-		p[off++] = (uint8_t)(ct1_aead_len & 0xFF);
-		memcpy(p + off, ct1_aead, ct1_aead_len);      off += ct1_aead_len;
-		g_pq3_exchange.msg1_len = off;
-		g_pq3_exchange.msg1_ready = 1;
+		uint64_t _txrx_start = pq3_get_time_ns();
+		pthread_mutex_lock(&g_pq3_exchange.mutex);
+		{
+			uint8_t *p = g_pq3_exchange.msg1_buf;
+			uint32_t off = 0;
+			memcpy(p + off, ctx->eph_pk, PQ_KEM_PK_LEN); off += PQ_KEM_PK_LEN;
+			memcpy(p + off, ct_R, PQ_KEM_CT_LEN);        off += PQ_KEM_CT_LEN;
+			p[off++] = (uint8_t)(ct1_aead_len >> 8);
+			p[off++] = (uint8_t)(ct1_aead_len & 0xFF);
+			memcpy(p + off, ct1_aead, ct1_aead_len);      off += ct1_aead_len;
+			g_pq3_exchange.msg1_len = off;
+			g_pq3_exchange.msg1_ready = 1;
+		}
+		pthread_cond_signal(&g_pq3_exchange.cond_msg1_ready);
+		pthread_mutex_unlock(&g_pq3_exchange.mutex);
+		pq3_txrx_ns += (pq3_get_time_ns() - _txrx_start);
 	}
-	pthread_cond_signal(&g_pq3_exchange.cond_msg1_ready);
-	pthread_mutex_unlock(&g_pq3_exchange.mutex);
 
 	/* ── Receive msg2 ── */
-	pthread_mutex_lock(&g_pq3_exchange.mutex);
-	while (!g_pq3_exchange.msg2_ready)
-		pthread_cond_wait(&g_pq3_exchange.cond_msg2_ready,
-		                  &g_pq3_exchange.mutex);
-	pthread_mutex_unlock(&g_pq3_exchange.mutex);
+	{
+		uint64_t _txrx_start = pq3_get_time_ns();
+		pthread_mutex_lock(&g_pq3_exchange.mutex);
+		while (!g_pq3_exchange.msg2_ready)
+			pthread_cond_wait(&g_pq3_exchange.cond_msg2_ready,
+			                  &g_pq3_exchange.mutex);
+		pthread_mutex_unlock(&g_pq3_exchange.mutex);
+		pq3_txrx_ns += (pq3_get_time_ns() - _txrx_start);
+	}
 
 	uint8_t *msg2 = g_pq3_exchange.msg2_buf;
 	uint32_t m2off = 0;
@@ -290,12 +299,16 @@ static void *pq3_initiator_thread(void *arg)
 	if (ret != 0) { print_error("T3PQ Init: AEAD enc msg3 failed"); return NULL; }
 
 	/* ── Send msg3 ── */
-	pthread_mutex_lock(&g_pq3_exchange.mutex);
-	memcpy(g_pq3_exchange.msg3_buf, ct3_aead, ct3_aead_len);
-	g_pq3_exchange.msg3_len = ct3_aead_len;
-	g_pq3_exchange.msg3_ready = 1;
-	pthread_cond_signal(&g_pq3_exchange.cond_msg3_ready);
-	pthread_mutex_unlock(&g_pq3_exchange.mutex);
+	{
+		uint64_t _txrx_start = pq3_get_time_ns();
+		pthread_mutex_lock(&g_pq3_exchange.mutex);
+		memcpy(g_pq3_exchange.msg3_buf, ct3_aead, ct3_aead_len);
+		g_pq3_exchange.msg3_len = ct3_aead_len;
+		g_pq3_exchange.msg3_ready = 1;
+		pthread_cond_signal(&g_pq3_exchange.cond_msg3_ready);
+		pthread_mutex_unlock(&g_pq3_exchange.mutex);
+		pq3_txrx_ns += (pq3_get_time_ns() - _txrx_start);
+	}
 
 	/* PRK_out */
 	uint8_t th4_in[PQ_HASH_LEN + 64];
@@ -308,6 +321,7 @@ static void *pq3_initiator_thread(void *arg)
 	if (ret != 0) { print_error("T3PQ Init: PRK_out failed"); return NULL; }
 
 	ctx->success = 1;
+	ctx->txrx_ns = pq3_txrx_ns;
 	print_success("T3PQ Initiator: EDHOC exchange completed!");
 	return NULL;
 }
@@ -316,17 +330,24 @@ static void *pq3_initiator_thread(void *arg)
  * Responder Thread (Type 3 PQ)
  * =============================================================================
  */
-static void *pq3_responder_thread(void *arg)
+void *pq3_responder_thread(void *arg)
 {
 	struct pq3_party_ctx *ctx = (struct pq3_party_ctx *)arg;
 	int ret;
 
+	/* Reset per-thread txrx counter */
+	pq3_txrx_ns = 0;
+
 	/* ── Receive msg1 ── */
-	pthread_mutex_lock(&g_pq3_exchange.mutex);
-	while (!g_pq3_exchange.msg1_ready)
-		pthread_cond_wait(&g_pq3_exchange.cond_msg1_ready,
-		                  &g_pq3_exchange.mutex);
-	pthread_mutex_unlock(&g_pq3_exchange.mutex);
+	{
+		uint64_t _txrx_start = pq3_get_time_ns();
+		pthread_mutex_lock(&g_pq3_exchange.mutex);
+		while (!g_pq3_exchange.msg1_ready)
+			pthread_cond_wait(&g_pq3_exchange.cond_msg1_ready,
+			                  &g_pq3_exchange.mutex);
+		pthread_mutex_unlock(&g_pq3_exchange.mutex);
+		pq3_txrx_ns += (pq3_get_time_ns() - _txrx_start);
+	}
 
 	uint8_t *msg1 = g_pq3_exchange.msg1_buf;
 	uint32_t m1off = 0;
@@ -409,27 +430,35 @@ static void *pq3_responder_thread(void *arg)
 	if (ret != 0) { print_error("T3PQ Resp: AEAD enc msg2 failed"); return NULL; }
 
 	/* ── Send msg2 ── */
-	pthread_mutex_lock(&g_pq3_exchange.mutex);
 	{
-		uint8_t *p = g_pq3_exchange.msg2_buf;
-		uint32_t off = 0;
-		memcpy(p + off, ct_eph2, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
-		memcpy(p + off, ct_I, PQ_KEM_CT_LEN);    off += PQ_KEM_CT_LEN;
-		p[off++] = (uint8_t)(ct2_aead_len >> 8);
-		p[off++] = (uint8_t)(ct2_aead_len & 0xFF);
-		memcpy(p + off, ct2_aead, ct2_aead_len);  off += ct2_aead_len;
-		g_pq3_exchange.msg2_len = off;
-		g_pq3_exchange.msg2_ready = 1;
+		uint64_t _txrx_start = pq3_get_time_ns();
+		pthread_mutex_lock(&g_pq3_exchange.mutex);
+		{
+			uint8_t *p = g_pq3_exchange.msg2_buf;
+			uint32_t off = 0;
+			memcpy(p + off, ct_eph2, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+			memcpy(p + off, ct_I, PQ_KEM_CT_LEN);    off += PQ_KEM_CT_LEN;
+			p[off++] = (uint8_t)(ct2_aead_len >> 8);
+			p[off++] = (uint8_t)(ct2_aead_len & 0xFF);
+			memcpy(p + off, ct2_aead, ct2_aead_len);  off += ct2_aead_len;
+			g_pq3_exchange.msg2_len = off;
+			g_pq3_exchange.msg2_ready = 1;
+		}
+		pthread_cond_signal(&g_pq3_exchange.cond_msg2_ready);
+		pthread_mutex_unlock(&g_pq3_exchange.mutex);
+		pq3_txrx_ns += (pq3_get_time_ns() - _txrx_start);
 	}
-	pthread_cond_signal(&g_pq3_exchange.cond_msg2_ready);
-	pthread_mutex_unlock(&g_pq3_exchange.mutex);
 
 	/* ── Receive msg3 ── */
-	pthread_mutex_lock(&g_pq3_exchange.mutex);
-	while (!g_pq3_exchange.msg3_ready)
-		pthread_cond_wait(&g_pq3_exchange.cond_msg3_ready,
-		                  &g_pq3_exchange.mutex);
-	pthread_mutex_unlock(&g_pq3_exchange.mutex);
+	{
+		uint64_t _txrx_start = pq3_get_time_ns();
+		pthread_mutex_lock(&g_pq3_exchange.mutex);
+		while (!g_pq3_exchange.msg3_ready)
+			pthread_cond_wait(&g_pq3_exchange.cond_msg3_ready,
+			                  &g_pq3_exchange.mutex);
+		pthread_mutex_unlock(&g_pq3_exchange.mutex);
+		pq3_txrx_ns += (pq3_get_time_ns() - _txrx_start);
+	}
 
 	uint8_t k3[PQ_AEAD_KEY_LEN], iv3[PQ_AEAD_NONCE_LEN];
 	ret = t3pq_derive_key_iv(ctx->prk3, T3PQ_K3, sizeof(T3PQ_K3) - 1, k3, iv3);
@@ -475,6 +504,7 @@ static void *pq3_responder_thread(void *arg)
 	if (ret != 0) { print_error("T3PQ Resp: PRK_out failed"); return NULL; }
 
 	ctx->success = 1;
+	ctx->txrx_ns = pq3_txrx_ns;
 	print_success("T3PQ Responder: EDHOC exchange completed!");
 	return NULL;
 }

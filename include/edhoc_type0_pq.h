@@ -26,6 +26,8 @@
 #ifndef EDHOC_TYPE0_PQ_H
 #define EDHOC_TYPE0_PQ_H
 
+#include <stdint.h>
+
 /**
  * @brief Run EDHOC Type 0 PQ (KEM-based) protocol simulation.
  *
@@ -35,5 +37,37 @@
  * @return 0 on success, -1 on failure
  */
 int run_edhoc_type0_pq(void);
+
+/* ── Benchmark support: expose internal thread functions ─────────────── */
+#include "edhoc_pq_kem.h"  /* PQ_KEM_PK_LEN, PQ_KEM_SK_LEN, etc. */
+
+struct pq_party_ctx {
+	/* KEM long-term keys (used for key exchange / encaps to other party) */
+	uint8_t lt_pk[PQ_KEM_PK_LEN];
+	uint8_t lt_sk[PQ_KEM_SK_LEN];
+	uint8_t other_lt_pk[PQ_KEM_PK_LEN];
+	/* Signature long-term keys (ML-DSA-65, for Type 0 PQ SigSig auth) */
+	uint8_t sig_pk[PQ_SIG_PK_LEN];
+	uint8_t sig_sk[PQ_SIG_SK_LEN];
+	uint8_t other_sig_pk[PQ_SIG_PK_LEN];
+	/* Ephemeral KEM keys */
+	uint8_t eph_pk[PQ_KEM_PK_LEN];
+	uint8_t eph_sk[PQ_KEM_SK_LEN];
+	/* Derived key material */
+	uint8_t prk1[PQ_PRK_LEN];
+	uint8_t prk2[PQ_PRK_LEN];
+	uint8_t prk3[PQ_PRK_LEN];
+	uint8_t th2[PQ_HASH_LEN];
+	uint8_t th3[PQ_HASH_LEN];
+	uint8_t th4[PQ_HASH_LEN];
+	uint8_t prk_out[PQ_PRK_LEN];
+	int success;
+	uint64_t txrx_ns;  /* Accumulated message exchange time (ns) */
+};
+
+void pq_exchange_init(void);
+void pq_exchange_destroy(void);
+void *pq_type0_initiator_thread(void *arg);
+void *pq_type0_responder_thread(void *arg);
 
 #endif /* EDHOC_TYPE0_PQ_H */
