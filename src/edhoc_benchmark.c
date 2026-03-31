@@ -172,17 +172,19 @@ struct ops_benchmark {
 
 /* Overhead resource untuk satu (type, role) */
 struct overhead_benchmark {
-	double cpu_us;         /* Computed crypto cost from ops benchmark (µs) */
+	double cpu_us;         /* Measured in-situ CPU time (µs) — Classic: thread CPU,
+				  PQ: computed from ops benchmark */
 	long   memory_bytes;   /* Estimated stack + heap memory dalam bytes */
 };
 
 /* Waktu handshake per fase untuk satu (type, role) */
 struct handshake_benchmark {
-	double processing_us;     /* Computed crypto cost from ops benchmark */
+	double processing_us;     /* Measured in-situ CPU time (Classic) or
+				     computed from ops (PQ) */
 	double txrx_us;           /* Waktu transmisi/penerimaan pesan */
 	double precomputation_us; /* Waktu setup kunci (ephemeral keygen) */
-	double overhead_us;       /* Protocol overhead (CBOR, memcpy, etc.) */
-	double total_us;          /* Total waktu handshake (measured wall time) */
+	double overhead_us;       /* Scheduling & IPC overhead (≥ 0) */
+	double total_us;          /* Total = processing + txrx + precomp + overhead */
 };
 
 /* =============================================================================
@@ -1377,6 +1379,12 @@ static int run_pq_handshake_benchmark(int pq_type_num,
 				      handshake_init->processing_us -
 				      handshake_init->txrx_us -
 				      handshake_init->precomputation_us;
+	if (handshake_init->overhead_us < 0) {
+		handshake_init->overhead_us = 0;
+		handshake_init->total_us = handshake_init->processing_us +
+					   handshake_init->txrx_us +
+					   handshake_init->precomputation_us;
+	}
 
 	/* Responder */
 	handshake_resp->processing_us = proc_resp;
@@ -1387,6 +1395,12 @@ static int run_pq_handshake_benchmark(int pq_type_num,
 				      handshake_resp->processing_us -
 				      handshake_resp->txrx_us -
 				      handshake_resp->precomputation_us;
+	if (handshake_resp->overhead_us < 0) {
+		handshake_resp->overhead_us = 0;
+		handshake_resp->total_us = handshake_resp->processing_us +
+					   handshake_resp->txrx_us +
+					   handshake_resp->precomputation_us;
+	}
 
 	snprintf(buf, sizeof(buf),
 		 "PQ handshake benchmark completed (%d/%d successful).",
@@ -1445,6 +1459,7 @@ static int run_handshake_benchmark(int type_num,
 	print_info(buf);
 
 	double total_i_wall = 0, total_r_wall = 0;
+	double total_i_cpu = 0, total_r_cpu = 0;
 	double total_i_txrx = 0, total_r_txrx = 0;
 	int success_count = 0;
 
@@ -1498,11 +1513,18 @@ static int run_handshake_benchmark(int type_num,
 			double r_wall = elapsed_us(r_data.wall_start_ns,
 						   r_data.wall_end_ns);
 
+			double i_cpu = elapsed_us(i_data.cpu_start_ns,
+						  i_data.cpu_end_ns);
+			double r_cpu = elapsed_us(r_data.cpu_start_ns,
+						  r_data.cpu_end_ns);
+
 			double i_txrx = (double)(uintptr_t)i_txrx_ret / 1000.0;
 			double r_txrx = (double)(uintptr_t)r_txrx_ret / 1000.0;
 
 			total_i_wall += i_wall;
 			total_r_wall += r_wall;
+			total_i_cpu += i_cpu;
+			total_r_cpu += r_cpu;
 			total_i_txrx += i_txrx;
 			total_r_txrx += r_txrx;
 			success_count++;
@@ -1516,12 +1538,31 @@ static int run_handshake_benchmark(int type_num,
 
 	double n = (double)success_count;
 
-	/* Compute processing cost from operations benchmark (sum of ops × calls)
-	 * This ensures processing_us is directly derivable from operations CSV */
-	double proc_i = compute_classic_ops_total(ops_init);
-	double proc_r = compute_classic_ops_total(ops_resp);
+	/* Use measured per-thread CPU time as processing cost.
+	 *
+	 * CLOCK_THREAD_CPUTIME_ID measures actual CPU cycles consumed by each
+	 * thread, automatically excluding condvar/mutex wait time (which is
+	 * part of txrx). This gives the true in-situ crypto + protocol cost.
+	 *
+	 * The thread CPU time INCLUDES the X25519 keygen (precomputation) since
+	 * edhoc_initiator/responder_run() performs keygen internally.
+	 * We subtract precomp to get crypto-only processing, avoiding
+	 * double-counting.
+	 *
+	 * Note: The operations CSV provides isolated microbenchmark data as an
+	 * independent reference. Due to cache/pipeline effects, isolated
+	 * microbenchmark sums may differ from in-situ measured CPU time.
+	 * The handshake and overhead CSVs use measured CPU time for accuracy. */
+	double cpu_i = total_i_cpu / n;
+	double cpu_r = total_r_cpu / n;
 
-	/* Overhead: computed crypto cost + estimated memory */
+	/* processing = cpu_time - precomp (keygen already in CPU measurement) */
+	double proc_i = cpu_i - precomp_i_us;
+	double proc_r = cpu_r - precomp_r_us;
+	if (proc_i < 0) proc_i = cpu_i;  /* safety: use full CPU if precomp > cpu */
+	if (proc_r < 0) proc_r = cpu_r;
+
+	/* Overhead CSV: cpu_time = processing (measured CPU - precomp) */
 	overhead_i->cpu_us = proc_i;
 	overhead_i->memory_bytes = estimate_edhoc_memory(type_num);
 	overhead_r->cpu_us = proc_r;
@@ -1536,6 +1577,15 @@ static int run_handshake_benchmark(int type_num,
 				   handshake_i->processing_us -
 				   handshake_i->txrx_us -
 				   handshake_i->precomputation_us;
+	/* Safety clamp: if overhead < 0 due to timing resolution overlap,
+	 * set to 0 and adjust total to maintain arithmetic identity:
+	 * total = processing + txrx + precomp + overhead */
+	if (handshake_i->overhead_us < 0) {
+		handshake_i->overhead_us = 0;
+		handshake_i->total_us = handshake_i->processing_us +
+					handshake_i->txrx_us +
+					handshake_i->precomputation_us;
+	}
 
 	handshake_r->total_us = total_r_wall / n;
 	handshake_r->txrx_us = total_r_txrx / n;
@@ -1545,6 +1595,12 @@ static int run_handshake_benchmark(int type_num,
 				   handshake_r->processing_us -
 				   handshake_r->txrx_us -
 				   handshake_r->precomputation_us;
+	if (handshake_r->overhead_us < 0) {
+		handshake_r->overhead_us = 0;
+		handshake_r->total_us = handshake_r->processing_us +
+					handshake_r->txrx_us +
+					handshake_r->precomputation_us;
+	}
 
 	snprintf(buf, sizeof(buf),
 		 "Handshake benchmark completed (%d/%d successful).",
@@ -1752,7 +1808,7 @@ static void print_overhead_summary(struct overhead_benchmark *t0_init,
 				   struct overhead_benchmark *t3_resp)
 {
 	printf("\n");
-	print_header("Overhead Benchmark (computed from ops, avg per handshake)");
+	print_header("Overhead Benchmark (measured CPU time, avg per handshake)");
 	printf("\n");
 
 	printf("  %-16s %-12s %14s %14s %s\n",
@@ -1762,16 +1818,16 @@ static void print_overhead_summary(struct overhead_benchmark *t0_init,
 	       "──────────────", "────────────────────");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type0_SigSig", "Initiator", t0_init->cpu_us,
-	       t0_init->memory_bytes, "sum(ops×calls)");
+	       t0_init->memory_bytes, "thread_cpu_time");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type0_SigSig", "Responder", t0_resp->cpu_us,
-	       t0_resp->memory_bytes, "sum(ops×calls)");
+	       t0_resp->memory_bytes, "thread_cpu_time");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type3_MACMAC", "Initiator", t3_init->cpu_us,
-	       t3_init->memory_bytes, "sum(ops×calls)");
+	       t3_init->memory_bytes, "thread_cpu_time");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type3_MACMAC", "Responder", t3_resp->cpu_us,
-	       t3_resp->memory_bytes, "sum(ops×calls)");
+	       t3_resp->memory_bytes, "thread_cpu_time");
 }
 
 static void print_handshake_summary(struct handshake_benchmark *t0_init,
@@ -1839,11 +1895,12 @@ int run_edhoc_benchmark(void)
 	print_info("  ✓ ECDH: Type0=1×, Type3=3× (ephemeral + 2 static DH)");
 	print_info("  ✓ AEAD: CT2=XOR not AEAD (RFC 9528 §5.3.2), only CT3 uses AEAD");
 	print_info("  ✓ Memory: Estimated stack+heap footprint, not process RSS");
-	print_info("  ✓ CPU: Computed crypto cost = sum(ops × calls), directly verifiable");
-	print_info("  ✓ Processing: Same as CPU, derived from operations benchmark");
-	print_info("  ✓ Overhead: Protocol overhead = total - processing - txrx - precomp");
+	print_info("  ✓ CPU: Measured per-thread CPU time (CLOCK_THREAD_CPUTIME_ID)");
+	print_info("  ✓ Processing: Measured CPU time minus precomp (no double-counting)");
+	print_info("  ✓ Overhead: total - processing - txrx - precomp (≥ 0, clamped)");
 	print_info("  ✓ Hash: SHA-256 benchmark added (~4 calls/handshake)");
 	print_info("  ✓ Calls: Per-operation call count matches EDHOC protocol flow");
+	print_info("  ✓ Ops CSV: Isolated microbenchmarks (independent reference)");
 	printf("\n");
 
 	mkdir(BENCH_OUTPUT_DIR, 0755);
