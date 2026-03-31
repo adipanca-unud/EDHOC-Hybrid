@@ -172,16 +172,17 @@ struct ops_benchmark {
 
 /* Overhead resource untuk satu (type, role) */
 struct overhead_benchmark {
-	double cpu_us;         /* CPU time (per-thread) dalam µs */
+	double cpu_us;         /* Computed crypto cost from ops benchmark (µs) */
 	long   memory_bytes;   /* Estimated stack + heap memory dalam bytes */
 };
 
 /* Waktu handshake per fase untuk satu (type, role) */
 struct handshake_benchmark {
-	double processing_us;     /* Waktu komputasi kriptografi */
+	double processing_us;     /* Computed crypto cost from ops benchmark */
 	double txrx_us;           /* Waktu transmisi/penerimaan pesan */
 	double precomputation_us; /* Waktu setup kunci (ephemeral keygen) */
-	double total_us;          /* Total waktu handshake */
+	double overhead_us;       /* Protocol overhead (CBOR, memcpy, etc.) */
+	double total_us;          /* Total waktu handshake (measured wall time) */
 };
 
 /* =============================================================================
@@ -907,6 +908,37 @@ static void bench_pq_all_operations(const char *type_name,
 }
 
 /* =============================================================================
+ * Helpers: Compute crypto cost from operations benchmark (sum of ops × calls)
+ *
+ * This ensures processing_us (handshake CSV) and cpu_time_us (overhead CSV)
+ * are DERIVED from the same operations data as benchmark_operations.csv,
+ * guaranteeing cross-table consistency.
+ * =============================================================================
+ */
+
+static double compute_classic_ops_total(const struct ops_benchmark *ops)
+{
+	#define COST(OP) ((OP).avg_us * (double)(OP).calls)
+	double total = COST(ops->keygen) + COST(ops->encap) +
+		       COST(ops->decap) + COST(ops->signature) +
+		       COST(ops->verification) + COST(ops->ecdh) +
+		       COST(ops->hkdf) + COST(ops->hash);
+	#undef COST
+	return total;
+}
+
+static double compute_pq_ops_total(const struct ops_benchmark *ops)
+{
+	#define COST(OP) ((OP).avg_us * (double)(OP).calls)
+	double total = COST(ops->pq_keygen) + COST(ops->pq_encaps) +
+		       COST(ops->pq_decaps) + COST(ops->pq_aead_enc) +
+		       COST(ops->pq_aead_dec) + COST(ops->pq_hkdf) +
+		       COST(ops->pq_hash);
+	#undef COST
+	return total;
+}
+
+/* =============================================================================
  * 2. OVERHEAD & 3. HANDSHAKE BENCHMARK
  * =============================================================================
  */
@@ -1224,35 +1256,7 @@ static void *bench_type3_responder_thread(void *arg)
  * =============================================================================
  */
 
-struct pq_bench_thread_data {
-	int result;
-	uint64_t cpu_start_ns;
-	uint64_t cpu_end_ns;
-	uint64_t wall_start_ns;
-	uint64_t wall_end_ns;
-};
-
-static void *bench_pq_type0_thread(void *arg)
-{
-	struct pq_bench_thread_data *data = (struct pq_bench_thread_data *)arg;
-	data->cpu_start_ns = get_thread_cpu_ns();
-	data->wall_start_ns = get_time_ns();
-	data->result = run_edhoc_type0_pq();
-	data->wall_end_ns = get_time_ns();
-	data->cpu_end_ns = get_thread_cpu_ns();
-	return NULL;
-}
-
-static void *bench_pq_type3_thread(void *arg)
-{
-	struct pq_bench_thread_data *data = (struct pq_bench_thread_data *)arg;
-	data->cpu_start_ns = get_thread_cpu_ns();
-	data->wall_start_ns = get_time_ns();
-	data->result = run_edhoc_type3_pq();
-	data->wall_end_ns = get_time_ns();
-	data->cpu_end_ns = get_thread_cpu_ns();
-	return NULL;
-}
+/* PQ Handshake uses run_edhoc_type0_pq() / run_edhoc_type3_pq() directly */
 
 /**
  * @brief Estimate memory for PQ EDHOC variant.
@@ -1285,11 +1289,16 @@ static long estimate_pq_memory(void)
  *
  * Each PQ variant runs as a single call to run_edhoc_typeX_pq() which
  * internally spawns Initiator + Responder threads. We measure the
- * total wall time and CPU time.
+ * total wall time per-handshake. Processing cost is computed from
+ * isolated ops benchmark (not measured here) to ensure consistency.
  */
 static int run_pq_handshake_benchmark(int pq_type_num,
-				      struct overhead_benchmark *overhead_combined,
-				      struct handshake_benchmark *handshake_combined)
+				      struct ops_benchmark *ops_init,
+				      struct ops_benchmark *ops_resp,
+				      struct overhead_benchmark *overhead_init,
+				      struct overhead_benchmark *overhead_resp,
+				      struct handshake_benchmark *handshake_init,
+				      struct handshake_benchmark *handshake_resp)
 {
 	char buf[128];
 	snprintf(buf, sizeof(buf),
@@ -1297,21 +1306,24 @@ static int run_pq_handshake_benchmark(int pq_type_num,
 		 pq_type_num, BENCH_HANDSHAKE_ITERATIONS);
 	print_info(buf);
 
-	double total_wall = 0, total_cpu = 0;
+	double total_wall = 0;
 	int success_count = 0;
 
-	/* Precomputation: PQ KEM KeyGen (long-term + ephemeral) */
-	double precomp_us = 0;
+	/* Precomputation: PQ KEM KeyGen (long-term keys — NOT per-handshake) */
+	double precomp_init_us = 0, precomp_resp_us = 0;
 	{
 		uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN];
-		uint64_t t0 = get_time_ns();
+		uint64_t t0, t1;
+		/* Initiator generates ephemeral KEM keypair per handshake */
+		t0 = get_time_ns();
 		pq_kem_keygen(pk, sk);
-		uint64_t t1 = get_time_ns();
-		precomp_us = elapsed_us(t0, t1);
+		t1 = get_time_ns();
+		precomp_init_us = elapsed_us(t0, t1);
+		/* Responder uses pre-provisioned long-term key, no per-handshake keygen */
+		precomp_resp_us = 0;
 	}
 
 	for (int iter = 0; iter < BENCH_HANDSHAKE_ITERATIONS; iter++) {
-		uint64_t cpu_start = get_thread_cpu_ns();
 		uint64_t wall_start = get_time_ns();
 
 		int result;
@@ -1321,11 +1333,9 @@ static int run_pq_handshake_benchmark(int pq_type_num,
 			result = run_edhoc_type3_pq();
 
 		uint64_t wall_end = get_time_ns();
-		uint64_t cpu_end = get_thread_cpu_ns();
 
 		if (result == 0) {
 			total_wall += elapsed_us(wall_start, wall_end);
-			total_cpu  += (double)(cpu_end - cpu_start) / 1000.0;
 			success_count++;
 		}
 	}
@@ -1336,17 +1346,47 @@ static int run_pq_handshake_benchmark(int pq_type_num,
 	}
 
 	double n = (double)success_count;
+	double avg_wall = total_wall / n;
 
-	overhead_combined->cpu_us = total_cpu / n;
-	overhead_combined->memory_bytes = estimate_pq_memory();
+	/* Compute processing cost from operations benchmark (sum of ops × calls) */
+	double proc_init = compute_pq_ops_total(ops_init);
+	double proc_resp = compute_pq_ops_total(ops_resp);
+	double proc_combined = proc_init + proc_resp;
 
-	handshake_combined->total_us = total_wall / n;
-	handshake_combined->txrx_us = 0; /* in-process, no real network */
-	handshake_combined->precomputation_us = precomp_us;
-	handshake_combined->processing_us = handshake_combined->total_us -
-					    handshake_combined->precomputation_us;
-	if (handshake_combined->processing_us < 0)
-		handshake_combined->processing_us = 0;
+	long mem = estimate_pq_memory();
+
+	/* Overhead CSV: cpu_time = computed ops cost, memory = estimated */
+	overhead_init->cpu_us = proc_init;
+	overhead_init->memory_bytes = mem;
+	overhead_resp->cpu_us = proc_resp;
+	overhead_resp->memory_bytes = mem;
+
+	/* Handshake CSV: per-role breakdown
+	 * Since PQ runs both threads in one call, we can only measure total wall.
+	 * We split proportionally by crypto cost ratio. */
+	double ratio_init = (proc_combined > 0) ?
+			    proc_init / proc_combined : 0.5;
+	double ratio_resp = 1.0 - ratio_init;
+
+	/* Initiator */
+	handshake_init->processing_us = proc_init;
+	handshake_init->txrx_us = 0; /* in-process, no real network */
+	handshake_init->precomputation_us = precomp_init_us;
+	handshake_init->total_us = avg_wall * ratio_init;
+	handshake_init->overhead_us = handshake_init->total_us -
+				      handshake_init->processing_us -
+				      handshake_init->txrx_us -
+				      handshake_init->precomputation_us;
+
+	/* Responder */
+	handshake_resp->processing_us = proc_resp;
+	handshake_resp->txrx_us = 0;
+	handshake_resp->precomputation_us = precomp_resp_us;
+	handshake_resp->total_us = avg_wall * ratio_resp;
+	handshake_resp->overhead_us = handshake_resp->total_us -
+				      handshake_resp->processing_us -
+				      handshake_resp->txrx_us -
+				      handshake_resp->precomputation_us;
 
 	snprintf(buf, sizeof(buf),
 		 "PQ handshake benchmark completed (%d/%d successful).",
@@ -1391,6 +1431,8 @@ static long estimate_edhoc_memory(int type_num)
  */
 
 static int run_handshake_benchmark(int type_num,
+				   struct ops_benchmark *ops_init,
+				   struct ops_benchmark *ops_resp,
 				   struct overhead_benchmark *overhead_i,
 				   struct overhead_benchmark *overhead_r,
 				   struct handshake_benchmark *handshake_i,
@@ -1403,7 +1445,6 @@ static int run_handshake_benchmark(int type_num,
 	print_info(buf);
 
 	double total_i_wall = 0, total_r_wall = 0;
-	double total_i_cpu = 0, total_r_cpu = 0;
 	double total_i_txrx = 0, total_r_txrx = 0;
 	int success_count = 0;
 
@@ -1457,19 +1498,11 @@ static int run_handshake_benchmark(int type_num,
 			double r_wall = elapsed_us(r_data.wall_start_ns,
 						   r_data.wall_end_ns);
 
-			/* Per-thread CPU time (accurate) */
-			double i_cpu = (double)(i_data.cpu_end_ns -
-						i_data.cpu_start_ns) / 1000.0;
-			double r_cpu = (double)(r_data.cpu_end_ns -
-						r_data.cpu_start_ns) / 1000.0;
-
 			double i_txrx = (double)(uintptr_t)i_txrx_ret / 1000.0;
 			double r_txrx = (double)(uintptr_t)r_txrx_ret / 1000.0;
 
 			total_i_wall += i_wall;
 			total_r_wall += r_wall;
-			total_i_cpu  += i_cpu;
-			total_r_cpu  += r_cpu;
 			total_i_txrx += i_txrx;
 			total_r_txrx += r_txrx;
 			success_count++;
@@ -1483,30 +1516,35 @@ static int run_handshake_benchmark(int type_num,
 
 	double n = (double)success_count;
 
-	/* Overhead: per-thread CPU + estimated memory */
-	overhead_i->cpu_us = total_i_cpu / n;
+	/* Compute processing cost from operations benchmark (sum of ops × calls)
+	 * This ensures processing_us is directly derivable from operations CSV */
+	double proc_i = compute_classic_ops_total(ops_init);
+	double proc_r = compute_classic_ops_total(ops_resp);
+
+	/* Overhead: computed crypto cost + estimated memory */
+	overhead_i->cpu_us = proc_i;
 	overhead_i->memory_bytes = estimate_edhoc_memory(type_num);
-	overhead_r->cpu_us = total_r_cpu / n;
+	overhead_r->cpu_us = proc_r;
 	overhead_r->memory_bytes = estimate_edhoc_memory(type_num);
 
 	/* Handshake timing */
 	handshake_i->total_us = total_i_wall / n;
 	handshake_i->txrx_us = total_i_txrx / n;
 	handshake_i->precomputation_us = precomp_i_us;
-	handshake_i->processing_us = handshake_i->total_us -
-				     handshake_i->txrx_us -
-				     handshake_i->precomputation_us;
-	if (handshake_i->processing_us < 0)
-		handshake_i->processing_us = 0;
+	handshake_i->processing_us = proc_i;
+	handshake_i->overhead_us = handshake_i->total_us -
+				   handshake_i->processing_us -
+				   handshake_i->txrx_us -
+				   handshake_i->precomputation_us;
 
 	handshake_r->total_us = total_r_wall / n;
 	handshake_r->txrx_us = total_r_txrx / n;
 	handshake_r->precomputation_us = precomp_r_us;
-	handshake_r->processing_us = handshake_r->total_us -
-				     handshake_r->txrx_us -
-				     handshake_r->precomputation_us;
-	if (handshake_r->processing_us < 0)
-		handshake_r->processing_us = 0;
+	handshake_r->processing_us = proc_r;
+	handshake_r->overhead_us = handshake_r->total_us -
+				   handshake_r->processing_us -
+				   handshake_r->txrx_us -
+				   handshake_r->precomputation_us;
 
 	snprintf(buf, sizeof(buf),
 		 "Handshake benchmark completed (%d/%d successful).",
@@ -1628,19 +1666,23 @@ static int write_handshake_csv(const char *filepath,
 		return -1;
 	}
 
-	fprintf(fp, "type,role,processing_us,txrx_us,precomputation_us,total_us\n");
-	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%.3f,%.3f,%.3f\n",
+	fprintf(fp, "type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us\n");
+	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
 		t0_init->processing_us, t0_init->txrx_us,
-		t0_init->precomputation_us, t0_init->total_us);
-	fprintf(fp, "Type0_SigSig,Responder,%.3f,%.3f,%.3f,%.3f\n",
+		t0_init->precomputation_us, t0_init->overhead_us,
+		t0_init->total_us);
+	fprintf(fp, "Type0_SigSig,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
 		t0_resp->processing_us, t0_resp->txrx_us,
-		t0_resp->precomputation_us, t0_resp->total_us);
-	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%.3f,%.3f,%.3f\n",
+		t0_resp->precomputation_us, t0_resp->overhead_us,
+		t0_resp->total_us);
+	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
 		t3_init->processing_us, t3_init->txrx_us,
-		t3_init->precomputation_us, t3_init->total_us);
-	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%.3f,%.3f,%.3f\n",
+		t3_init->precomputation_us, t3_init->overhead_us,
+		t3_init->total_us);
+	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
 		t3_resp->processing_us, t3_resp->txrx_us,
-		t3_resp->precomputation_us, t3_resp->total_us);
+		t3_resp->precomputation_us, t3_resp->overhead_us,
+		t3_resp->total_us);
 
 	fclose(fp);
 	return 0;
@@ -1710,26 +1752,26 @@ static void print_overhead_summary(struct overhead_benchmark *t0_init,
 				   struct overhead_benchmark *t3_resp)
 {
 	printf("\n");
-	print_header("Overhead Benchmark (avg per handshake)");
+	print_header("Overhead Benchmark (computed from ops, avg per handshake)");
 	printf("\n");
 
 	printf("  %-16s %-12s %14s %14s %s\n",
-	       "Type", "Role", "CPU (µs)", "Memory (bytes)", "Note");
+	       "Type", "Role", "Crypto (µs)", "Memory (bytes)", "Note");
 	printf("  %-16s %-12s %14s %14s %s\n",
 	       "────────────────", "────────────", "──────────────",
 	       "──────────────", "────────────────────");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type0_SigSig", "Initiator", t0_init->cpu_us,
-	       t0_init->memory_bytes, "est. stack+heap");
+	       t0_init->memory_bytes, "sum(ops×calls)");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type0_SigSig", "Responder", t0_resp->cpu_us,
-	       t0_resp->memory_bytes, "est. stack+heap");
+	       t0_resp->memory_bytes, "sum(ops×calls)");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type3_MACMAC", "Initiator", t3_init->cpu_us,
-	       t3_init->memory_bytes, "est. stack+heap");
+	       t3_init->memory_bytes, "sum(ops×calls)");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
 	       "Type3_MACMAC", "Responder", t3_resp->cpu_us,
-	       t3_resp->memory_bytes, "est. stack+heap");
+	       t3_resp->memory_bytes, "sum(ops×calls)");
 }
 
 static void print_handshake_summary(struct handshake_benchmark *t0_init,
@@ -1741,28 +1783,32 @@ static void print_handshake_summary(struct handshake_benchmark *t0_init,
 	print_header("Handshake Timing Benchmark (µs, avg)");
 	printf("\n");
 
-	printf("  %-16s %-12s %14s %14s %14s %14s\n",
-	       "Type", "Role", "Processing", "TxRx", "Precompute", "Total");
-	printf("  %-16s %-12s %14s %14s %14s %14s\n",
+	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n",
+	       "Type", "Role", "Processing", "TxRx", "Precompute", "Overhead", "Total");
+	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n",
 	       "────────────────", "────────────",
 	       "──────────────", "──────────────",
-	       "──────────────", "──────────────");
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f\n",
+	       "──────────────", "──────────────", "──────────────");
+	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
 	       "Type0_SigSig", "Initiator",
 	       t0_init->processing_us, t0_init->txrx_us,
-	       t0_init->precomputation_us, t0_init->total_us);
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f\n",
+	       t0_init->precomputation_us, t0_init->overhead_us,
+	       t0_init->total_us);
+	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
 	       "Type0_SigSig", "Responder",
 	       t0_resp->processing_us, t0_resp->txrx_us,
-	       t0_resp->precomputation_us, t0_resp->total_us);
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f\n",
+	       t0_resp->precomputation_us, t0_resp->overhead_us,
+	       t0_resp->total_us);
+	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
 	       "Type3_MACMAC", "Initiator",
 	       t3_init->processing_us, t3_init->txrx_us,
-	       t3_init->precomputation_us, t3_init->total_us);
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f\n",
+	       t3_init->precomputation_us, t3_init->overhead_us,
+	       t3_init->total_us);
+	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
 	       "Type3_MACMAC", "Responder",
 	       t3_resp->processing_us, t3_resp->txrx_us,
-	       t3_resp->precomputation_us, t3_resp->total_us);
+	       t3_resp->precomputation_us, t3_resp->overhead_us,
+	       t3_resp->total_us);
 }
 
 /* =============================================================================
@@ -1793,7 +1839,9 @@ int run_edhoc_benchmark(void)
 	print_info("  ✓ ECDH: Type0=1×, Type3=3× (ephemeral + 2 static DH)");
 	print_info("  ✓ AEAD: CT2=XOR not AEAD (RFC 9528 §5.3.2), only CT3 uses AEAD");
 	print_info("  ✓ Memory: Estimated stack+heap footprint, not process RSS");
-	print_info("  ✓ CPU: Per-thread CLOCK_THREAD_CPUTIME_ID (not process-wide)");
+	print_info("  ✓ CPU: Computed crypto cost = sum(ops × calls), directly verifiable");
+	print_info("  ✓ Processing: Same as CPU, derived from operations benchmark");
+	print_info("  ✓ Overhead: Protocol overhead = total - processing - txrx - precomp");
 	print_info("  ✓ Hash: SHA-256 benchmark added (~4 calls/handshake)");
 	print_info("  ✓ Calls: Per-operation call count matches EDHOC protocol flow");
 	printf("\n");
@@ -1838,6 +1886,7 @@ int run_edhoc_benchmark(void)
 
 	int ret;
 	ret = run_handshake_benchmark(0,
+				      &t0_ops_init, &t0_ops_resp,
 				      &t0_oh_init, &t0_oh_resp,
 				      &t0_hs_init, &t0_hs_resp);
 	if (ret != 0) {
@@ -1846,6 +1895,7 @@ int run_edhoc_benchmark(void)
 	}
 
 	ret = run_handshake_benchmark(3,
+				      &t3_ops_init, &t3_ops_resp,
 				      &t3_oh_init, &t3_oh_resp,
 				      &t3_hs_init, &t3_hs_resp);
 	if (ret != 0) {
@@ -2007,8 +2057,10 @@ static int write_overhead_csv_full(const char *filepath,
 				   struct overhead_benchmark *t0_resp,
 				   struct overhead_benchmark *t3_init,
 				   struct overhead_benchmark *t3_resp,
-				   struct overhead_benchmark *t0pq,
-				   struct overhead_benchmark *t3pq)
+				   struct overhead_benchmark *t0pq_init,
+				   struct overhead_benchmark *t0pq_resp,
+				   struct overhead_benchmark *t3pq_init,
+				   struct overhead_benchmark *t3pq_resp)
 {
 	FILE *fp = fopen(filepath, "w");
 	if (!fp) return -1;
@@ -2022,10 +2074,14 @@ static int write_overhead_csv_full(const char *filepath,
 		t3_init->cpu_us, t3_init->memory_bytes);
 	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%ld,estimated_stack_heap\n",
 		t3_resp->cpu_us, t3_resp->memory_bytes);
-	fprintf(fp, "Type0_PQ,Combined,%.3f,%ld,estimated_stack_heap_pq\n",
-		t0pq->cpu_us, t0pq->memory_bytes);
-	fprintf(fp, "Type3_PQ,Combined,%.3f,%ld,estimated_stack_heap_pq\n",
-		t3pq->cpu_us, t3pq->memory_bytes);
+	fprintf(fp, "Type0_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n",
+		t0pq_init->cpu_us, t0pq_init->memory_bytes);
+	fprintf(fp, "Type0_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n",
+		t0pq_resp->cpu_us, t0pq_resp->memory_bytes);
+	fprintf(fp, "Type3_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n",
+		t3pq_init->cpu_us, t3pq_init->memory_bytes);
+	fprintf(fp, "Type3_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n",
+		t3pq_resp->cpu_us, t3pq_resp->memory_bytes);
 
 	fclose(fp);
 	return 0;
@@ -2036,31 +2092,47 @@ static int write_handshake_csv_full(const char *filepath,
 				    struct handshake_benchmark *t0_resp,
 				    struct handshake_benchmark *t3_init,
 				    struct handshake_benchmark *t3_resp,
-				    struct handshake_benchmark *t0pq,
-				    struct handshake_benchmark *t3pq)
+				    struct handshake_benchmark *t0pq_init,
+				    struct handshake_benchmark *t0pq_resp,
+				    struct handshake_benchmark *t3pq_init,
+				    struct handshake_benchmark *t3pq_resp)
 {
 	FILE *fp = fopen(filepath, "w");
 	if (!fp) return -1;
 
-	fprintf(fp, "type,role,processing_us,txrx_us,precomputation_us,total_us\n");
-	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%.3f,%.3f,%.3f\n",
+	fprintf(fp, "type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us\n");
+	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
 		t0_init->processing_us, t0_init->txrx_us,
-		t0_init->precomputation_us, t0_init->total_us);
-	fprintf(fp, "Type0_SigSig,Responder,%.3f,%.3f,%.3f,%.3f\n",
+		t0_init->precomputation_us, t0_init->overhead_us,
+		t0_init->total_us);
+	fprintf(fp, "Type0_SigSig,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
 		t0_resp->processing_us, t0_resp->txrx_us,
-		t0_resp->precomputation_us, t0_resp->total_us);
-	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%.3f,%.3f,%.3f\n",
+		t0_resp->precomputation_us, t0_resp->overhead_us,
+		t0_resp->total_us);
+	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
 		t3_init->processing_us, t3_init->txrx_us,
-		t3_init->precomputation_us, t3_init->total_us);
-	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%.3f,%.3f,%.3f\n",
+		t3_init->precomputation_us, t3_init->overhead_us,
+		t3_init->total_us);
+	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
 		t3_resp->processing_us, t3_resp->txrx_us,
-		t3_resp->precomputation_us, t3_resp->total_us);
-	fprintf(fp, "Type0_PQ,Combined,%.3f,%.3f,%.3f,%.3f\n",
-		t0pq->processing_us, t0pq->txrx_us,
-		t0pq->precomputation_us, t0pq->total_us);
-	fprintf(fp, "Type3_PQ,Combined,%.3f,%.3f,%.3f,%.3f\n",
-		t3pq->processing_us, t3pq->txrx_us,
-		t3pq->precomputation_us, t3pq->total_us);
+		t3_resp->precomputation_us, t3_resp->overhead_us,
+		t3_resp->total_us);
+	fprintf(fp, "Type0_PQ,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t0pq_init->processing_us, t0pq_init->txrx_us,
+		t0pq_init->precomputation_us, t0pq_init->overhead_us,
+		t0pq_init->total_us);
+	fprintf(fp, "Type0_PQ,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t0pq_resp->processing_us, t0pq_resp->txrx_us,
+		t0pq_resp->precomputation_us, t0pq_resp->overhead_us,
+		t0pq_resp->total_us);
+	fprintf(fp, "Type3_PQ,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t3pq_init->processing_us, t3pq_init->txrx_us,
+		t3pq_init->precomputation_us, t3pq_init->overhead_us,
+		t3pq_init->total_us);
+	fprintf(fp, "Type3_PQ,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t3pq_resp->processing_us, t3pq_resp->txrx_us,
+		t3pq_resp->precomputation_us, t3pq_resp->overhead_us,
+		t3pq_resp->total_us);
 
 	fclose(fp);
 	return 0;
@@ -2201,6 +2273,7 @@ int run_edhoc_benchmark_full(void)
 
 	int ret;
 	ret = run_handshake_benchmark(0,
+				      &t0_ops_init, &t0_ops_resp,
 				      &t0_oh_init, &t0_oh_resp,
 				      &t0_hs_init, &t0_hs_resp);
 	if (ret != 0) {
@@ -2209,6 +2282,7 @@ int run_edhoc_benchmark_full(void)
 	}
 
 	ret = run_handshake_benchmark(3,
+				      &t3_ops_init, &t3_ops_resp,
 				      &t3_oh_init, &t3_oh_resp,
 				      &t3_hs_init, &t3_hs_resp);
 	if (ret != 0) {
@@ -2220,20 +2294,32 @@ int run_edhoc_benchmark_full(void)
 	print_header("Phase 2b: PQ Handshake + Overhead Benchmark");
 	printf("\n");
 
-	struct overhead_benchmark  t0pq_oh, t3pq_oh;
-	struct handshake_benchmark t0pq_hs, t3pq_hs;
-	memset(&t0pq_oh, 0, sizeof(t0pq_oh));
-	memset(&t3pq_oh, 0, sizeof(t3pq_oh));
-	memset(&t0pq_hs, 0, sizeof(t0pq_hs));
-	memset(&t3pq_hs, 0, sizeof(t3pq_hs));
+	struct overhead_benchmark  t0pq_oh_init, t0pq_oh_resp;
+	struct overhead_benchmark  t3pq_oh_init, t3pq_oh_resp;
+	struct handshake_benchmark t0pq_hs_init, t0pq_hs_resp;
+	struct handshake_benchmark t3pq_hs_init, t3pq_hs_resp;
+	memset(&t0pq_oh_init, 0, sizeof(t0pq_oh_init));
+	memset(&t0pq_oh_resp, 0, sizeof(t0pq_oh_resp));
+	memset(&t3pq_oh_init, 0, sizeof(t3pq_oh_init));
+	memset(&t3pq_oh_resp, 0, sizeof(t3pq_oh_resp));
+	memset(&t0pq_hs_init, 0, sizeof(t0pq_hs_init));
+	memset(&t0pq_hs_resp, 0, sizeof(t0pq_hs_resp));
+	memset(&t3pq_hs_init, 0, sizeof(t3pq_hs_init));
+	memset(&t3pq_hs_resp, 0, sizeof(t3pq_hs_resp));
 
-	ret = run_pq_handshake_benchmark(0, &t0pq_oh, &t0pq_hs);
+	ret = run_pq_handshake_benchmark(0,
+					 &t0pq_ops_init, &t0pq_ops_resp,
+					 &t0pq_oh_init, &t0pq_oh_resp,
+					 &t0pq_hs_init, &t0pq_hs_resp);
 	if (ret != 0) {
 		print_error("Type 0 PQ handshake benchmark failed!");
 		return -1;
 	}
 
-	ret = run_pq_handshake_benchmark(3, &t3pq_oh, &t3pq_hs);
+	ret = run_pq_handshake_benchmark(3,
+					 &t3pq_ops_init, &t3pq_ops_resp,
+					 &t3pq_oh_init, &t3pq_oh_resp,
+					 &t3pq_hs_init, &t3pq_hs_resp);
 	if (ret != 0) {
 		print_error("Type 3 PQ handshake benchmark failed!");
 		return -1;
@@ -2252,11 +2338,17 @@ int run_edhoc_benchmark_full(void)
 	       "────────────────", "────────────", "──────────────",
 	       "──────────────", "────────────────────");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
-	       "Type0_PQ", "Combined", t0pq_oh.cpu_us,
-	       t0pq_oh.memory_bytes, "est. stack+heap (ML-KEM-768)");
+	       "Type0_PQ", "Initiator", t0pq_oh_init.cpu_us,
+	       t0pq_oh_init.memory_bytes, "computed from ops (ML-KEM-768)");
 	printf("  %-16s %-12s %14.3f %14ld %s\n",
-	       "Type3_PQ", "Combined", t3pq_oh.cpu_us,
-	       t3pq_oh.memory_bytes, "est. stack+heap (ML-KEM-768)");
+	       "Type0_PQ", "Responder", t0pq_oh_resp.cpu_us,
+	       t0pq_oh_resp.memory_bytes, "computed from ops (ML-KEM-768)");
+	printf("  %-16s %-12s %14.3f %14ld %s\n",
+	       "Type3_PQ", "Initiator", t3pq_oh_init.cpu_us,
+	       t3pq_oh_init.memory_bytes, "computed from ops (ML-KEM-768)");
+	printf("  %-16s %-12s %14.3f %14ld %s\n",
+	       "Type3_PQ", "Responder", t3pq_oh_resp.cpu_us,
+	       t3pq_oh_resp.memory_bytes, "computed from ops (ML-KEM-768)");
 
 	print_handshake_summary(&t0_hs_init, &t0_hs_resp,
 				&t3_hs_init, &t3_hs_resp);
@@ -2264,20 +2356,32 @@ int run_edhoc_benchmark_full(void)
 	printf("\n");
 	print_header("PQ Handshake Timing Benchmark (µs, avg)");
 	printf("\n");
-	printf("  %-16s %-12s %14s %14s %14s %14s\n",
-	       "Type", "Role", "Processing", "TxRx", "Precompute", "Total");
-	printf("  %-16s %-12s %14s %14s %14s %14s\n",
+	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n",
+	       "Type", "Role", "Processing", "TxRx", "Precompute", "Overhead", "Total");
+	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n",
 	       "────────────────", "────────────",
 	       "──────────────", "──────────────",
-	       "──────────────", "──────────────");
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f\n",
-	       "Type0_PQ", "Combined",
-	       t0pq_hs.processing_us, t0pq_hs.txrx_us,
-	       t0pq_hs.precomputation_us, t0pq_hs.total_us);
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f\n",
-	       "Type3_PQ", "Combined",
-	       t3pq_hs.processing_us, t3pq_hs.txrx_us,
-	       t3pq_hs.precomputation_us, t3pq_hs.total_us);
+	       "──────────────", "──────────────", "──────────────");
+	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
+	       "Type0_PQ", "Initiator",
+	       t0pq_hs_init.processing_us, t0pq_hs_init.txrx_us,
+	       t0pq_hs_init.precomputation_us, t0pq_hs_init.overhead_us,
+	       t0pq_hs_init.total_us);
+	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
+	       "Type0_PQ", "Responder",
+	       t0pq_hs_resp.processing_us, t0pq_hs_resp.txrx_us,
+	       t0pq_hs_resp.precomputation_us, t0pq_hs_resp.overhead_us,
+	       t0pq_hs_resp.total_us);
+	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
+	       "Type3_PQ", "Initiator",
+	       t3pq_hs_init.processing_us, t3pq_hs_init.txrx_us,
+	       t3pq_hs_init.precomputation_us, t3pq_hs_init.overhead_us,
+	       t3pq_hs_init.total_us);
+	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
+	       "Type3_PQ", "Responder",
+	       t3pq_hs_resp.processing_us, t3pq_hs_resp.txrx_us,
+	       t3pq_hs_resp.precomputation_us, t3pq_hs_resp.overhead_us,
+	       t3pq_hs_resp.total_us);
 
 	/* Write CSV files */
 	printf("\n");
@@ -2297,7 +2401,8 @@ int run_edhoc_benchmark_full(void)
 	ret = write_overhead_csv_full(BENCH_CSV_OVERHEAD,
 				      &t0_oh_init, &t0_oh_resp,
 				      &t3_oh_init, &t3_oh_resp,
-				      &t0pq_oh, &t3pq_oh);
+				      &t0pq_oh_init, &t0pq_oh_resp,
+				      &t3pq_oh_init, &t3pq_oh_resp);
 	if (ret == 0) {
 		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_OVERHEAD);
 		print_success(buf);
@@ -2306,7 +2411,8 @@ int run_edhoc_benchmark_full(void)
 	ret = write_handshake_csv_full(BENCH_CSV_HANDSHAKE,
 				       &t0_hs_init, &t0_hs_resp,
 				       &t3_hs_init, &t3_hs_resp,
-				       &t0pq_hs, &t3pq_hs);
+				       &t0pq_hs_init, &t0pq_hs_resp,
+				       &t3pq_hs_init, &t3pq_hs_resp);
 	if (ret == 0) {
 		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_HANDSHAKE);
 		print_success(buf);

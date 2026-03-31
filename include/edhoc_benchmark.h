@@ -20,16 +20,17 @@
  *      - HKDF      : HKDF-Extract + HKDF-Expand (SHA-256)
  *
  *   2. Overhead Benchmark (benchmark_overhead.csv)
- *      Resource usage selama full handshake:
- *      - CPU Time     : Waktu CPU yang digunakan (user + system) dalam µs
- *      - Memory Peak  : Peak RSS memory usage dalam bytes
+ *      Resource usage per handshake:
+ *      - CPU Time     : Computed crypto cost = sum(ops × calls) dalam µs
+ *      - Memory Peak  : Estimated stack + heap memory usage dalam bytes
  *
  *   3. Handshake Benchmark (benchmark_handshake.csv)
  *      Waktu per fase dalam handshake EDHOC:
- *      - Processing     : Total waktu komputasi kriptografi
+ *      - Processing     : Computed crypto cost = sum(ops × calls)
  *      - TxRx           : Total waktu transmisi + penerimaan pesan
  *      - Precomputation : Waktu setup kunci sebelum handshake
- *      - Total          : Total waktu handshake end-to-end
+ *      - Overhead       : Protocol overhead (CBOR, memcpy, etc.)
+ *      - Total          : Total waktu handshake end-to-end (measured wall time)
  *
  * Output: 3 file CSV di direktori output/
  * =============================================================================
