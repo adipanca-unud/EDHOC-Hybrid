@@ -4,7 +4,9 @@
  * =============================================================================
  *
  * Abstraksi KEM (Key Encapsulation Mechanism) dan Signature menggunakan
- * ML-KEM-768 dan ML-DSA-65 dari liboqs (Open Quantum Safe).
+ * ML-KEM-768 dan ML-DSA-65. Secara default menggunakan implementasi PQClean
+ * (flag USE_PQCLEAN), dan fallback ke liboqs (Open Quantum Safe) jika flag
+ * tersebut dimatikan.
  *
  * KEM functions:
  *   - pq_kem_keygen()   : Generate PQ KEM key pair (pk, sk)

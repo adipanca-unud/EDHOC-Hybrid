@@ -98,10 +98,6 @@
 #include "common/crypto_wrapper.h"
 #include "edhoc/suites.h"
 
-/* compact25519 for keygen */
-#include "compact_x25519.h"
-#include "compact_ed25519.h"
-
 /* =============================================================================
  * Timing utilities
  * =============================================================================
@@ -200,8 +196,9 @@ struct handshake_benchmark {
 /**
  * @brief Benchmark KeyGen — pembangkitan kunci ephemeral X25519.
  *
- * Menggunakan compact_x25519_keygen() untuk membangkitkan pasangan kunci
- * DH ephemeral (32-byte private + 32-byte public) dari random seed.
+ * Menggunakan crypto_wrapper (X25519 via libsodium) untuk membangkitkan
+ * pasangan kunci DH ephemeral (32-byte private + 32-byte public) dari seed
+ * deterministik.
  *
  * Dalam EDHOC: setiap sisi (Initiator & Responder) membangkitkan
  * tepat 1 pasang kunci ephemeral per handshake.
@@ -216,19 +213,26 @@ static struct op_result bench_keygen_x25519(int iterations)
 	uint64_t total_ns = 0;
 
 	for (int i = 0; i < iterations; i++) {
-		uint8_t seed[32], sk[32], pk[32];
-		for (int j = 0; j < 32; j++)
-			seed[j] = (uint8_t)(i * 37 + j * 13 + 42);
+		uint8_t sk_buf[32] = {0};
+		uint8_t pk_buf[32] = {0};
+		struct byte_array sk = { .len = sizeof(sk_buf), .ptr = sk_buf };
+		struct byte_array pk = { .len = sizeof(pk_buf), .ptr = pk_buf };
+		uint32_t seed = (uint32_t)(i * 37U + 42U);
 
 		uint64_t start = get_time_ns();
-		compact_x25519_keygen(sk, pk, seed);
+		enum err r = ephemeral_dh_key_gen(X25519, seed, &sk, &pk);
 		uint64_t end = get_time_ns();
 
-		total_ns += (end - start);
+		if (r == ok) {
+			total_ns += (end - start);
+			res.count++;
+		}
 	}
 
-	res.avg_us = (double)total_ns / (double)iterations / 1000.0;
-	res.count = iterations;
+	if (res.count > 0) {
+		res.avg_us =
+			(double)total_ns / (double)res.count / 1000.0;
+	}
 	return res;
 }
 

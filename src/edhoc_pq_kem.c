@@ -3,9 +3,9 @@
  * EDHOC-Hybrid: Post-Quantum KEM Wrapper Implementation
  * =============================================================================
  *
- * Uses liboqs ML-KEM-768 for KEM operations and mbedTLS PSA for
- * symmetric crypto (HKDF, AEAD, Hash) to reuse the same crypto backend
- * as the classic EDHOC implementation.
+ * Uses PQClean ML-KEM-768 / ML-DSA-65 when USE_PQCLEAN is defined (default)
+ * and falls back to liboqs otherwise. Symmetric crypto (HKDF, AEAD, Hash)
+ * continues to use mbedTLS PSA to reuse the same backend as classic EDHOC.
  * =============================================================================
  */
 
@@ -14,9 +14,13 @@
 #include <string.h>
 #include <stdio.h>
 
-/* liboqs */
+/* PQ backends */
+#ifdef USE_PQCLEAN
+#include "crypto_kem/ml-kem-768/clean/api.h"
+#include "crypto_sign/ml-dsa-65/clean/api.h"
+#else
 #include <oqs/oqs.h>
-
+#endif
 /* mbedTLS PSA for symmetric crypto */
 #include "psa/crypto.h"
 
@@ -24,12 +28,15 @@
 #define PQ_CCM_ALG PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_CCM, PQ_AEAD_TAG_LEN)
 
 /* =============================================================================
- * PQ KEM Operations (ML-KEM-768 via liboqs)
+ * PQ KEM Operations (ML-KEM-768)
  * =============================================================================
  */
 
 int pq_kem_keygen(uint8_t *pk, uint8_t *sk)
 {
+#ifdef USE_PQCLEAN
+	return PQCLEAN_MLKEM768_CLEAN_crypto_kem_keypair(pk, sk);
+#else
 	OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_ml_kem_768);
 	if (kem == NULL)
 		return -1;
@@ -37,10 +44,14 @@ int pq_kem_keygen(uint8_t *pk, uint8_t *sk)
 	OQS_STATUS rc = OQS_KEM_keypair(kem, pk, sk);
 	OQS_KEM_free(kem);
 	return (rc == OQS_SUCCESS) ? 0 : -1;
+#endif
 }
 
 int pq_kem_encaps(uint8_t *ct, uint8_t *ss, const uint8_t *pk)
 {
+#ifdef USE_PQCLEAN
+	return PQCLEAN_MLKEM768_CLEAN_crypto_kem_enc(ct, ss, pk);
+#else
 	OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_ml_kem_768);
 	if (kem == NULL)
 		return -1;
@@ -48,10 +59,14 @@ int pq_kem_encaps(uint8_t *ct, uint8_t *ss, const uint8_t *pk)
 	OQS_STATUS rc = OQS_KEM_encaps(kem, ct, ss, pk);
 	OQS_KEM_free(kem);
 	return (rc == OQS_SUCCESS) ? 0 : -1;
+#endif
 }
 
 int pq_kem_decaps(uint8_t *ss, const uint8_t *ct, const uint8_t *sk)
 {
+#ifdef USE_PQCLEAN
+	return PQCLEAN_MLKEM768_CLEAN_crypto_kem_dec(ss, ct, sk);
+#else
 	OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_ml_kem_768);
 	if (kem == NULL)
 		return -1;
@@ -59,6 +74,7 @@ int pq_kem_decaps(uint8_t *ss, const uint8_t *ct, const uint8_t *sk)
 	OQS_STATUS rc = OQS_KEM_decaps(kem, ss, ct, sk);
 	OQS_KEM_free(kem);
 	return (rc == OQS_SUCCESS) ? 0 : -1;
+#endif
 }
 
 /* =============================================================================
@@ -258,12 +274,15 @@ int pq_hash_sha256(const uint8_t *data, size_t data_len, uint8_t *hash_out)
 }
 
 /* =============================================================================
- * PQ Signature Operations (ML-DSA-65 via liboqs)
+ * PQ Signature Operations (ML-DSA-65 via PQClean or liboqs)
  * =============================================================================
  */
 
 int pq_sig_keygen(uint8_t *pk, uint8_t *sk)
 {
+#ifdef USE_PQCLEAN
+	return PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk, sk);
+#else
 	OQS_SIG *sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
 	if (sig == NULL)
 		return -1;
@@ -271,32 +290,43 @@ int pq_sig_keygen(uint8_t *pk, uint8_t *sk)
 	OQS_STATUS rc = OQS_SIG_keypair(sig, pk, sk);
 	OQS_SIG_free(sig);
 	return (rc == OQS_SUCCESS) ? 0 : -1;
+#endif
 }
 
 int pq_sig_sign(const uint8_t *msg, size_t msg_len,
-                const uint8_t *sk,
-                uint8_t *sig_out, size_t *sig_len)
+				const uint8_t *sk,
+				uint8_t *sig_out, size_t *sig_len)
 {
+#ifdef USE_PQCLEAN
+	return PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(sig_out, sig_len,
+				msg, msg_len, sk);
+#else
 	OQS_SIG *sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
 	if (sig == NULL)
 		return -1;
 
 	OQS_STATUS rc = OQS_SIG_sign(sig, sig_out, sig_len,
-	                              msg, msg_len, sk);
+								  msg, msg_len, sk);
 	OQS_SIG_free(sig);
 	return (rc == OQS_SUCCESS) ? 0 : -1;
+#endif
 }
 
 int pq_sig_verify(const uint8_t *msg, size_t msg_len,
-                  const uint8_t *sig_in, size_t sig_len,
-                  const uint8_t *pk)
+				  const uint8_t *sig_in, size_t sig_len,
+				  const uint8_t *pk)
 {
+#ifdef USE_PQCLEAN
+	return PQCLEAN_MLDSA65_CLEAN_crypto_sign_verify(sig_in, sig_len,
+			msg, msg_len, pk);
+#else
 	OQS_SIG *sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
 	if (sig == NULL)
 		return -1;
 
 	OQS_STATUS rc = OQS_SIG_verify(sig, msg, msg_len,
-	                                sig_in, sig_len, pk);
+									sig_in, sig_len, pk);
 	OQS_SIG_free(sig);
 	return (rc == OQS_SUCCESS) ? 0 : -1;
+#endif
 }

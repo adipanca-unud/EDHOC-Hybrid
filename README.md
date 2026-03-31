@@ -82,7 +82,7 @@ EDHOC-Hybrid/
 │       ├── test_vectors/              # RFC 9529 + P-256 test vectors
 │       └── externals/   [Git submodules]
 │           ├── zcbor/                 # CBOR encoder/decoder
-│           ├── compact25519/          # X25519/EdDSA crypto (Suite 0)
+│           ├── compact25519/          # (legacy) X25519/EdDSA; replaced by libsodium backend
 │           └── mbedtls/               # P-256/ES256/AES crypto (Suite 2)
 └── build/                             # Build output (edhoc_hybrid binary)
 ```
@@ -92,11 +92,11 @@ EDHOC-Hybrid/
 | Submodule | Path | Repository | Purpose |
 |-----------|------|------------|---------|
 | uoscore-uedhoc | `lib/uoscore-uedhoc` | [eriptic/uoscore-uedhoc](https://github.com/eriptic/uoscore-uedhoc) | Core EDHOC/OSCORE protocol library |
-| compact25519 | `lib/uoscore-uedhoc/externals/compact25519` | [DavyLandman/compact25519](https://github.com/DavyLandman/compact25519) | X25519 key exchange + EdDSA signatures |
 | mbedtls | `lib/uoscore-uedhoc/externals/mbedtls` | [ARMmbed/mbedtls](https://github.com/ARMmbed/mbedtls) | AES-CCM, SHA-256, P-256/ES256 crypto |
 | zcbor | `lib/uoscore-uedhoc/externals/zcbor` | [NordicSemiconductor/zcbor](https://github.com/NordicSemiconductor/zcbor) | CBOR encoding/decoding |
 | cantcoap | `lib/uoscore-uedhoc/externals/cantcoap` | [staropram/cantcoap](https://github.com/staropram/cantcoap) | CoAP message parsing (optional) |
 | tinycrypt | `lib/uoscore-uedhoc/externals/tinycrypt` | [intel/tinycrypt](https://github.com/intel/tinycrypt) | Lightweight crypto (alternative engine) |
+| libsodium | system (`libsodium-dev`) | [jedisct1/libsodium](https://github.com/jedisct1/libsodium) | X25519 + Ed25519 backend for Suite 0 |
 
 ## Architecture
 

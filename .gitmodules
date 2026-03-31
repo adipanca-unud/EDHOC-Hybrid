@@ -1,3 +1,9 @@
 [submodule "lib/uoscore-uedhoc"]
 	path = lib/uoscore-uedhoc
 	url = https://github.com/eriptic/uoscore-uedhoc.git
+[submodule "lib/PQClean"]
+	path = lib/PQClean
+	url = https://github.com/PQClean/PQClean.git
+[submodule "lib/liboqs"]
+	path = lib/liboqs
+	url = https://github.com/open-quantum-safe/liboqs.git
