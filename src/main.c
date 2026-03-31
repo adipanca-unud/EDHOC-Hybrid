@@ -35,6 +35,7 @@
 #include "edhoc_type3_classic.h"
 #include "edhoc_type0_pq.h"
 #include "edhoc_type3_pq.h"
+#include "edhoc_type3_hybrid.h"
 #include "edhoc_benchmark.h"
 
 static void print_banner(void)
@@ -84,6 +85,16 @@ static void print_menu(void)
 	printf("      %sAll 4 variants → 3 CSV files (operations, overhead, handshake)%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
+	printf("  %s[7]%s EDHOC Type 3 Hybrid (X25519 + ML-KEM-768)\n",
+	       CLR_GREEN, CLR_RESET);
+	printf("      %sHybrid | ECDHE + KEM | MAC-MAC (static DH auth)%s\n",
+	       CLR_CYAN, CLR_RESET);
+	printf("\n");
+	printf("  %s[8]%s Full Benchmark (Classic + PQ + Hybrid)\n",
+	       CLR_GREEN, CLR_RESET);
+	printf("      %sAll 5 variants → 3 CSV files%s\n",
+	       CLR_CYAN, CLR_RESET);
+	printf("\n");
 	printf("  %s[0]%s Exit\n", CLR_RED, CLR_RESET);
 	printf("\n");
 	printf("  %s> Choice: %s", CLR_BOLD, CLR_RESET);
@@ -110,7 +121,7 @@ int main(int argc, char *argv[])
 				while ((c = getchar()) != '\n' && c != EOF)
 					;
 				printf("\n");
-				print_error("Invalid input. Please enter 0-6.");
+				print_error("Invalid input. Please enter 0-8.");
 				choice = -1;
 				continue;
 			}
@@ -165,9 +176,23 @@ int main(int argc, char *argv[])
 			}
 			break;
 
+		case 7:
+			result = run_edhoc_type3_hybrid();
+			if (result != 0) {
+				print_error("Type 3 Hybrid (ECDHE + KEM) failed!");
+			}
+			break;
+
+		case 8:
+			result = run_edhoc_benchmark_full_hybrid();
+			if (result != 0) {
+				print_error("Full Benchmark (Classic + PQ + Hybrid) failed!");
+			}
+			break;
+
 		default:
 			printf("\n");
-			print_error("Invalid choice. Please enter 0-6.");
+			print_error("Invalid choice. Please enter 0-8.");
 			break;
 		}
 

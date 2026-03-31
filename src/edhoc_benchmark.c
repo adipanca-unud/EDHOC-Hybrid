@@ -90,6 +90,7 @@
 #include "edhoc_type3_classic.h"
 #include "edhoc_type0_pq.h"
 #include "edhoc_type3_pq.h"
+#include "edhoc_type3_hybrid.h"
 #include "edhoc_pq_kem.h"
 #include "edhoc_test_vectors_rfc9529.h"
 #include "edhoc_type3_x25519_testvec.h"
@@ -2818,5 +2819,657 @@ int run_edhoc_benchmark_full(void)
 	print_info("● 4 variants: Type0 Classic, Type3 Classic, Type0 PQ, Type3 PQ");
 	printf("\n");
 
+	return 0;
+}
+
+/* =============================================================================
+ * Hybrid Benchmark (Type 3 Hybrid: X25519 ECDHE + ML-KEM-768)
+ * =============================================================================
+ */
+
+static void bench_hybrid_operations_for_role(bool is_initiator,
+					 struct ops_benchmark *ops)
+{
+	/* Classic side */
+	ops->keygen = bench_keygen_x25519(BENCH_ITERATIONS);
+	ops->keygen.calls = 1; /* ephemeral ECDHE */
+
+	ops->encap = bench_encap(BENCH_ITERATIONS);
+	ops->encap.calls = 1; /* both roles AEAD encrypt once */
+
+	ops->decap = bench_decap(BENCH_ITERATIONS);
+	ops->decap.calls = 1; /* both roles AEAD decrypt once */
+
+	ops->signature.avg_us = 0; ops->signature.count = 0; ops->signature.calls = 0;
+	ops->verification = ops->signature;
+
+	ops->ecdh = bench_ecdh(BENCH_ITERATIONS);
+	ops->ecdh.calls = 2; /* ephemeral + static DH */
+
+	ops->hkdf = bench_hkdf(BENCH_ITERATIONS);
+	ops->hkdf.calls = 10; /* approx chain Extract/Expand */
+
+	ops->hash = bench_hash(BENCH_ITERATIONS);
+	ops->hash.calls = 3; /* TH2, TH3, TH4 */
+
+	/* PQ side (only KEM ops) */
+	ops->pq_keygen = bench_pq_keygen(BENCH_ITERATIONS);
+	ops->pq_keygen.calls = is_initiator ? 1 : 0; /* initiator precomputes KEM key */
+
+	ops->pq_encaps = bench_pq_encaps(BENCH_ITERATIONS);
+	ops->pq_encaps.calls = is_initiator ? 0 : 1; /* responder encapsulates */
+
+	ops->pq_decaps = bench_pq_decaps(BENCH_ITERATIONS);
+	ops->pq_decaps.calls = is_initiator ? 1 : 0; /* initiator decaps */
+
+	/* Unused PQ ops */
+	ops->pq_sig_sign.avg_us = 0; ops->pq_sig_sign.count = 0; ops->pq_sig_sign.calls = 0;
+	ops->pq_sig_verify = ops->pq_sig_sign;
+	ops->pq_aead_enc.avg_us = 0; ops->pq_aead_enc.count = 0; ops->pq_aead_enc.calls = 0;
+	ops->pq_aead_dec = ops->pq_aead_enc;
+	ops->pq_hkdf.avg_us = 0; ops->pq_hkdf.count = 0; ops->pq_hkdf.calls = 0;
+	ops->pq_hash.avg_us = 0; ops->pq_hash.count = 0; ops->pq_hash.calls = 0;
+}
+
+static void bench_hybrid_all_operations(struct ops_benchmark *init_ops,
+				      struct ops_benchmark *resp_ops)
+{
+	print_info("Running Hybrid operations benchmark...");
+	bench_hybrid_operations_for_role(true, init_ops);
+	bench_hybrid_operations_for_role(false, resp_ops);
+	print_success("Hybrid operations benchmark completed.");
+}
+
+static double compute_hybrid_ops_total(const struct ops_benchmark *ops)
+{
+	return compute_classic_ops_total(ops) + compute_pq_ops_total(ops);
+}
+
+static void calibrate_hybrid_ops(struct ops_benchmark *ops,
+				 double measured_cpu_us)
+{
+	double isolated = compute_hybrid_ops_total(ops);
+	if (isolated <= 0) return;
+	double factor = measured_cpu_us / isolated;
+
+	/* scale classic */
+	ops->keygen.avg_us       *= factor;
+	ops->encap.avg_us        *= factor;
+	ops->decap.avg_us        *= factor;
+	ops->signature.avg_us    *= factor;
+	ops->verification.avg_us *= factor;
+	ops->ecdh.avg_us         *= factor;
+	ops->hkdf.avg_us         *= factor;
+	ops->hash.avg_us         *= factor;
+
+	/* scale PQ */
+	ops->pq_keygen.avg_us     *= factor;
+	ops->pq_encaps.avg_us     *= factor;
+	ops->pq_decaps.avg_us     *= factor;
+	ops->pq_sig_sign.avg_us   *= factor;
+	ops->pq_sig_verify.avg_us *= factor;
+	ops->pq_aead_enc.avg_us   *= factor;
+	ops->pq_aead_dec.avg_us   *= factor;
+	ops->pq_hkdf.avg_us       *= factor;
+	ops->pq_hash.avg_us       *= factor;
+}
+
+static long estimate_hybrid_memory(void)
+{
+	/* Classic EDHOC footprint + KEM buffers (pk, sk, ct, ss) + workspace */
+	long classic = estimate_edhoc_memory(3);
+	long kem_keys = PQ_KEM_PK_LEN + PQ_KEM_SK_LEN;      /* initiator keypair */
+	long kem_buffers = PQ_KEM_CT_LEN + PQ_KEM_SS_LEN;   /* encaps/decaps buffers */
+	long msg_buffers = 3 * 8192;                        /* shared msg buffers */
+	long workspace = 4096;                              /* crypto workspace */
+	return classic + kem_keys + kem_buffers + msg_buffers + workspace;
+}
+
+static int run_hybrid_handshake_benchmark(struct ops_benchmark *ops_init,
+				    struct ops_benchmark *ops_resp,
+				    struct overhead_benchmark *oh_init,
+				    struct overhead_benchmark *oh_resp,
+				    struct handshake_benchmark *hs_init,
+				    struct handshake_benchmark *hs_resp)
+{
+	print_info("Running Hybrid handshake benchmark (Type 3 Hybrid)...");
+
+	/* Pre-generate long-term static keys (outside timing) */
+	uint8_t init_static_sk[32], init_static_pk[32];
+	uint8_t resp_static_sk[32], resp_static_pk[32];
+	{
+		struct byte_array sk = { .len = 32, .ptr = init_static_sk };
+		struct byte_array pk = { .len = 32, .ptr = init_static_pk };
+		if (ephemeral_dh_key_gen(X25519, 100, &sk, &pk) != ok)
+			return -1;
+	}
+	{
+		struct byte_array sk = { .len = 32, .ptr = resp_static_sk };
+		struct byte_array pk = { .len = 32, .ptr = resp_static_pk };
+		if (ephemeral_dh_key_gen(X25519, 200, &sk, &pk) != ok)
+			return -1;
+	}
+
+	double total_i_wall = 0, total_r_wall = 0;
+	double total_i_cpu  = 0, total_r_cpu  = 0;
+	double total_i_txrx = 0, total_r_txrx = 0;
+	int success_count = 0;
+
+	for (int iter = 0; iter < BENCH_HANDSHAKE_ITERATIONS; iter++) {
+		struct hybrid_party_ctx init_ctx, resp_ctx;
+		memset(&init_ctx, 0, sizeof(init_ctx));
+		memset(&resp_ctx, 0, sizeof(resp_ctx));
+
+		/* Copy static keys */
+		memcpy(init_ctx.static_sk, init_static_sk, 32);
+		memcpy(init_ctx.static_pk, init_static_pk, 32);
+		memcpy(resp_ctx.static_sk, resp_static_sk, 32);
+		memcpy(resp_ctx.static_pk, resp_static_pk, 32);
+		memcpy(init_ctx.other_static_pk, resp_static_pk, 32);
+		memcpy(resp_ctx.other_static_pk, init_static_pk, 32);
+
+		/* Generate ephemeral ECDHE keys (precomputation) */
+		{
+			struct byte_array sk = { .len = 32, .ptr = init_ctx.eph_sk };
+			struct byte_array pk = { .len = 32, .ptr = init_ctx.eph_pk };
+			ephemeral_dh_key_gen(X25519, 300 + iter, &sk, &pk);
+		}
+		{
+			struct byte_array sk = { .len = 32, .ptr = resp_ctx.eph_sk };
+			struct byte_array pk = { .len = 32, .ptr = resp_ctx.eph_pk };
+			ephemeral_dh_key_gen(X25519, 400 + iter, &sk, &pk);
+		}
+
+		/* Initiator KEM key pair (precomputation) */
+		pq_kem_keygen(init_ctx.kem_pk, init_ctx.kem_sk);
+
+		hybrid_exchange_init();
+
+		struct pq_bench_thread_data i_data, r_data;
+		memset(&i_data, 0, sizeof(i_data));
+		memset(&r_data, 0, sizeof(r_data));
+		i_data.protocol_fn = hybrid_initiator_thread;
+		r_data.protocol_fn = hybrid_responder_thread;
+		i_data.party_ctx = &init_ctx;
+		r_data.party_ctx = &resp_ctx;
+
+		pthread_t tid_i, tid_r;
+		pthread_create(&tid_r, NULL, pq_bench_wrapper_thread, &r_data);
+		pthread_create(&tid_i, NULL, pq_bench_wrapper_thread, &i_data);
+		pthread_join(tid_i, NULL);
+		pthread_join(tid_r, NULL);
+
+		hybrid_exchange_destroy();
+
+		if (init_ctx.success && resp_ctx.success) {
+			double i_wall = elapsed_us(i_data.wall_start_ns, i_data.wall_end_ns);
+			double r_wall = elapsed_us(r_data.wall_start_ns, r_data.wall_end_ns);
+			double i_cpu  = elapsed_us(i_data.cpu_start_ns,  i_data.cpu_end_ns);
+			double r_cpu  = elapsed_us(r_data.cpu_start_ns,  r_data.cpu_end_ns);
+			double i_txrx = (double)init_ctx.txrx_ns / 1000.0;
+			double r_txrx = (double)resp_ctx.txrx_ns / 1000.0;
+
+			total_i_wall += i_wall; total_r_wall += r_wall;
+			total_i_cpu  += i_cpu;  total_r_cpu  += r_cpu;
+			total_i_txrx += i_txrx; total_r_txrx += r_txrx;
+			success_count++;
+		}
+	}
+
+	if (success_count == 0) {
+		print_error("All Hybrid handshake iterations failed!");
+		return -1;
+	}
+
+	double n = (double)success_count;
+	double cpu_i = total_i_cpu / n;
+	double cpu_r = total_r_cpu / n;
+
+	/* Calibrate ops to measured CPU */
+	calibrate_hybrid_ops(ops_init, cpu_i);
+	calibrate_hybrid_ops(ops_resp, cpu_r);
+
+	double ops_sum_i = compute_hybrid_ops_total(ops_init);
+	double ops_sum_r = compute_hybrid_ops_total(ops_resp);
+
+	/* Precomputation = calibrated keygen costs (classic + PQ) */
+	double pre_i = ops_init->keygen.avg_us * ops_init->keygen.calls +
+		      ops_init->pq_keygen.avg_us * ops_init->pq_keygen.calls;
+	double pre_r = ops_resp->keygen.avg_us * ops_resp->keygen.calls +
+		      ops_resp->pq_keygen.avg_us * ops_resp->pq_keygen.calls;
+
+	double proc_i = ops_sum_i - pre_i;
+	double proc_r = ops_sum_r - pre_r;
+
+	long mem = estimate_hybrid_memory();
+	oh_init->cpu_us = proc_i; oh_init->memory_bytes = mem;
+	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = mem;
+
+	double txrx_i = total_i_txrx / n;
+	double txrx_r = total_r_txrx / n;
+	double wall_i = total_i_wall / n;
+	double wall_r = total_r_wall / n;
+
+	hs_init->processing_us     = proc_i;
+	hs_init->txrx_us           = txrx_i;
+	hs_init->precomputation_us = pre_i;
+	hs_init->total_us          = wall_i;
+	hs_init->overhead_us       = hs_init->total_us - hs_init->processing_us -
+				    hs_init->txrx_us - hs_init->precomputation_us;
+	if (hs_init->overhead_us < 0) {
+		hs_init->overhead_us = 0;
+		hs_init->total_us = hs_init->processing_us + hs_init->txrx_us + hs_init->precomputation_us;
+	}
+
+	hs_resp->processing_us     = proc_r;
+	hs_resp->txrx_us           = txrx_r;
+	hs_resp->precomputation_us = pre_r;
+	hs_resp->total_us          = wall_r;
+	hs_resp->overhead_us       = hs_resp->total_us - hs_resp->processing_us -
+				    hs_resp->txrx_us - hs_resp->precomputation_us;
+	if (hs_resp->overhead_us < 0) {
+		hs_resp->overhead_us = 0;
+		hs_resp->total_us = hs_resp->processing_us + hs_resp->txrx_us + hs_resp->precomputation_us;
+	}
+
+	char buf[128];
+	snprintf(buf, sizeof(buf),
+		 "Hybrid handshake benchmark completed (%d/%d successful).",
+		 success_count, BENCH_HANDSHAKE_ITERATIONS);
+	print_success(buf);
+	return 0;
+}
+
+/* Hybrid CSV writers (5 variants total) */
+
+static int write_operations_csv_full_hybrid(const char *filepath,
+					 struct ops_benchmark *t0_init,
+					 struct ops_benchmark *t0_resp,
+					 struct ops_benchmark *t3_init,
+					 struct ops_benchmark *t3_resp,
+					 struct ops_benchmark *t0pq_init,
+					 struct ops_benchmark *t0pq_resp,
+					 struct ops_benchmark *t3pq_init,
+					 struct ops_benchmark *t3pq_resp,
+					 struct ops_benchmark *thyb_init,
+					 struct ops_benchmark *thyb_resp)
+{
+	FILE *fp = fopen(filepath, "w");
+	if (!fp) return -1;
+
+	fprintf(fp, "type,role,operation,avg_time_us,calls_per_handshake,total_per_handshake_us,iterations\n");
+
+	#define WRITE_OP(TYPE, ROLE, OP_NAME, OP) \
+		fprintf(fp, "%s,%s,%s,%.3f,%d,%.3f,%d\n", \
+			TYPE, ROLE, OP_NAME, (OP).avg_us, (OP).calls, \
+			(OP).avg_us * (double)(OP).calls, (OP).count)
+
+	/* Classic Type 0 */
+	WRITE_OP("Type0_SigSig", "Initiator", "KeyGen",       t0_init->keygen);
+	WRITE_OP("Type0_SigSig", "Initiator", "Encap",        t0_init->encap);
+	WRITE_OP("Type0_SigSig", "Initiator", "Decap",        t0_init->decap);
+	WRITE_OP("Type0_SigSig", "Initiator", "Signature",    t0_init->signature);
+	WRITE_OP("Type0_SigSig", "Initiator", "Verification", t0_init->verification);
+	WRITE_OP("Type0_SigSig", "Initiator", "ECDH",         t0_init->ecdh);
+	WRITE_OP("Type0_SigSig", "Initiator", "HKDF",         t0_init->hkdf);
+	WRITE_OP("Type0_SigSig", "Initiator", "Hash",         t0_init->hash);
+	WRITE_OP("Type0_SigSig", "Responder", "KeyGen",       t0_resp->keygen);
+	WRITE_OP("Type0_SigSig", "Responder", "Encap",        t0_resp->encap);
+	WRITE_OP("Type0_SigSig", "Responder", "Decap",        t0_resp->decap);
+	WRITE_OP("Type0_SigSig", "Responder", "Signature",    t0_resp->signature);
+	WRITE_OP("Type0_SigSig", "Responder", "Verification", t0_resp->verification);
+	WRITE_OP("Type0_SigSig", "Responder", "ECDH",         t0_resp->ecdh);
+	WRITE_OP("Type0_SigSig", "Responder", "HKDF",         t0_resp->hkdf);
+	WRITE_OP("Type0_SigSig", "Responder", "Hash",         t0_resp->hash);
+
+	/* Classic Type 3 */
+	WRITE_OP("Type3_MACMAC", "Initiator", "KeyGen",       t3_init->keygen);
+	WRITE_OP("Type3_MACMAC", "Initiator", "Encap",        t3_init->encap);
+	WRITE_OP("Type3_MACMAC", "Initiator", "Decap",        t3_init->decap);
+	WRITE_OP("Type3_MACMAC", "Initiator", "Signature",    t3_init->signature);
+	WRITE_OP("Type3_MACMAC", "Initiator", "Verification", t3_init->verification);
+	WRITE_OP("Type3_MACMAC", "Initiator", "ECDH",         t3_init->ecdh);
+	WRITE_OP("Type3_MACMAC", "Initiator", "HKDF",         t3_init->hkdf);
+	WRITE_OP("Type3_MACMAC", "Initiator", "Hash",         t3_init->hash);
+	WRITE_OP("Type3_MACMAC", "Responder", "KeyGen",       t3_resp->keygen);
+	WRITE_OP("Type3_MACMAC", "Responder", "Encap",        t3_resp->encap);
+	WRITE_OP("Type3_MACMAC", "Responder", "Decap",        t3_resp->decap);
+	WRITE_OP("Type3_MACMAC", "Responder", "Signature",    t3_resp->signature);
+	WRITE_OP("Type3_MACMAC", "Responder", "Verification", t3_resp->verification);
+	WRITE_OP("Type3_MACMAC", "Responder", "ECDH",         t3_resp->ecdh);
+	WRITE_OP("Type3_MACMAC", "Responder", "HKDF",         t3_resp->hkdf);
+	WRITE_OP("Type3_MACMAC", "Responder", "Hash",         t3_resp->hash);
+
+	/* PQ Type 0 */
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_KeyGen",       t0pq_init->pq_keygen);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_Encaps",       t0pq_init->pq_encaps);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_Decaps",       t0pq_init->pq_decaps);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_Signature",    t0pq_init->pq_sig_sign);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_Verification", t0pq_init->pq_sig_verify);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_AEAD_Enc",     t0pq_init->pq_aead_enc);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_AEAD_Dec",     t0pq_init->pq_aead_dec);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_HKDF",         t0pq_init->pq_hkdf);
+	WRITE_OP("Type0_PQ", "Initiator", "PQ_Hash",         t0pq_init->pq_hash);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_KeyGen",       t0pq_resp->pq_keygen);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_Encaps",       t0pq_resp->pq_encaps);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_Decaps",       t0pq_resp->pq_decaps);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_Signature",    t0pq_resp->pq_sig_sign);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_Verification", t0pq_resp->pq_sig_verify);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_AEAD_Enc",     t0pq_resp->pq_aead_enc);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_AEAD_Dec",     t0pq_resp->pq_aead_dec);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_HKDF",         t0pq_resp->pq_hkdf);
+	WRITE_OP("Type0_PQ", "Responder", "PQ_Hash",         t0pq_resp->pq_hash);
+
+	/* PQ Type 3 */
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_KeyGen",       t3pq_init->pq_keygen);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_Encaps",       t3pq_init->pq_encaps);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_Decaps",       t3pq_init->pq_decaps);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_Signature",    t3pq_init->pq_sig_sign);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_Verification", t3pq_init->pq_sig_verify);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_AEAD_Enc",     t3pq_init->pq_aead_enc);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_AEAD_Dec",     t3pq_init->pq_aead_dec);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_HKDF",         t3pq_init->pq_hkdf);
+	WRITE_OP("Type3_PQ", "Initiator", "PQ_Hash",         t3pq_init->pq_hash);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_KeyGen",       t3pq_resp->pq_keygen);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_Encaps",       t3pq_resp->pq_encaps);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_Decaps",       t3pq_resp->pq_decaps);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_Signature",    t3pq_resp->pq_sig_sign);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_Verification", t3pq_resp->pq_sig_verify);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_AEAD_Enc",     t3pq_resp->pq_aead_enc);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_AEAD_Dec",     t3pq_resp->pq_aead_dec);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_HKDF",         t3pq_resp->pq_hkdf);
+	WRITE_OP("Type3_PQ", "Responder", "PQ_Hash",         t3pq_resp->pq_hash);
+
+	/* Hybrid Type 3 */
+	WRITE_OP("Type3_Hybrid", "Initiator", "KeyGen",    thyb_init->keygen);
+	WRITE_OP("Type3_Hybrid", "Initiator", "Encap",     thyb_init->encap);
+	WRITE_OP("Type3_Hybrid", "Initiator", "Decap",     thyb_init->decap);
+	WRITE_OP("Type3_Hybrid", "Initiator", "ECDH",      thyb_init->ecdh);
+	WRITE_OP("Type3_Hybrid", "Initiator", "HKDF",      thyb_init->hkdf);
+	WRITE_OP("Type3_Hybrid", "Initiator", "Hash",      thyb_init->hash);
+	WRITE_OP("Type3_Hybrid", "Initiator", "PQ_KeyGen", thyb_init->pq_keygen);
+	WRITE_OP("Type3_Hybrid", "Initiator", "PQ_Encaps", thyb_init->pq_encaps);
+	WRITE_OP("Type3_Hybrid", "Initiator", "PQ_Decaps", thyb_init->pq_decaps);
+
+	WRITE_OP("Type3_Hybrid", "Responder", "KeyGen",    thyb_resp->keygen);
+	WRITE_OP("Type3_Hybrid", "Responder", "Encap",     thyb_resp->encap);
+	WRITE_OP("Type3_Hybrid", "Responder", "Decap",     thyb_resp->decap);
+	WRITE_OP("Type3_Hybrid", "Responder", "ECDH",      thyb_resp->ecdh);
+	WRITE_OP("Type3_Hybrid", "Responder", "HKDF",      thyb_resp->hkdf);
+	WRITE_OP("Type3_Hybrid", "Responder", "Hash",      thyb_resp->hash);
+	WRITE_OP("Type3_Hybrid", "Responder", "PQ_KeyGen", thyb_resp->pq_keygen);
+	WRITE_OP("Type3_Hybrid", "Responder", "PQ_Encaps", thyb_resp->pq_encaps);
+	WRITE_OP("Type3_Hybrid", "Responder", "PQ_Decaps", thyb_resp->pq_decaps);
+
+	#undef WRITE_OP
+	fclose(fp);
+	return 0;
+}
+
+static int write_overhead_csv_full_hybrid(const char *filepath,
+					struct overhead_benchmark *t0_init,
+					struct overhead_benchmark *t0_resp,
+					struct overhead_benchmark *t3_init,
+					struct overhead_benchmark *t3_resp,
+					struct overhead_benchmark *t0pq_init,
+					struct overhead_benchmark *t0pq_resp,
+					struct overhead_benchmark *t3pq_init,
+					struct overhead_benchmark *t3pq_resp,
+					struct overhead_benchmark *thyb_init,
+					struct overhead_benchmark *thyb_resp)
+{
+	FILE *fp = fopen(filepath, "w");
+	if (!fp) return -1;
+
+	fprintf(fp, "type,role,cpu_time_us,memory_bytes,memory_note\n");
+	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%ld,estimated_stack_heap\n",
+		t0_init->cpu_us, t0_init->memory_bytes);
+	fprintf(fp, "Type0_SigSig,Responder,%.3f,%ld,estimated_stack_heap\n",
+		t0_resp->cpu_us, t0_resp->memory_bytes);
+	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%ld,estimated_stack_heap\n",
+		t3_init->cpu_us, t3_init->memory_bytes);
+	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%ld,estimated_stack_heap\n",
+		t3_resp->cpu_us, t3_resp->memory_bytes);
+	fprintf(fp, "Type0_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n",
+		t0pq_init->cpu_us, t0pq_init->memory_bytes);
+	fprintf(fp, "Type0_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n",
+		t0pq_resp->cpu_us, t0pq_resp->memory_bytes);
+	fprintf(fp, "Type3_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n",
+		t3pq_init->cpu_us, t3pq_init->memory_bytes);
+	fprintf(fp, "Type3_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n",
+		t3pq_resp->cpu_us, t3pq_resp->memory_bytes);
+	fprintf(fp, "Type3_Hybrid,Initiator,%.3f,%ld,estimated_stack_heap_hybrid\n",
+		thyb_init->cpu_us, thyb_init->memory_bytes);
+	fprintf(fp, "Type3_Hybrid,Responder,%.3f,%ld,estimated_stack_heap_hybrid\n",
+		thyb_resp->cpu_us, thyb_resp->memory_bytes);
+
+	fclose(fp);
+	return 0;
+}
+
+static int write_handshake_csv_full_hybrid(const char *filepath,
+					struct handshake_benchmark *t0_init,
+					struct handshake_benchmark *t0_resp,
+					struct handshake_benchmark *t3_init,
+					struct handshake_benchmark *t3_resp,
+					struct handshake_benchmark *t0pq_init,
+					struct handshake_benchmark *t0pq_resp,
+					struct handshake_benchmark *t3pq_init,
+					struct handshake_benchmark *t3pq_resp,
+					struct handshake_benchmark *thyb_init,
+					struct handshake_benchmark *thyb_resp)
+{
+	FILE *fp = fopen(filepath, "w");
+	if (!fp) return -1;
+
+	fprintf(fp, "type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us\n");
+	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t0_init->processing_us, t0_init->txrx_us,
+		t0_init->precomputation_us, t0_init->overhead_us,
+		t0_init->total_us);
+	fprintf(fp, "Type0_SigSig,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t0_resp->processing_us, t0_resp->txrx_us,
+		t0_resp->precomputation_us, t0_resp->overhead_us,
+		t0_resp->total_us);
+	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t3_init->processing_us, t3_init->txrx_us,
+		t3_init->precomputation_us, t3_init->overhead_us,
+		t3_init->total_us);
+	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t3_resp->processing_us, t3_resp->txrx_us,
+		t3_resp->precomputation_us, t3_resp->overhead_us,
+		t3_resp->total_us);
+	fprintf(fp, "Type0_PQ,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t0pq_init->processing_us, t0pq_init->txrx_us,
+		t0pq_init->precomputation_us, t0pq_init->overhead_us,
+		t0pq_init->total_us);
+	fprintf(fp, "Type0_PQ,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t0pq_resp->processing_us, t0pq_resp->txrx_us,
+		t0pq_resp->precomputation_us, t0pq_resp->overhead_us,
+		t0pq_resp->total_us);
+	fprintf(fp, "Type3_PQ,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t3pq_init->processing_us, t3pq_init->txrx_us,
+		t3pq_init->precomputation_us, t3pq_init->overhead_us,
+		t3pq_init->total_us);
+	fprintf(fp, "Type3_PQ,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		t3pq_resp->processing_us, t3pq_resp->txrx_us,
+		t3pq_resp->precomputation_us, t3pq_resp->overhead_us,
+		t3pq_resp->total_us);
+	fprintf(fp, "Type3_Hybrid,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		thyb_init->processing_us, thyb_init->txrx_us,
+		thyb_init->precomputation_us, thyb_init->overhead_us,
+		thyb_init->total_us);
+	fprintf(fp, "Type3_Hybrid,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		thyb_resp->processing_us, thyb_resp->txrx_us,
+		thyb_resp->precomputation_us, thyb_resp->overhead_us,
+		thyb_resp->total_us);
+
+	fclose(fp);
+	return 0;
+}
+
+/* =============================================================================
+ * run_edhoc_benchmark_full_hybrid() — 5 variants (Classic + PQ + Hybrid)
+ * =============================================================================
+ */
+
+int run_edhoc_benchmark_full_hybrid(void)
+{
+	print_header("EDHOC-Hybrid Full Benchmark (Classic + PQ + Hybrid)");
+	printf("\n");
+	print_info("Benchmark Configuration:");
+	char buf[256];
+	snprintf(buf, sizeof(buf),
+		 "  Operations iterations : %d", BENCH_ITERATIONS);
+	print_info(buf);
+	snprintf(buf, sizeof(buf),
+		 "  Handshake iterations  : %d", BENCH_HANDSHAKE_ITERATIONS);
+	print_info(buf);
+	print_info("  Variants: Type0, Type3, Type0_PQ, Type3_PQ, Type3_Hybrid");
+	printf("\n");
+
+	mkdir(BENCH_OUTPUT_DIR, 0755);
+
+	/* Phase 1a: Classic ops */
+	print_header("Phase 1a: Classic Operations Benchmark");
+	printf("\n");
+	struct ops_benchmark t0_ops_init, t0_ops_resp;
+	struct ops_benchmark t3_ops_init, t3_ops_resp;
+	memset(&t0_ops_init, 0, sizeof(t0_ops_init));
+	memset(&t0_ops_resp, 0, sizeof(t0_ops_resp));
+	memset(&t3_ops_init, 0, sizeof(t3_ops_init));
+	memset(&t3_ops_resp, 0, sizeof(t3_ops_resp));
+	bench_all_operations("Type 0 (Sig-Sig)", 0, &t0_ops_init, &t0_ops_resp);
+	bench_all_operations("Type 3 (MAC-MAC)", 3, &t3_ops_init, &t3_ops_resp);
+	print_ops_summary("Type 0 (Sig-Sig)", &t0_ops_init, &t0_ops_resp);
+	print_ops_summary("Type 3 (MAC-MAC)", &t3_ops_init, &t3_ops_resp);
+
+	/* Phase 1b: PQ ops */
+	print_header("Phase 1b: PQ Operations Benchmark");
+	printf("\n");
+	struct ops_benchmark t0pq_ops_init, t0pq_ops_resp;
+	struct ops_benchmark t3pq_ops_init, t3pq_ops_resp;
+	memset(&t0pq_ops_init, 0, sizeof(t0pq_ops_init));
+	memset(&t0pq_ops_resp, 0, sizeof(t0pq_ops_resp));
+	memset(&t3pq_ops_init, 0, sizeof(t3pq_ops_init));
+	memset(&t3pq_ops_resp, 0, sizeof(t3pq_ops_resp));
+	bench_pq_all_operations("Type 0 PQ (ML-KEM-768 + ML-DSA-65)", 0,
+				&t0pq_ops_init, &t0pq_ops_resp);
+	bench_pq_all_operations("Type 3 PQ (ML-KEM-768)", 3,
+				&t3pq_ops_init, &t3pq_ops_resp);
+	print_pq_ops_summary("Type 0 PQ (ML-KEM-768 + ML-DSA-65)", &t0pq_ops_init, &t0pq_ops_resp);
+	print_pq_ops_summary("Type 3 PQ (ML-KEM-768)", &t3pq_ops_init, &t3pq_ops_resp);
+
+	/* Phase 1c: Hybrid ops */
+	print_header("Phase 1c: Hybrid Operations Benchmark");
+	printf("\n");
+	struct ops_benchmark th_ops_init, th_ops_resp;
+	memset(&th_ops_init, 0, sizeof(th_ops_init));
+	memset(&th_ops_resp, 0, sizeof(th_ops_resp));
+	bench_hybrid_all_operations(&th_ops_init, &th_ops_resp);
+
+	/* Phase 2a: Classic handshake */
+	print_header("Phase 2a: Classic Handshake + Overhead Benchmark");
+	printf("\n");
+	struct overhead_benchmark t0_oh_init, t0_oh_resp, t3_oh_init, t3_oh_resp;
+	struct handshake_benchmark t0_hs_init, t0_hs_resp, t3_hs_init, t3_hs_resp;
+	memset(&t0_oh_init, 0, sizeof(t0_oh_init));
+	memset(&t0_oh_resp, 0, sizeof(t0_oh_resp));
+	memset(&t3_oh_init, 0, sizeof(t3_oh_init));
+	memset(&t3_oh_resp, 0, sizeof(t3_oh_resp));
+	memset(&t0_hs_init, 0, sizeof(t0_hs_init));
+	memset(&t0_hs_resp, 0, sizeof(t0_hs_resp));
+	memset(&t3_hs_init, 0, sizeof(t3_hs_init));
+	memset(&t3_hs_resp, 0, sizeof(t3_hs_resp));
+	if (run_handshake_benchmark(0, &t0_ops_init, &t0_ops_resp,
+		&t0_oh_init, &t0_oh_resp, &t0_hs_init, &t0_hs_resp) != 0) return -1;
+	if (run_handshake_benchmark(3, &t3_ops_init, &t3_ops_resp,
+		&t3_oh_init, &t3_oh_resp, &t3_hs_init, &t3_hs_resp) != 0) return -1;
+
+	/* Phase 2b: PQ handshake */
+	print_header("Phase 2b: PQ Handshake + Overhead Benchmark");
+	printf("\n");
+	struct overhead_benchmark t0pq_oh_init, t0pq_oh_resp, t3pq_oh_init, t3pq_oh_resp;
+	struct handshake_benchmark t0pq_hs_init, t0pq_hs_resp, t3pq_hs_init, t3pq_hs_resp;
+	memset(&t0pq_oh_init, 0, sizeof(t0pq_oh_init));
+	memset(&t0pq_oh_resp, 0, sizeof(t0pq_oh_resp));
+	memset(&t3pq_oh_init, 0, sizeof(t3pq_oh_init));
+	memset(&t3pq_oh_resp, 0, sizeof(t3pq_oh_resp));
+	memset(&t0pq_hs_init, 0, sizeof(t0pq_hs_init));
+	memset(&t0pq_hs_resp, 0, sizeof(t0pq_hs_resp));
+	memset(&t3pq_hs_init, 0, sizeof(t3pq_hs_init));
+	memset(&t3pq_hs_resp, 0, sizeof(t3pq_hs_resp));
+	if (run_pq_handshake_benchmark(0, &t0pq_ops_init, &t0pq_ops_resp,
+		&t0pq_oh_init, &t0pq_oh_resp, &t0pq_hs_init, &t0pq_hs_resp) != 0) return -1;
+	if (run_pq_handshake_benchmark(3, &t3pq_ops_init, &t3pq_ops_resp,
+		&t3pq_oh_init, &t3pq_oh_resp, &t3pq_hs_init, &t3pq_hs_resp) != 0) return -1;
+
+	/* Phase 2c: Hybrid handshake */
+	print_header("Phase 2c: Hybrid Handshake + Overhead Benchmark");
+	printf("\n");
+	struct overhead_benchmark th_oh_init, th_oh_resp;
+	struct handshake_benchmark th_hs_init, th_hs_resp;
+	memset(&th_oh_init, 0, sizeof(th_oh_init));
+	memset(&th_oh_resp, 0, sizeof(th_oh_resp));
+	memset(&th_hs_init, 0, sizeof(th_hs_init));
+	memset(&th_hs_resp, 0, sizeof(th_hs_resp));
+	if (run_hybrid_handshake_benchmark(&th_ops_init, &th_ops_resp,
+		&th_oh_init, &th_oh_resp, &th_hs_init, &th_hs_resp) != 0) return -1;
+
+	/* Print summaries */
+	print_overhead_summary(&t0_oh_init, &t0_oh_resp, &t3_oh_init, &t3_oh_resp);
+	print_handshake_summary(&t0_hs_init, &t0_hs_resp, &t3_hs_init, &t3_hs_resp);
+
+	printf("\n");
+	print_header("Hybrid Overhead Benchmark (avg per handshake)");
+	printf("\n");
+	printf("  %-16s %-12s %14s %14s %s\n", "Type", "Role", "CPU (µs)", "Memory (bytes)", "Note");
+	printf("  %-16s %-12s %14s %14s %s\n", "────────────────", "────────────", "──────────────", "──────────────", "────────────────────");
+	printf("  %-16s %-12s %14.3f %14ld %s\n", "Type3_Hybrid", "Initiator", th_oh_init.cpu_us, th_oh_init.memory_bytes, "computed from ops");
+	printf("  %-16s %-12s %14.3f %14ld %s\n", "Type3_Hybrid", "Responder", th_oh_resp.cpu_us, th_oh_resp.memory_bytes, "computed from ops");
+
+	printf("\n");
+	print_header("Hybrid Handshake Timing Benchmark (µs, avg)");
+	printf("\n");
+	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n", "Type", "Role", "Processing", "TxRx", "Precompute", "Overhead", "Total");
+	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n", "────────────────", "────────────", "──────────────", "──────────────", "──────────────", "──────────────", "──────────────");
+	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n", "Type3_Hybrid", "Initiator", th_hs_init.processing_us, th_hs_init.txrx_us, th_hs_init.precomputation_us, th_hs_init.overhead_us, th_hs_init.total_us);
+	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n", "Type3_Hybrid", "Responder", th_hs_resp.processing_us, th_hs_resp.txrx_us, th_hs_resp.precomputation_us, th_hs_resp.overhead_us, th_hs_resp.total_us);
+
+	/* Write CSV files */
+	printf("\n");
+	print_header("Writing CSV Output Files (Full: Classic + PQ + Hybrid)");
+	printf("\n");
+	int ret;
+	ret = write_operations_csv_full_hybrid(BENCH_CSV_OPERATIONS,
+		&t0_ops_init, &t0_ops_resp, &t3_ops_init, &t3_ops_resp,
+		&t0pq_ops_init, &t0pq_ops_resp, &t3pq_ops_init, &t3pq_ops_resp,
+		&th_ops_init, &th_ops_resp);
+	if (ret == 0) {
+		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_OPERATIONS);
+		print_success(buf);
+	}
+	ret = write_overhead_csv_full_hybrid(BENCH_CSV_OVERHEAD,
+		&t0_oh_init, &t0_oh_resp, &t3_oh_init, &t3_oh_resp,
+		&t0pq_oh_init, &t0pq_oh_resp, &t3pq_oh_init, &t3pq_oh_resp,
+		&th_oh_init, &th_oh_resp);
+	if (ret == 0) {
+		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_OVERHEAD);
+		print_success(buf);
+	}
+	ret = write_handshake_csv_full_hybrid(BENCH_CSV_HANDSHAKE,
+		&t0_hs_init, &t0_hs_resp, &t3_hs_init, &t3_hs_resp,
+		&t0pq_hs_init, &t0pq_hs_resp, &t3pq_hs_init, &t3pq_hs_resp,
+		&th_hs_init, &th_hs_resp);
+	if (ret == 0) {
+		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_HANDSHAKE);
+		print_success(buf);
+	}
+
+	printf("\n");
+	print_success("EDHOC-Hybrid Full Benchmark (Classic + PQ + Hybrid) completed!");
+	print_info("● CSV files saved in output/ directory.");
+	print_info("● 5 variants: Type0, Type3, Type0_PQ, Type3_PQ, Type3_Hybrid");
+	printf("\n");
 	return 0;
 }
