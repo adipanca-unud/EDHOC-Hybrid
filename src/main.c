@@ -37,6 +37,7 @@
 #include "edhoc_type3_pq.h"
 #include "edhoc_type3_hybrid.h"
 #include "edhoc_benchmark.h"
+#include "edhoc_benchmark_socket.h"
 
 static void print_banner(void)
 {
@@ -95,6 +96,11 @@ static void print_menu(void)
 	printf("      %sAll 5 variants → 3 CSV files%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
+	printf("  %s[9]%s Socket Benchmark (TCP Client-Server, All 5 Variants)\n",
+	       CLR_GREEN, CLR_RESET);
+	printf("      %sTCP localhost | All 5 variants → 3 CSV files (output_socket/)%s\n",
+	       CLR_CYAN, CLR_RESET);
+	printf("\n");
 	printf("  %s[0]%s Exit\n", CLR_RED, CLR_RESET);
 	printf("\n");
 	printf("  %s> Choice: %s", CLR_BOLD, CLR_RESET);
@@ -121,7 +127,7 @@ int main(int argc, char *argv[])
 				while ((c = getchar()) != '\n' && c != EOF)
 					;
 				printf("\n");
-				print_error("Invalid input. Please enter 0-8.");
+				print_error("Invalid input. Please enter 0-9.");
 				choice = -1;
 				continue;
 			}
@@ -190,9 +196,16 @@ int main(int argc, char *argv[])
 			}
 			break;
 
+		case 9:
+			result = run_edhoc_benchmark_socket();
+			if (result != 0) {
+				print_error("Socket Benchmark (TCP) failed!");
+			}
+			break;
+
 		default:
 			printf("\n");
-			print_error("Invalid choice. Please enter 0-8.");
+			print_error("Invalid choice. Please enter 0-9.");
 			break;
 		}
 

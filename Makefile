@@ -42,6 +42,7 @@ APP_SRCS += $(SRC_DIR)/edhoc_pq_kem.c
 APP_SRCS += $(SRC_DIR)/edhoc_type0_pq.c
 APP_SRCS += $(SRC_DIR)/edhoc_type3_pq.c
 APP_SRCS += $(SRC_DIR)/edhoc_type3_hybrid.c
+APP_SRCS += $(SRC_DIR)/edhoc_benchmark_socket.c
 
 TV_SRCS = $(TV_DIR)/edhoc_test_vectors_rfc9529.c
 
@@ -160,6 +161,7 @@ clean:
 	rm -f $(BUILD_DIR)/edhoc_pq_kem.o $(BUILD_DIR)/edhoc_type0_pq.o $(BUILD_DIR)/edhoc_type3_pq.o
 	rm -f $(BUILD_DIR)/edhoc_type3_hybrid.o
 	rm -f $(BUILD_DIR)/edhoc_type3_hybrid.o
+	rm -f $(BUILD_DIR)/edhoc_benchmark_socket.o
 	rm -f $(BUILD_DIR)/pqclean_*.o
 	rm -f $(BUILD_DIR)/tv_*.o $(TARGET)
 
