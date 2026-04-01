@@ -4,7 +4,7 @@ Hybrid EDHOC implementation (classic + post-quantum + hybrid) built on top of
 [uoscore-uedhoc](https://github.com/eriptic/uoscore-uedhoc). Classic paths use
 libsodium for X25519/Ed25519/HKDF-SHA256; PQ paths use PQClean (ML-KEM-768 &
 ML-DSA-65) with mbedTLS AES-CCM for symmetric encryption; the hybrid path chains
-X25519 ECDHE with ML-KEM-768 KEM for EDHOC Type 3 MAC-MAC.
+X25519 ECDHE with ML-KEM-768 KEM for EDHOC Type 3 MAC-MAC.  
 
 ## Variants & Crypto Stacks
 
