@@ -135,6 +135,129 @@ static const uint8_t HYB_AK[]   = "EDHOC-HYB-AK";
 static const uint8_t HYB_ID_I[] = "EDHOC-HYB-Initiator";
 static const uint8_t HYB_ID_R[] = "EDHOC-HYB-Responder";
 
+/* ── Libsodium-based HKDF wrappers (same backend as classic EDHOC) ── */
+
+/**
+ * hyb_hkdf_extract — HKDF-Extract using libsodium HMAC-SHA256
+ * (same code path as classic EDHOC's hkdf_extract() in crypto_wrapper.c)
+ */
+static int hyb_hkdf_extract(const uint8_t *salt, size_t salt_len,
+			    const uint8_t *ikm, size_t ikm_len,
+			    uint8_t *prk_out)
+{
+	struct byte_array salt_ba = {
+		.len = (uint32_t)salt_len,
+		.ptr = (uint8_t *)salt
+	};
+	struct byte_array ikm_ba = {
+		.len = (uint32_t)ikm_len,
+		.ptr = (uint8_t *)ikm
+	};
+	/* Handle NULL salt: crypto_wrapper checks salt->ptr internally */
+	if (salt == NULL || salt_len == 0) {
+		salt_ba.ptr = NULL;
+		salt_ba.len = 0;
+	}
+	enum err r = hkdf_extract(SHA_256, &salt_ba, &ikm_ba, prk_out);
+	return (r == ok) ? 0 : -1;
+}
+
+/**
+ * hyb_hkdf_expand — HKDF-Expand using libsodium HMAC-SHA256
+ * (same code path as classic EDHOC's hkdf_expand() in crypto_wrapper.c)
+ */
+static int hyb_hkdf_expand(const uint8_t *prk,
+			   const uint8_t *info, size_t info_len,
+			   uint8_t *okm, size_t okm_len)
+{
+	struct byte_array prk_ba = {
+		.len = 32,
+		.ptr = (uint8_t *)prk
+	};
+	struct byte_array info_ba = {
+		.len = (uint32_t)info_len,
+		.ptr = (uint8_t *)info
+	};
+	struct byte_array okm_ba = {
+		.len = (uint32_t)okm_len,
+		.ptr = okm
+	};
+	enum err r = hkdf_expand(SHA_256, &prk_ba, &info_ba, &okm_ba);
+	return (r == ok) ? 0 : -1;
+}
+
+/**
+ * hyb_hash_sha256 — SHA-256 using mbedTLS PSA hash
+ * (same code path as classic EDHOC's hash() in crypto_wrapper.c)
+ */
+static int hyb_hash_sha256(const uint8_t *data, size_t data_len,
+			   uint8_t *hash_out)
+{
+	struct byte_array in = {
+		.len = (uint32_t)data_len,
+		.ptr = (uint8_t *)data
+	};
+	struct byte_array out = {
+		.len = 32,
+		.ptr = hash_out
+	};
+	enum err r = hash(SHA_256, &in, &out);
+	return (r == ok) ? 0 : -1;
+}
+
+/**
+ * hyb_aead_encrypt — AES-CCM-16-64-128 encrypt using mbedTLS PSA
+ * (same code path as classic EDHOC's aead() in crypto_wrapper.c)
+ */
+static int hyb_aead_encrypt(const uint8_t *key, const uint8_t *nonce,
+			    const uint8_t *aad, size_t aad_len,
+			    const uint8_t *pt, size_t pt_len,
+			    uint8_t *ct, size_t *ct_len)
+{
+	uint8_t tag_buf[PQ_AEAD_TAG_LEN];
+	struct byte_array plain  = { .len = (uint32_t)pt_len,  .ptr = (uint8_t *)pt };
+	struct byte_array k_ba   = { .len = PQ_AEAD_KEY_LEN,   .ptr = (uint8_t *)key };
+	struct byte_array n_ba   = { .len = PQ_AEAD_NONCE_LEN, .ptr = (uint8_t *)nonce };
+	struct byte_array aad_ba = { .len = (uint32_t)aad_len, .ptr = (uint8_t *)aad };
+	struct byte_array ciph   = { .len = (uint32_t)pt_len,  .ptr = ct };
+	struct byte_array tag_ba = { .len = PQ_AEAD_TAG_LEN,   .ptr = tag_buf };
+
+	enum err r = aead(ENCRYPT, &plain, &k_ba, &n_ba, &aad_ba, &ciph, &tag_ba);
+	if (r != ok) return -1;
+
+	/* Append tag after ciphertext (same layout as hyb_aead_encrypt) */
+	memcpy(ct + pt_len, tag_buf, PQ_AEAD_TAG_LEN);
+	*ct_len = pt_len + PQ_AEAD_TAG_LEN;
+	return 0;
+}
+
+/**
+ * hyb_aead_decrypt — AES-CCM-16-64-128 decrypt using mbedTLS PSA
+ * (same code path as classic EDHOC's aead() in crypto_wrapper.c)
+ */
+static int hyb_aead_decrypt(const uint8_t *key, const uint8_t *nonce,
+			    const uint8_t *aad, size_t aad_len,
+			    const uint8_t *ct, size_t ct_len,
+			    uint8_t *pt, size_t *pt_len)
+{
+	if (ct_len < PQ_AEAD_TAG_LEN) return -1;
+	size_t plain_len = ct_len - PQ_AEAD_TAG_LEN;
+
+	/* crypto_wrapper aead(DECRYPT) expects ct+tag concatenated as input */
+	struct byte_array ct_ba  = { .len = (uint32_t)ct_len,       .ptr = (uint8_t *)ct };
+	struct byte_array k_ba   = { .len = PQ_AEAD_KEY_LEN,        .ptr = (uint8_t *)key };
+	struct byte_array n_ba   = { .len = PQ_AEAD_NONCE_LEN,      .ptr = (uint8_t *)nonce };
+	struct byte_array aad_ba = { .len = (uint32_t)aad_len,      .ptr = (uint8_t *)aad };
+	struct byte_array pt_ba  = { .len = (uint32_t)plain_len,    .ptr = pt };
+	struct byte_array tag_ba = { .len = PQ_AEAD_TAG_LEN,
+				     .ptr = (uint8_t *)(ct + plain_len) };
+
+	enum err r = aead(DECRYPT, &ct_ba, &k_ba, &n_ba, &aad_ba, &pt_ba, &tag_ba);
+	if (r != ok) return -1;
+	*pt_len = plain_len;
+	return 0;
+}
+
 /* ── Derive EK + IV from PRK using label ── */
 static int hyb_derive_key_iv(const uint8_t *prk,
 			     const uint8_t *label, size_t label_len,
@@ -147,11 +270,11 @@ static int hyb_derive_key_iv(const uint8_t *prk,
 	memcpy(info, label, label_len);
 	memcpy(info + label_len, th, th_len);
 
-	if (pq_hkdf_expand(prk, info, info_len, key, PQ_AEAD_KEY_LEN) != 0)
+	if (hyb_hkdf_expand(prk, info, info_len, key, PQ_AEAD_KEY_LEN) != 0)
 		return -1;
 	/* IV: XOR first byte of label to differentiate */
 	info[0] ^= 0xFF;
-	if (pq_hkdf_expand(prk, info, info_len, iv, PQ_AEAD_NONCE_LEN) != 0)
+	if (hyb_hkdf_expand(prk, info, info_len, iv, PQ_AEAD_NONCE_LEN) != 0)
 		return -1;
 	return 0;
 }
@@ -253,7 +376,7 @@ void *hybrid_initiator_thread(void *arg)
 		memcpy(th2_in, m1_buf, m1_len); th2_in_len += m1_len;
 		memcpy(th2_in + th2_in_len, peer_eph_pk, 32); th2_in_len += 32;
 		memcpy(th2_in + th2_in_len, c_kem, PQ_KEM_CT_LEN); th2_in_len += PQ_KEM_CT_LEN;
-		ret = pq_hash_sha256(th2_in, th2_in_len, ctx->th2);
+		ret = hyb_hash_sha256(th2_in, th2_in_len, ctx->th2);
 		if (ret != 0) { print_error("HYB Init: TH2 failed"); return NULL; }
 	}
 
@@ -264,7 +387,7 @@ void *hybrid_initiator_thread(void *arg)
 		uint8_t ikm[PQ_KEM_SS_LEN + 32];
 		memcpy(ikm, k_kem, PQ_KEM_SS_LEN);
 		memcpy(ikm + PQ_KEM_SS_LEN, ctx->th2, 32);
-		ret = pq_hkdf_extract(ss_eph, 32, ikm, PQ_KEM_SS_LEN + 32, ctx->prk2e);
+		ret = hyb_hkdf_extract(ss_eph, 32, ikm, PQ_KEM_SS_LEN + 32, ctx->prk2e);
 		if (ret != 0) { print_error("HYB Init: PRK2e failed"); return NULL; }
 	}
 
@@ -287,11 +410,11 @@ void *hybrid_initiator_thread(void *arg)
 	/* ── Decrypt msg2 = AEAD.Dec(EK2, ct2) ── */
 	uint8_t pt2[512];
 	size_t pt2_len = 0;
-	ret = pq_aead_decrypt(ek2, iv2, NULL, 0, ct2_aead, ct2_len, pt2, &pt2_len);
+	ret = hyb_aead_decrypt(ek2, iv2, NULL, 0, ct2_aead, ct2_len, pt2, &pt2_len);
 	if (ret != 0) { print_error("HYB Init: AEAD dec msg2 failed"); return NULL; }
 
 	/* ── PRK3e2m = HKDF-Extract(Bx, PRK2e) ── */
-	ret = pq_hkdf_extract(ss_bx, 32, ctx->prk2e, 32, ctx->prk3e2m);
+	ret = hyb_hkdf_extract(ss_bx, 32, ctx->prk2e, 32, ctx->prk3e2m);
 	if (ret != 0) { print_error("HYB Init: PRK3e2m failed"); return NULL; }
 
 	/* ── MK2 = HKDF-Expand(PRK3e2m, TH2) → Verify MAC2 ── */
@@ -300,7 +423,7 @@ void *hybrid_initiator_thread(void *arg)
 		uint8_t mk2_info[32 + 64];
 		memcpy(mk2_info, ctx->th2, 32);
 		memcpy(mk2_info + 32, HYB_ID_R, sizeof(HYB_ID_R) - 1);
-		ret = pq_hkdf_expand(ctx->prk3e2m, mk2_info,
+		ret = hyb_hkdf_expand(ctx->prk3e2m, mk2_info,
 				     32 + sizeof(HYB_ID_R) - 1,
 				     mk2, PQ_AEAD_TAG_LEN);
 		if (ret != 0) { print_error("HYB Init: MK2 failed"); return NULL; }
@@ -320,7 +443,7 @@ void *hybrid_initiator_thread(void *arg)
 		memcpy(th3_in + len, g_hyb_exchange.msg2_buf, g_hyb_exchange.msg2_len);
 		len += g_hyb_exchange.msg2_len;
 		memcpy(th3_in + len, ctx->other_static_pk, 32); len += 32;
-		ret = pq_hash_sha256(th3_in, len, ctx->th3);
+		ret = hyb_hash_sha256(th3_in, len, ctx->th3);
 		if (ret != 0) { print_error("HYB Init: TH3 failed"); return NULL; }
 	}
 
@@ -335,7 +458,7 @@ void *hybrid_initiator_thread(void *arg)
 	uint8_t ss_ya[32];
 	ret = hyb_ecdh(ctx->static_sk, peer_eph_pk, ss_ya);
 	if (ret != 0) { print_error("HYB Init: ECDH(Y,a) failed"); return NULL; }
-	ret = pq_hkdf_extract(ss_ya, 32, ctx->prk3e2m, 32, ctx->prk4e3m);
+	ret = hyb_hkdf_extract(ss_ya, 32, ctx->prk3e2m, 32, ctx->prk4e3m);
 	if (ret != 0) { print_error("HYB Init: PRK4e3m failed"); return NULL; }
 
 	/* ── MK3 → MAC3 ── */
@@ -344,7 +467,7 @@ void *hybrid_initiator_thread(void *arg)
 		uint8_t mk3_info[32 + 64];
 		memcpy(mk3_info, ctx->th3, 32);
 		memcpy(mk3_info + 32, HYB_ID_I, sizeof(HYB_ID_I) - 1);
-		ret = pq_hkdf_expand(ctx->prk4e3m, mk3_info,
+		ret = hyb_hkdf_expand(ctx->prk4e3m, mk3_info,
 				     32 + sizeof(HYB_ID_I) - 1,
 				     mac3, PQ_AEAD_TAG_LEN);
 		if (ret != 0) { print_error("HYB Init: MAC3 failed"); return NULL; }
@@ -360,7 +483,7 @@ void *hybrid_initiator_thread(void *arg)
 
 	uint8_t ct3_aead[128 + PQ_AEAD_TAG_LEN];
 	size_t ct3_len = 0;
-	ret = pq_aead_encrypt(ek3, iv3, NULL, 0, pt3, pt3_len,
+	ret = hyb_aead_encrypt(ek3, iv3, NULL, 0, pt3, pt3_len,
 			      ct3_aead, &ct3_len);
 	if (ret != 0) { print_error("HYB Init: AEAD enc msg3 failed"); return NULL; }
 
@@ -371,12 +494,12 @@ void *hybrid_initiator_thread(void *arg)
 		memcpy(th4_in, ctx->th3, 32); len += 32;
 		memcpy(th4_in + len, ct3_aead, ct3_len); len += ct3_len;
 		memcpy(th4_in + len, ctx->static_pk, 32); len += 32;
-		ret = pq_hash_sha256(th4_in, len, ctx->th4);
+		ret = hyb_hash_sha256(th4_in, len, ctx->th4);
 		if (ret != 0) { print_error("HYB Init: TH4 failed"); return NULL; }
 	}
 
 	/* ── PRK_out = HKDF-Expand(PRK4e3m, TH4) ── */
-	ret = pq_hkdf_expand(ctx->prk4e3m, ctx->th4, 32, ctx->prk_out, 32);
+	ret = hyb_hkdf_expand(ctx->prk4e3m, ctx->th4, 32, ctx->prk_out, 32);
 	if (ret != 0) { print_error("HYB Init: PRK_out failed"); return NULL; }
 
 	/* ── Send M3 ── */
@@ -449,7 +572,7 @@ void *hybrid_responder_thread(void *arg)
 		memcpy(th2_in, m1, m1_len); th2_in_len += m1_len;
 		memcpy(th2_in + th2_in_len, ctx->eph_pk, 32); th2_in_len += 32;
 		memcpy(th2_in + th2_in_len, c_kem, PQ_KEM_CT_LEN); th2_in_len += PQ_KEM_CT_LEN;
-		ret = pq_hash_sha256(th2_in, th2_in_len, ctx->th2);
+		ret = hyb_hash_sha256(th2_in, th2_in_len, ctx->th2);
 		if (ret != 0) { print_error("HYB Resp: TH2 failed"); return NULL; }
 	}
 
@@ -458,7 +581,7 @@ void *hybrid_responder_thread(void *arg)
 		uint8_t ikm[PQ_KEM_SS_LEN + 32];
 		memcpy(ikm, k_kem, PQ_KEM_SS_LEN);
 		memcpy(ikm + PQ_KEM_SS_LEN, ctx->th2, 32);
-		ret = pq_hkdf_extract(ss_eph, 32, ikm, PQ_KEM_SS_LEN + 32, ctx->prk2e);
+		ret = hyb_hkdf_extract(ss_eph, 32, ikm, PQ_KEM_SS_LEN + 32, ctx->prk2e);
 		if (ret != 0) { print_error("HYB Resp: PRK2e failed"); return NULL; }
 	}
 
@@ -479,7 +602,7 @@ void *hybrid_responder_thread(void *arg)
 	}
 
 	/* ── PRK3e2m = HKDF-Extract(Xb, PRK2e) ── */
-	ret = pq_hkdf_extract(ss_xb, 32, ctx->prk2e, 32, ctx->prk3e2m);
+	ret = hyb_hkdf_extract(ss_xb, 32, ctx->prk2e, 32, ctx->prk3e2m);
 	if (ret != 0) { print_error("HYB Resp: PRK3e2m failed"); return NULL; }
 
 	/* ── MK2 = HKDF-Expand(PRK3e2m, TH2) → MAC2 ── */
@@ -488,7 +611,7 @@ void *hybrid_responder_thread(void *arg)
 		uint8_t mk2_info[32 + 64];
 		memcpy(mk2_info, ctx->th2, 32);
 		memcpy(mk2_info + 32, HYB_ID_R, sizeof(HYB_ID_R) - 1);
-		ret = pq_hkdf_expand(ctx->prk3e2m, mk2_info,
+		ret = hyb_hkdf_expand(ctx->prk3e2m, mk2_info,
 				     32 + sizeof(HYB_ID_R) - 1,
 				     mac2, PQ_AEAD_TAG_LEN);
 		if (ret != 0) { print_error("HYB Resp: MAC2 failed"); return NULL; }
@@ -505,7 +628,7 @@ void *hybrid_responder_thread(void *arg)
 
 	uint8_t ct2_aead[512 + PQ_AEAD_TAG_LEN];
 	size_t ct2_aead_len = 0;
-	ret = pq_aead_encrypt(ek2, iv2, NULL, 0, pt2, pt2_len,
+	ret = hyb_aead_encrypt(ek2, iv2, NULL, 0, pt2, pt2_len,
 			      ct2_aead, &ct2_aead_len);
 	if (ret != 0) { print_error("HYB Resp: AEAD enc msg2 failed"); return NULL; }
 
@@ -548,7 +671,7 @@ void *hybrid_responder_thread(void *arg)
 		memcpy(th3_in + len, g_hyb_exchange.msg2_buf, g_hyb_exchange.msg2_len);
 		len += g_hyb_exchange.msg2_len;
 		memcpy(th3_in + len, ctx->static_pk, 32); len += 32;
-		ret = pq_hash_sha256(th3_in, len, ctx->th3);
+		ret = hyb_hash_sha256(th3_in, len, ctx->th3);
 		if (ret != 0) { print_error("HYB Resp: TH3 failed"); return NULL; }
 	}
 
@@ -561,7 +684,7 @@ void *hybrid_responder_thread(void *arg)
 	/* ── Decrypt msg3 ── */
 	uint8_t pt3[128];
 	size_t pt3_len = 0;
-	ret = pq_aead_decrypt(ek3, iv3, NULL, 0,
+	ret = hyb_aead_decrypt(ek3, iv3, NULL, 0,
 			      g_hyb_exchange.msg3_buf, g_hyb_exchange.msg3_len,
 			      pt3, &pt3_len);
 	if (ret != 0) { print_error("HYB Resp: AEAD dec msg3 failed"); return NULL; }
@@ -571,7 +694,7 @@ void *hybrid_responder_thread(void *arg)
 	uint8_t ss_ay[32];
 	ret = hyb_ecdh(ctx->eph_sk, ctx->other_static_pk, ss_ay);
 	if (ret != 0) { print_error("HYB Resp: ECDH(A,y) failed"); return NULL; }
-	ret = pq_hkdf_extract(ss_ay, 32, ctx->prk3e2m, 32, ctx->prk4e3m);
+	ret = hyb_hkdf_extract(ss_ay, 32, ctx->prk3e2m, 32, ctx->prk4e3m);
 	if (ret != 0) { print_error("HYB Resp: PRK4e3m failed"); return NULL; }
 
 	/* ── MK3 → Verify MAC3 ── */
@@ -580,7 +703,7 @@ void *hybrid_responder_thread(void *arg)
 		uint8_t mk3_info[32 + 64];
 		memcpy(mk3_info, ctx->th3, 32);
 		memcpy(mk3_info + 32, HYB_ID_I, sizeof(HYB_ID_I) - 1);
-		ret = pq_hkdf_expand(ctx->prk4e3m, mk3_info,
+		ret = hyb_hkdf_expand(ctx->prk4e3m, mk3_info,
 				     32 + sizeof(HYB_ID_I) - 1,
 				     mac3_exp, PQ_AEAD_TAG_LEN);
 		if (ret != 0) { print_error("HYB Resp: MK3 failed"); return NULL; }
@@ -601,12 +724,12 @@ void *hybrid_responder_thread(void *arg)
 		memcpy(th4_in + len, g_hyb_exchange.msg3_buf, g_hyb_exchange.msg3_len);
 		len += g_hyb_exchange.msg3_len;
 		memcpy(th4_in + len, ctx->other_static_pk, 32); len += 32;
-		ret = pq_hash_sha256(th4_in, len, ctx->th4);
+		ret = hyb_hash_sha256(th4_in, len, ctx->th4);
 		if (ret != 0) { print_error("HYB Resp: TH4 failed"); return NULL; }
 	}
 
 	/* ── PRK_out = HKDF-Expand(PRK4e3m, TH4) ── */
-	ret = pq_hkdf_expand(ctx->prk4e3m, ctx->th4, 32, ctx->prk_out, 32);
+	ret = hyb_hkdf_expand(ctx->prk4e3m, ctx->th4, 32, ctx->prk_out, 32);
 	if (ret != 0) { print_error("HYB Resp: PRK_out failed"); return NULL; }
 
 	ctx->success = 1;

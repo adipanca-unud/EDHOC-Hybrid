@@ -86,12 +86,37 @@ Benchmark output CSVs:
 
 ## Performance notes (classic vs PQ vs hybrid)
 
-- **KEM counts drive latency.** Hybrid Type 3 uses 1 KEM.Enc (Responder) + 1 KEM.Dec (Initiator). PQ Type 3 uses 3 KEMs per side. With ML-KEM-768 ≈ 150–200 µs/op, Hybrid saves ~400–500 µs over PQ Type 3.
-- **ECDH backbone.** All X25519 comes from libsodium (`crypto_scalarmult_curve25519`) with the same compiler flags. Hybrid keeps two ECDH calls per side and one KEM anchor for PQ security.
-- **Why Hybrid ECDH looks very small (≈18–23 µs).** The ops micro-benchmark hits the bare crypto call with pre-made keys (no CBOR/PSA setup), so libsodium’s optimized scalar-mult lands in the ~20 µs range. Classic Type 3 includes a slightly heavier wrapper path, so its per-op number is higher.
-- **HKDF load.** Hybrid runs 10 HKDFs (~95–127 µs total): heavier than PQ (8 HKDFs, ~30–40 µs) but lighter than classic (10 HKDFs with larger buffers, ~500–700 µs).
-- **What the 1 µs Encap/Decap rows are.** Those are the lightweight AEAD wrap/unwrap inside EDHOC; PQ costs live under `PQ_Encaps`/`PQ_Decaps` (100–170 µs each).
-- **Scope of timings.** Benchmarks measure crypto only (no CBOR encode/decode, no network I/O). This favors direct crypto costs and makes the KEM-count difference visible.
+### Crypto library alignment (fairness)
+
+All five variants share the same underlying libraries to ensure a fair comparison:
+
+| Operation | Classic (Type 0/3) | PQ (Type 0/3) | Hybrid (Type 3) |
+|---|---|---|---|
+| **ECDH / KeyGen** | libsodium `crypto_scalarmult` | — | libsodium `crypto_scalarmult` |
+| **HKDF** | libsodium HMAC-SHA256 (`crypto_auth_hmacsha256`) | mbedTLS PSA HMAC | libsodium HMAC-SHA256 (same as classic) |
+| **Hash (SHA-256)** | mbedTLS PSA `psa_hash_compute` | mbedTLS PSA `psa_hash_compute` | mbedTLS PSA `psa_hash_compute` (same as classic) |
+| **AEAD (AES-CCM)** | mbedTLS PSA `psa_aead_*` | mbedTLS PSA `psa_aead_*` | mbedTLS PSA `psa_aead_*` (same as classic) |
+| **KEM (ML-KEM-768)** | — | PQClean | PQClean (same as PQ) |
+| **Signature** | libsodium Ed25519 | PQClean ML-DSA-65 | — (MAC-only) |
+
+The hybrid handshake (`edhoc_type3_hybrid.c`) calls the same `crypto_wrapper.h` functions
+(libsodium HKDF, mbedTLS AEAD/Hash) as classic Type 3, and the same PQClean KEM functions
+as PQ Type 3. The benchmark micro-benchmarks (`bench_ecdh`, `bench_hkdf`, `bench_hash`,
+`bench_encap`, `bench_decap`, `bench_pq_*`) use the identical call path, so measured
+times reflect the same overhead.
+
+### Why Hybrid is faster than PQ
+
+- **KEM counts drive latency.** Hybrid uses 1 KEM.Enc (Responder) + 1 KEM.Dec (Initiator). PQ Type 3 uses 3 KEMs per side. With ML-KEM-768 ~150-200 us/op, Hybrid saves ~400 us.
+- **ECDH backbone.** Hybrid keeps 2 ECDH calls per side (~25-35 us each) and one KEM as a PQ security anchor — much cheaper than replacing all ECDHs with KEMs.
+- **HKDF load.** Hybrid runs 10 HKDFs (~45-65 us total via libsodium), comparable to classic.
+- **Structural insight:** ECDH = performance backbone, KEM = PQ security reinforcement.
+
+### Benchmark scope
+
+- **What the 1-2 us Encap/Decap rows are.** Those are the lightweight AES-CCM AEAD wrap/unwrap; PQ costs appear under `PQ_Encaps`/`PQ_Decaps` (120-180 us each).
+- **Micro-bench variance.** Ops run sequentially (classic -> PQ -> hybrid); later batches benefit from warm CPU caches. Per-call times differ between classic and hybrid even for the same function, but both use identical code paths.
+- **Scope of timings.** Benchmarks measure crypto only (no CBOR encode/decode, no network I/O, no PSA setup in the handshake itself).
 
 ## Verify Benchmark Consistency
 
