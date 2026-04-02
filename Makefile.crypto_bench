@@ -1,0 +1,119 @@
+# ============================================================================
+# Makefile for Pure Cryptographic Operations Benchmark
+# Standalone — no EDHOC, no sockets
+# ============================================================================
+#
+# Usage:
+#   make -f Makefile.crypto_bench          # Build
+#   make -f Makefile.crypto_bench run      # Build and run
+#   make -f Makefile.crypto_bench clean    # Clean
+#
+# Dependencies:
+#   - libsodium (apt install libsodium-dev)
+#   - PQClean (submodule in lib/PQClean)
+# ============================================================================
+
+.DEFAULT_GOAL := all
+
+CC      = gcc
+
+PROJ_DIR    = $(CURDIR)
+SRC_DIR     = $(PROJ_DIR)/src
+BUILD_DIR   = $(PROJ_DIR)/build
+OUTPUT_DIR  = $(PROJ_DIR)/output
+
+# PQClean paths
+PQCLEAN_DIR        = $(PROJ_DIR)/lib/PQClean
+PQCLEAN_KEM_DIR    = $(PQCLEAN_DIR)/crypto_kem/ml-kem-768/clean
+PQCLEAN_SIG_DIR    = $(PQCLEAN_DIR)/crypto_sign/ml-dsa-65/clean
+PQCLEAN_COMMON_DIR = $(PQCLEAN_DIR)/common
+
+# Target binary
+TARGET = $(BUILD_DIR)/benchmark_crypto
+
+# Source files
+BENCH_SRC = $(SRC_DIR)/benchmark_crypto.c
+
+# PQClean sources
+PQCLEAN_KEM_SRCS    = $(wildcard $(PQCLEAN_KEM_DIR)/*.c)
+PQCLEAN_SIG_SRCS    = $(wildcard $(PQCLEAN_SIG_DIR)/*.c)
+PQCLEAN_COMMON_SRCS = $(wildcard $(PQCLEAN_COMMON_DIR)/*.c)
+
+# Object files
+BENCH_OBJ = $(BUILD_DIR)/benchmark_crypto.o
+
+PQCLEAN_KEM_OBJS    = $(patsubst $(PQCLEAN_KEM_DIR)/%.c,$(BUILD_DIR)/bench_pqkem_%.o,$(PQCLEAN_KEM_SRCS))
+PQCLEAN_SIG_OBJS    = $(patsubst $(PQCLEAN_SIG_DIR)/%.c,$(BUILD_DIR)/bench_pqsig_%.o,$(PQCLEAN_SIG_SRCS))
+PQCLEAN_COMMON_OBJS = $(patsubst $(PQCLEAN_COMMON_DIR)/%.c,$(BUILD_DIR)/bench_pqcommon_%.o,$(PQCLEAN_COMMON_SRCS))
+
+OBJS = $(BENCH_OBJ) $(PQCLEAN_KEM_OBJS) $(PQCLEAN_SIG_OBJS) $(PQCLEAN_COMMON_OBJS)
+
+# Compiler flags
+CFLAGS  = -std=c11 -O2 -Wall -Wextra
+CFLAGS += -Wno-unused-parameter -Wno-sign-conversion -Wno-conversion
+CFLAGS += -Wno-cast-qual -Wno-missing-field-initializers
+
+# Include paths
+C_INCLUDES  = -I$(PQCLEAN_DIR)
+C_INCLUDES += -I$(PQCLEAN_COMMON_DIR)
+C_INCLUDES += -I$(PQCLEAN_KEM_DIR)
+C_INCLUDES += -I$(PQCLEAN_SIG_DIR)
+
+# Linker flags
+LDFLAGS = -lsodium -lm
+
+.PHONY: all clean run help
+
+all: $(TARGET)
+	@echo ''
+	@echo '  Build complete: $(TARGET)'
+	@echo '  Run with: $(TARGET)'
+	@echo '  Or: make -f Makefile.crypto_bench run'
+	@echo ''
+
+$(TARGET): $(OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(OBJS) $(LDFLAGS) -o $@
+	@echo '=== Linked: $@ ==='
+
+$(BUILD_DIR)/benchmark_crypto.o: $(SRC_DIR)/benchmark_crypto.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/bench_pqkem_%.o: $(PQCLEAN_KEM_DIR)/%.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/bench_pqsig_%.o: $(PQCLEAN_SIG_DIR)/%.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/bench_pqcommon_%.o: $(PQCLEAN_COMMON_DIR)/%.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+
+run: all
+	@mkdir -p $(OUTPUT_DIR)
+	@$(TARGET)
+
+clean:
+	rm -f $(BUILD_DIR)/benchmark_crypto.o
+	rm -f $(BUILD_DIR)/bench_pqkem_*.o
+	rm -f $(BUILD_DIR)/bench_pqsig_*.o
+	rm -f $(BUILD_DIR)/bench_pqcommon_*.o
+	rm -f $(TARGET)
+
+help:
+	@echo ''
+	@echo '  Pure Cryptographic Operations Benchmark'
+	@echo '  ======================================='
+	@echo ''
+	@echo '  make -f Makefile.crypto_bench          - Build the benchmark'
+	@echo '  make -f Makefile.crypto_bench run      - Build and run'
+	@echo '  make -f Makefile.crypto_bench clean    - Clean build artifacts'
+	@echo '  make -f Makefile.crypto_bench help     - Show this help'
+	@echo ''
+	@echo '  Dependencies:'
+	@echo '    - libsodium-dev (apt install libsodium-dev)'
+	@echo '    - PQClean submodule (git submodule update --init)'
+	@echo ''
