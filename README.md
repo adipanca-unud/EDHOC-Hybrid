@@ -1,35 +1,20 @@
-# EDHOC-Hybrid (RFC 9528)# EDHOC-Hybrid (RFC 9528)
+# EDHOC-Hybrid (RFC 9528)
 
-
-Hybrid EDHOC implementation (classic + post-quantum + hybrid) built on top ofHybrid EDHOC implementation (classic + post-quantum + hybrid) built on top of
-
-[uoscore-uedhoc](https://github.com/eriptic/uoscore-uedhoc). Classic paths use[uoscore-uedhoc](https://github.com/eriptic/uoscore-uedhoc). Classic paths use
-
-libsodium for X25519/Ed25519/HKDF-SHA256; PQ paths use PQClean (ML-KEM-768 &libsodium for X25519/Ed25519/HKDF-SHA256; PQ paths use PQClean (ML-KEM-768 &
-
-ML-DSA-65) with mbedTLS AES-CCM for symmetric encryption; the hybrid path chainsML-DSA-65) with mbedTLS AES-CCM for symmetric encryption; the hybrid path chains
-
-X25519 ECDHE with ML-KEM-768 KEM for EDHOC Type 3 MAC-MAC.  X25519 ECDHE with ML-KEM-768 KEM for EDHOC Type 3 MAC-MAC.  
-
-
-## Variants & Crypto Stacks## Variants & Crypto Stacks
+Hybrid EDHOC implementation (classic + post-quantum + hybrid) built on top of [uoscore-uedhoc](https://github.com/eriptic/uoscore-uedhoc).
+Classic paths use libsodium for X25519/Ed25519/HKDF-SHA256; PQ paths use PQClean (ML-KEM-768 & ML-DSA-65) with mbedTLS AES-CCM for symmetric encryption; the hybrid path chains X25519 ECDHE with ML-KEM-768 KEM for EDHOC Type 3 MAC-MAC.
 
 
 
-| Menu | Variant | Key Agreement / Auth | Sign / MAC | HKDF & Hash | AEAD || Menu | Variant | Key Agreement / Auth | Sign / MAC | HKDF & Hash | AEAD |
 
-|------|---------|----------------------|------------|-------------|------||------|---------|----------------------|------------|-------------|------|
+## Variants & Crypto Stacks
 
-| 1 | Type 0 Classic (Sig-Sig) | X25519 (ephemeral) | Ed25519 | HKDF-HMAC-SHA256 (libsodium) | AES-CCM-16-64-128 (mbedTLS) || 1 | Type 0 Classic (Sig-Sig) | X25519 (ephemeral) | Ed25519 | HKDF-HMAC-SHA256 (libsodium) | AES-CCM-16-64-128 (mbedTLS) |
-
-| 2 | Type 3 Classic (MAC-MAC) | X25519 (static DH for MAC) | HMAC/X25519 | HKDF-HMAC-SHA256 (libsodium) | AES-CCM-16-64-128 (mbedTLS) || 2 | Type 3 Classic (MAC-MAC) | X25519 (static DH for MAC) | HMAC/X25519 | HKDF-HMAC-SHA256 (libsodium) | AES-CCM-16-64-128 (mbedTLS) |
-
-| 3 | Type 0 PQ (KEM Sig-like) | ML-KEM-768 (PQClean) + long-term KEM auth | ML-DSA-65 (PQClean) | HKDF-HMAC-SHA256 (libsodium) / SHA-256 | AES-CCM-16-64-128 (mbedTLS) || 4 | Type 0 PQ (KEM Sig-like) | ML-KEM-768 (PQClean) + long-term KEM auth | ML-DSA-65 (PQClean) | HKDF-HMAC-SHA256 (libsodium) / SHA-256 | AES-CCM-16-64-128 (mbedTLS) |
-
-| 4 | Type 3 PQ (KEM MAC-MAC) | ML-KEM-768 (PQClean) | MAC with KEM-derived keys | HKDF-HMAC-SHA256 (libsodium) / SHA-256 | AES-CCM-16-64-128 (mbedTLS) || 5 | Type 3 PQ (KEM MAC-MAC) | ML-KEM-768 (PQClean) | MAC with KEM-derived keys | HKDF-HMAC-SHA256 (libsodium) / SHA-256 | AES-CCM-16-64-128 (mbedTLS) |
-
-| 5 | Type 3 Hybrid (MAC-MAC) | X25519 ECDHE + ML-KEM-768 KEM (chained HKDF-Extract) | MAC from hybrid secrets | HKDF-HMAC-SHA256 (libsodium) | AES-CCM-16-64-128 (mbedTLS) || 7 | Type 3 Hybrid (MAC-MAC) | X25519 ECDHE + ML-KEM-768 KEM (chained HKDF-Extract) | MAC from hybrid secrets | HKDF-HMAC-SHA256 (libsodium) | AES-CCM-16-64-128 (mbedTLS) |
-
+| Menu | Variant                  | Key Agreement / Auth                        | Sign / MAC                | HKDF & Hash                        | AEAD                        |
+|------|--------------------------|---------------------------------------------|---------------------------|-------------------------------------|-----------------------------|
+| 1    | Type 0 Classic (Sig-Sig) | X25519 (ephemeral)                          | Ed25519                   | HKDF-HMAC-SHA256 (libsodium)        | AES-CCM-16-64-128 (mbedTLS) |
+| 2    | Type 3 Classic (MAC-MAC) | X25519 (static DH for MAC)                  | HMAC/X25519               | HKDF-HMAC-SHA256 (libsodium)        | AES-CCM-16-64-128 (mbedTLS) |
+| 3    | Type 0 PQ (KEM Sig-like) | ML-KEM-768 (PQClean) + long-term KEM auth   | ML-DSA-65 (PQClean)       | HKDF-HMAC-SHA256 (libsodium)/SHA256 | AES-CCM-16-64-128 (mbedTLS) |
+| 4    | Type 3 PQ (KEM MAC-MAC)  | ML-KEM-768 (PQClean)                        | MAC with KEM-derived keys | HKDF-HMAC-SHA256 (libsodium)/SHA256 | AES-CCM-16-64-128 (mbedTLS) |
+| 5    | Type 3 Hybrid (MAC-MAC)  | X25519 ECDHE + ML-KEM-768 KEM (chained HKDF)| MAC from hybrid secrets   | HKDF-HMAC-SHA256 (libsodium)        | AES-CCM-16-64-128 (mbedTLS) |
 
 
 Menu **6** runs the benchmark (TCP client-server) across all 5 variants. Menu **3** runs classic benchmarks (Types 0 & 3). Menu **6** runs full benchmarks
@@ -249,58 +234,31 @@ Runs cross-table checks (operations ↔ overhead ↔ handshake) on `output/` CSV
 Runs six cross-table checks (operations ↔ overhead ↔ handshake) with 1 µs tolerance.
 
 ```
-
-EDHOC-Hybrid/## Project Structure (trimmed)
-
-├── Makefile                         # Top-level build (defaults to PQClean)
-
-├── README.md```
-
-├── verify_benchmark.py       # Benchmark CSV consistency checker
-
-├── include/├── Makefile                  # Top-level build (defaults to PQClean)
-
-│   ├── edhoc_common.h               # Shared helpers├── README.md
-
-│   ├── edhoc_type0_classic.h        # Classic Sig-Sig├── include/
-
-│   ├── edhoc_type3_classic.h        # Classic MAC-MAC│   ├── edhoc_common.h        # Shared helpers
-
-│   ├── edhoc_type0_pq.h             # PQ KEM Sig-like│   ├── edhoc_type0_classic.h # Classic Sig-Sig
-
-│   ├── edhoc_type3_pq.h             # PQ KEM MAC-MAC│   ├── edhoc_type3_classic.h # Classic MAC-MAC
-
-│   ├── edhoc_type3_hybrid.h         # Hybrid MAC-MAC (ECDHE + KEM)│   ├── edhoc_type0_pq.h      # PQ KEM Sig-like
-
+EDHOC-Hybrid/
+├── Makefile                  # Top-level build (defaults to PQClean)
+├── [README.md](http://_vscodecontentref_/2)
+├── [verify_benchmark.py](http://_vscodecontentref_/3)       # Benchmark CSV consistency checker
+├── include/
+│   ├── edhoc_common.h        # Shared helpers
+│   ├── edhoc_type0_classic.h # Classic Sig-Sig
+│   ├── edhoc_type3_classic.h # Classic MAC-MAC
+│   ├── edhoc_type0_pq.h      # PQ KEM Sig-like
+│   ├── edhoc_type3_pq.h      # PQ KEM MAC-MAC
+│   ├── edhoc_type3_hybrid.h  # Hybrid MAC-MAC (ECDHE + KEM)
 │   └── edhoc_benchmark.h     # Benchmark header
-
-├── src/│   └── edhoc_type3_hybrid.h  # Hybrid MAC-MAC (ECDHE + KEM)
-
-│   ├── main.c                       # Menu + dispatcher (1–6)├── src/
-
-│   ├── edhoc_common.c│   ├── main.c                # Menu + dispatcher (1–8)
-
-│   ├── edhoc_type0_classic.c│   ├── edhoc_common.c
-
-│   ├── edhoc_type3_classic.c│   ├── edhoc_type0_classic.c
-
-│   ├── edhoc_type0_pq.c│   ├── edhoc_type3_classic.c
-
-│   ├── edhoc_type3_pq.c│   ├── edhoc_type0_pq.c
-
-│   ├── edhoc_type3_hybrid.c         # Hybrid Type 3 implementation│   ├── edhoc_type3_pq.c
-
+├── src/
+│   ├── main.c                # Menu + dispatcher (1–8)
+│   ├── edhoc_common.c
+│   ├── edhoc_type0_classic.c
+│   ├── edhoc_type3_classic.c
+│   ├── edhoc_type0_pq.c
+│   ├── edhoc_type3_pq.c
+│   ├── edhoc_type3_hybrid.c  # Hybrid Type 3 implementation
 │   └── edhoc_benchmark.c     # Benchmark (TCP client-server)
-
-├── lib/│   └── edhoc_benchmark.c     # Benchmark harness (classic + PQ + hybrid)
-
-│   ├── PQClean/                     # PQ KEM/Signature (ML-KEM-768, ML-DSA-65)├── lib/
-
-│   └── uoscore-uedhoc/              # Core EDHOC/OSCORE library + nested externals│   ├── PQClean/              # PQ KEM/Signature (ML-KEM-768, ML-DSA-65)
-
-└── output/                   # Benchmark CSVs│   └── uoscore-uedhoc/       # Core EDHOC/OSCORE library + nested externals
-
-```└── output/                   # Benchmark CSVs
+├── lib/
+│   ├── PQClean/              # PQ KEM/Signature (ML-KEM-768, ML-DSA-65)
+│   └── uoscore-uedhoc/       # Core EDHOC/OSCORE library + nested externals
+└── output/                   # Benchmark CSVs
 
 ```
 
