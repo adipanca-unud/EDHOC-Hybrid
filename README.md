@@ -149,35 +149,21 @@ Benchmark output CSVs (TCP client-server):
 
 - `output/benchmark_handshake.csv`
 
-### Crypto library alignment (fairness)
 
-## Performance notes (classic vs PQ vs hybrid)
+### Crypto library alignment (fairness)
 
 All five variants share the same underlying libraries to ensure a fair comparison:
 
-### Crypto library alignment (fairness)
+| Operation         | Classic (Type 0/3)                        | PQ (Type 0/3)                | Hybrid (Type 3)                        |
+|-------------------|--------------------------------------------|------------------------------|-----------------------------------------|
+| **ECDH / KeyGen** | libsodium `crypto_scalarmult`              | —                            | libsodium `crypto_scalarmult`           |
+| **HKDF**          | libsodium HMAC-SHA256                      | mbedTLS PSA HMAC             | libsodium HMAC-SHA256                   |
+| **Hash (SHA-256)**| mbedTLS PSA `psa_hash_compute`             | mbedTLS PSA `psa_hash_compute`| mbedTLS PSA `psa_hash_compute`          |
+| **AEAD (AES-CCM)**| mbedTLS PSA `psa_aead_*`                   | mbedTLS PSA `psa_aead_*`     | mbedTLS PSA `psa_aead_*`                |
+| **KEM (ML-KEM-768)**| —                                       | PQClean                      | PQClean                                 |
+| **Signature**     | libsodium Ed25519                          | PQClean ML-DSA-65            | — (MAC-only)                            |
 
-| Operation | Classic (Type 0/3) | PQ (Type 0/3) | Hybrid (Type 3) |
-
-|---|---|---|---|All five variants share the same underlying libraries to ensure a fair comparison:
-
-| **ECDH / KeyGen** | libsodium `crypto_scalarmult` | — | libsodium `crypto_scalarmult` |
-
-| **HKDF** | libsodium HMAC-SHA256 (`crypto_auth_hmacsha256`) | mbedTLS PSA HMAC | libsodium HMAC-SHA256 (same as classic) || Operation | Classic (Type 0/3) | PQ (Type 0/3) | Hybrid (Type 3) |
-
-| **Hash (SHA-256)** | mbedTLS PSA `psa_hash_compute` | mbedTLS PSA `psa_hash_compute` | mbedTLS PSA `psa_hash_compute` (same as classic) ||---|---|---|---|
-
-| **AEAD (AES-CCM)** | mbedTLS PSA `psa_aead_*` | mbedTLS PSA `psa_aead_*` | mbedTLS PSA `psa_aead_*` (same as classic) || **ECDH / KeyGen** | libsodium `crypto_scalarmult` | — | libsodium `crypto_scalarmult` |
-
-| **KEM (ML-KEM-768)** | — | PQClean | PQClean (same as PQ) || **HKDF** | libsodium HMAC-SHA256 (`crypto_auth_hmacsha256`) | mbedTLS PSA HMAC | libsodium HMAC-SHA256 (same as classic) |
-
-| **Signature** | libsodium Ed25519 | PQClean ML-DSA-65 | — (MAC-only) || **Hash (SHA-256)** | mbedTLS PSA `psa_hash_compute` | mbedTLS PSA `psa_hash_compute` | mbedTLS PSA `psa_hash_compute` (same as classic) |
-
-| **AEAD (AES-CCM)** | mbedTLS PSA `psa_aead_*` | mbedTLS PSA `psa_aead_*` | mbedTLS PSA `psa_aead_*` (same as classic) |
-
-The hybrid handshake (`edhoc_type3_hybrid.c`) calls the same `crypto_wrapper.h` functions| **KEM (ML-KEM-768)** | — | PQClean | PQClean (same as PQ) |
-
-(libsodium HKDF, mbedTLS AEAD/Hash) as classic Type 3, and the same PQClean KEM functions| **Signature** | libsodium Ed25519 | PQClean ML-DSA-65 | — (MAC-only) |
+The hybrid handshake (`edhoc_type3_hybrid.c`) calls the same `crypto_wrapper.h` functions (libsodium HKDF, mbedTLS AEAD/Hash) as classic Type 3, dan PQClean KEM seperti PQ Type 3.
 
 as PQ Type 3. The benchmark micro-benchmarks (`bench_ecdh`, `bench_hkdf`, `bench_hash`,
 
@@ -262,27 +248,17 @@ EDHOC-Hybrid/
 
 ```
 
-### External Dependencies (via submodules or system)
 
 ### External Dependencies (via submodules or system)
 
-| Component | Source | Purpose |
-
-|-----------|--------|---------|| Component | Source | Purpose |
-
-| uoscore-uedhoc | submodule | Core EDHOC/OSCORE logic|-----------|--------|---------|
-
-| PQClean | submodule | ML-KEM-768, ML-DSA-65 implementations| uoscore-uedhoc | submodule | Core EDHOC/OSCORE logic
-
-| mbedTLS | `lib/uoscore-uedhoc/externals/mbedtls` | AES-CCM, PSA crypto| PQClean | submodule | ML-KEM-768, ML-DSA-65 implementations
-
-| zcbor | `lib/uoscore-uedhoc/externals/zcbor` | CBOR codec| mbedTLS | `lib/uoscore-uedhoc/externals/mbedtls` | AES-CCM, PSA crypto
-
-| tinycrypt | `lib/uoscore-uedhoc/externals/tinycrypt` | Lightweight crypto (optional paths)| zcbor | `lib/uoscore-uedhoc/externals/zcbor` | CBOR codec
-
-| libsodium | system (`libsodium-dev`) | X25519, Ed25519, HKDF-HMAC-SHA256| tinycrypt | `lib/uoscore-uedhoc/externals/tinycrypt` | Lightweight crypto (optional paths)
-
-| libsodium | system (`libsodium-dev`) | X25519, Ed25519, HKDF-HMAC-SHA256
+| Component    | Source                                         | Purpose                                    |
+|--------------|------------------------------------------------|--------------------------------------------|
+| uoscore-uedhoc | submodule                                    | Core EDHOC/OSCORE logic                    |
+| PQClean      | submodule                                      | ML-KEM-768, ML-DSA-65 implementations      |
+| mbedTLS      | `lib/uoscore-uedhoc/externals/mbedtls`         | AES-CCM, PSA crypto                        |
+| zcbor        | `lib/uoscore-uedhoc/externals/zcbor`           | CBOR codec                                 |
+| tinycrypt    | `lib/uoscore-uedhoc/externals/tinycrypt`       | Lightweight crypto (optional paths)         |
+| libsodium    | system (`libsodium-dev`)                       | X25519, Ed25519, HKDF-HMAC-SHA256          |
 
 ## License
 
