@@ -53,6 +53,9 @@ CFLAGS  = -std=c11 -O2 -Wall -Wextra
 CFLAGS += -Wno-unused-parameter -Wno-sign-conversion -Wno-conversion
 CFLAGS += -Wno-cast-qual -Wno-missing-field-initializers
 
+# PQClean sources benefit from -O3 (ML-KEM-768/ML-DSA-65 lattice math)
+PQCLEAN_CFLAGS = $(subst -O2,-O3,$(CFLAGS))
+
 # Include paths
 C_INCLUDES  = -I$(PQCLEAN_DIR)
 C_INCLUDES += -I$(PQCLEAN_COMMON_DIR)
@@ -82,15 +85,15 @@ $(BUILD_DIR)/benchmark_crypto.o: $(SRC_DIR)/benchmark_crypto.c
 
 $(BUILD_DIR)/bench_pqkem_%.o: $(PQCLEAN_KEM_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+	$(CC) $(PQCLEAN_CFLAGS) $(C_INCLUDES) -c $< -o $@
 
 $(BUILD_DIR)/bench_pqsig_%.o: $(PQCLEAN_SIG_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+	$(CC) $(PQCLEAN_CFLAGS) $(C_INCLUDES) -c $< -o $@
 
 $(BUILD_DIR)/bench_pqcommon_%.o: $(PQCLEAN_COMMON_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+	$(CC) $(PQCLEAN_CFLAGS) $(C_INCLUDES) -c $< -o $@
 
 run: all
 	@mkdir -p $(OUTPUT_DIR)

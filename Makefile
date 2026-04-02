@@ -42,6 +42,7 @@ APP_SRCS += $(SRC_DIR)/edhoc_type0_pq.c
 APP_SRCS += $(SRC_DIR)/edhoc_type3_pq.c
 APP_SRCS += $(SRC_DIR)/edhoc_type3_hybrid.c
 APP_SRCS += $(SRC_DIR)/edhoc_benchmark.c
+APP_SRCS += $(SRC_DIR)/crypto_libsodium.c
 
 TV_SRCS = $(TV_DIR)/edhoc_test_vectors_rfc9529.c
 
@@ -77,6 +78,9 @@ CFLAGS += -DCRED_R_SIZE=293 -DCRED_I_SIZE=293
 CFLAGS += -DSUITES_I_SIZE=1
 CFLAGS += -Wno-unused-parameter -Wno-sign-conversion -Wno-conversion
 CFLAGS += -Wno-cast-qual -Wno-missing-field-initializers -Wno-pointer-arith
+
+# PQClean sources benefit from -O3 (ML-KEM-768/ML-DSA-65 lattice math)
+PQCLEAN_CFLAGS = $(subst -O2,-O3,$(CFLAGS))
 
 C_INCLUDES  = -I$(INC_DIR)
 C_INCLUDES += -I$(LIB_DIR)/inc
@@ -140,15 +144,15 @@ $(BUILD_DIR)/mbedtls_%.o: $(EXT_DIR)/mbedtls/library/%.c
 
 $(BUILD_DIR)/pqclean_kem_%.o: $(PQCLEAN_KEM_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+	$(CC) $(PQCLEAN_CFLAGS) $(C_INCLUDES) -c $< -o $@
 
 $(BUILD_DIR)/pqclean_sig_%.o: $(PQCLEAN_SIG_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+	$(CC) $(PQCLEAN_CFLAGS) $(C_INCLUDES) -c $< -o $@
 
 $(BUILD_DIR)/pqclean_common_%.o: $(PQCLEAN_COMMON_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+	$(CC) $(PQCLEAN_CFLAGS) $(C_INCLUDES) -c $< -o $@
 
 run: all
 	@$(TARGET)

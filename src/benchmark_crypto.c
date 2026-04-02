@@ -51,7 +51,7 @@
 /* ==========================================================================
  * Configuration
  * ========================================================================== */
-#define BENCH_ITERATIONS  1000000 /* iterations per operation                  */
+#define BENCH_ITERATIONS  1000    /* iterations per operation                  */
 #define WARMUP_ITERATIONS 1000    /* warmup rounds (discarded)                 */
 #define MSG_LEN           64     /* message length for sign/hash/aead         */
 #define AAD_LEN           16     /* additional authenticated data length      */

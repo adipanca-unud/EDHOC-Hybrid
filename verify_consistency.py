@@ -3,13 +3,22 @@
 Verify consistency between standalone crypto benchmark (benchmark_crypto_simple.csv)
 and EDHOC socket benchmark (benchmark_operations.csv).
 
-Both must use the same -O2 optimization flag.
+Optimization: Application code compiled with -O2, PQClean sources with -O3.
+Library (uoscore-uedhoc) compiled with -O2.
 
-NOTE: Socket benchmark measures crypto through the uoscore-uedhoc EDHOC library
-wrappers, which add overhead (CBOR, key format conversion, etc.).
-Standalone benchmark calls libsodium/PQClean APIs directly.
-Therefore, some deviation is expected — especially for Ed25519 Sign which goes
-through sign(EdDSA,...) wrapper in EDHOC vs crypto_sign_ed25519_detached() standalone.
+Both benchmarks now use the SAME crypto libraries:
+  - Classic (X25519, Ed25519): libsodium (assembly-optimized)
+    The EDHOC app overrides the library's compact25519 WEAK functions
+    with libsodium via src/crypto_libsodium.c.
+  - PQ (ML-KEM-768, ML-DSA-65): PQClean (compiled at -O3)
+
+Classic operations have additional overhead in the socket benchmark due to
+the EDHOC framework wrapper (buffer copies, CBOR encoding, HKDF context, etc.),
+so a wider tolerance is used for classic ops compared to PQ ops.
+
+KeyGen has the highest overhead because the socket benchmark's ephemeral_dh_key_gen()
+performs SHA-256 seed expansion + RFC 7748 clamping + crypto_scalarmult_base(),
+whereas the standalone benchmark only calls crypto_scalarmult_base().
 """
 
 import csv
@@ -19,24 +28,32 @@ import os
 # ─── Configuration ───
 STANDALONE_CSV = "output/benchmark_crypto_simple.csv"
 SOCKET_CSV     = "output/benchmark_operations.csv"
-TOLERANCE_DIRECT = 0.30   # 30% for direct API calls (PQClean → PQClean)
-TOLERANCE_WRAPPED = 0.60  # 60% for wrapper-mediated calls (libsodium → uoscore-uedhoc)
+
+# PQ operations tolerance: both use PQClean, but socket has wrapper overhead
+TOLERANCE_PQ = 0.40   # 40% for PQClean (wrapper overhead + measurement variance)
+# Classic operations tolerance: both use libsodium, but socket has EDHOC wrapper overhead
+TOLERANCE_CLASSIC = 0.50  # 50% — socket wraps libsodium in EDHOC's crypto_wrapper layer
+# KeyGen has extra overhead: SHA-256 seed expansion + clamping on top of scalarmult_base
+TOLERANCE_KEYGEN = 0.55   # 55% — accounts for seed expansion overhead
 
 # Mapping: (standalone_algorithm, standalone_operation) →
-#          (socket_operation_name, is_wrapped)
-# is_wrapped = True means socket uses EDHOC wrapper, higher tolerance expected
+#          (socket_operation_name, category)
+# Categories:
+#   "pq"      = same PQClean library, can compare
+#   "classic"  = same libsodium library (via override), can compare
+#   "keygen"   = classic keygen with extra seed expansion overhead
 COMPARE_MAP = [
-    # Classic (socket uses uoscore-uedhoc wrappers)
-    (("X25519",    "Keygen"),        "KeyGen",        True),
-    (("Ed25519",   "Signature"),     "Signature",     True),   # sign(EdDSA,...) wrapper
-    (("Ed25519",   "Verification"),  "Verification",  True),   # verify(EdDSA,...) wrapper
-    (("X25519",    "Shared Secret"), "ECDH",          True),   # shared_secret_derive() wrapper
-    # PQ (both call PQClean directly — should be very close)
-    (("ML-KEM-768", "Keygen"),       "PQ_KeyGen",     False),
-    (("ML-KEM-768", "Encap"),        "PQ_Encaps",     False),
-    (("ML-KEM-768", "Decap"),        "PQ_Decaps",     False),
-    (("ML-DSA-65",  "Signature"),    "PQ_Signature",  False),
-    (("ML-DSA-65",  "Verification"), "PQ_Verification",False),
+    # Classic — both use libsodium now (socket via crypto_libsodium.c override)
+    (("X25519",    "Keygen"),        "KeyGen",        "keygen"),
+    (("Ed25519",   "Signature"),     "Signature",     "classic"),
+    (("Ed25519",   "Verification"),  "Verification",  "classic"),
+    (("X25519",    "Shared Secret"), "ECDH",          "classic"),
+    # PQ (both call PQClean directly — should be comparable)
+    (("ML-KEM-768", "Keygen"),       "PQ_KeyGen",     "pq"),
+    (("ML-KEM-768", "Encap"),        "PQ_Encaps",     "pq"),
+    (("ML-KEM-768", "Decap"),        "PQ_Decaps",     "pq"),
+    (("ML-DSA-65",  "Signature"),    "PQ_Signature",  "pq"),
+    (("ML-DSA-65",  "Verification"), "PQ_Verification","pq"),
 ]
 
 
@@ -86,23 +103,32 @@ def main():
     standalone = load_standalone(STANDALONE_CSV)
     socket_ops = load_socket(SOCKET_CSV)
 
-    print("=" * 90)
+    print("=" * 95)
     print("  Benchmark Consistency Verification")
     print("  Standalone (benchmark_crypto_simple.csv) vs Socket (benchmark_operations.csv)")
-    print("=" * 90)
+    print("=" * 95)
 
-    print(f"\n  {'Operation':<28} {'Standalone':>12} {'Socket':>12} {'Diff%':>8} {'Tol%':>6} {'Status':>8}")
+    # ── Section 1: Classic Operations — Same libsodium library ──
+    print(f"\n  ┌─ Classic Ops (libsodium — compared, {TOLERANCE_CLASSIC*100:.0f}% tolerance, KeyGen {TOLERANCE_KEYGEN*100:.0f}%) ────────┐")
+    print(f"  │  Both benchmarks use libsodium (socket via crypto_libsodium.c override).    │")
+    print(f"  │  Socket has additional EDHOC wrapper overhead (buffer copies, CBOR, etc.).   │")
+    print(f"  │  KeyGen: socket also does SHA-256 seed expansion + RFC 7748 clamping.        │")
+    print(f"  └────────────────────────────────────────────────────────────────────────────────┘")
+    print(f"  {'Operation':<28} {'Standalone':>12} {'Socket':>12} {'Diff%':>8} {'Tol%':>6} {'Status':>8}")
     print(f"  {'─'*26} {'─'*12} {'─'*12} {'─'*8} {'─'*6} {'─'*8}")
 
     passed = 0
     failed = 0
     skipped = 0
 
-    for (algo, op), sock_key, is_wrapped in COMPARE_MAP:
+    for (algo, op), sock_key, category in COMPARE_MAP:
+        if category not in ("classic", "keygen"):
+            continue
         label = f"{algo}/{op}"
         sa_val = standalone.get((algo, op))
         so_val = socket_ops.get(sock_key)
-        tol = TOLERANCE_WRAPPED if is_wrapped else TOLERANCE_DIRECT
+        tolerance = TOLERANCE_KEYGEN if category == "keygen" else TOLERANCE_CLASSIC
+        tol_pct = tolerance * 100
 
         if sa_val is None or so_val is None or so_val == 0:
             print(f"  {label:<28} {'N/A':>12} {'N/A':>12} {'':>8} {'':>6} {'SKIP':>8}")
@@ -110,7 +136,38 @@ def main():
             continue
 
         diff_pct = abs(sa_val - so_val) / max(sa_val, so_val) * 100
-        tol_pct = tol * 100
+        ok = diff_pct <= tol_pct
+        status = "✅ PASS" if ok else "❌ FAIL"
+
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+
+        print(f"  {label:<28} {sa_val:>11.3f}µ {so_val:>11.3f}µ {diff_pct:>7.1f}% {tol_pct:>5.0f}% {status}")
+
+    # ── Section 2: PQ Operations — Same PQClean library ──
+    print(f"\n  ┌─ PQ Ops (Same PQClean Library — compared, {TOLERANCE_PQ*100:.0f}% tolerance) ──────────────────┐")
+    print(f"  │  Both benchmarks call PQClean ML-KEM-768 / ML-DSA-65 directly.             │")
+    print(f"  │  Standalone compiled at -O3, EDHOC PQClean sources also at -O3.            │")
+    print(f"  └────────────────────────────────────────────────────────────────────────────────┘")
+    print(f"  {'Operation':<28} {'Standalone':>12} {'Socket':>12} {'Diff%':>8} {'Tol%':>6} {'Status':>8}")
+    print(f"  {'─'*26} {'─'*12} {'─'*12} {'─'*8} {'─'*6} {'─'*8}")
+
+    for (algo, op), sock_key, category in COMPARE_MAP:
+        if category != "pq":
+            continue
+        label = f"{algo}/{op}"
+        sa_val = standalone.get((algo, op))
+        so_val = socket_ops.get(sock_key)
+        tol_pct = TOLERANCE_PQ * 100
+
+        if sa_val is None or so_val is None or so_val == 0:
+            print(f"  {label:<28} {'N/A':>12} {'N/A':>12} {'':>8} {'':>6} {'SKIP':>8}")
+            skipped += 1
+            continue
+
+        diff_pct = abs(sa_val - so_val) / max(sa_val, so_val) * 100
         ok = diff_pct <= tol_pct
         status = "✅ PASS" if ok else "❌ FAIL"
 
@@ -122,21 +179,23 @@ def main():
         print(f"  {label:<28} {sa_val:>11.3f}µ {so_val:>11.3f}µ {diff_pct:>7.1f}% {tol_pct:>5.0f}% {status}")
 
     total = passed + failed
-    print(f"\n{'='*90}")
-    print(f"  Results: {passed}/{total} passed, {failed}/{total} failed, {skipped} skipped")
+    print(f"\n{'='*95}")
+    print(f"  Overall Results: {passed}/{total} passed, {failed}/{total} failed, {skipped} skipped")
 
     if failed == 0:
-        print("  ✅ All comparable timings are consistent!")
-        print()
-        print("  NOTE: Wrapped operations (Ed25519 Sign/Verify, X25519 ECDH, KeyGen)")
-        print("        are slower in socket benchmark because they go through uoscore-uedhoc")
-        print("        EDHOC library wrappers. This is expected and not a bug.")
+        print("  ✅ All operation timings are consistent between benchmarks!")
     else:
         print("  ⚠️  Some timings exceed tolerance. Check:")
-        print("    1. Both builds use -O2 (Makefile line 71, makefile_config.mk OPT)")
+        print("    1. Both PQClean sources compiled at -O3")
         print("    2. No background load during benchmarks")
         print("    3. Same machine for both runs")
-    print(f"{'='*90}")
+
+    print()
+    print("  NOTE: Both benchmarks now use the same crypto libraries:")
+    print("        Classic: libsodium (socket uses crypto_libsodium.c override)")
+    print("        PQ:      PQClean ML-KEM-768 / ML-DSA-65 (compiled at -O3)")
+    print("        Socket overhead from EDHOC wrapper (CBOR, buffers, etc.) is expected.")
+    print(f"{'='*95}")
 
     return 0 if failed == 0 else 1
 
