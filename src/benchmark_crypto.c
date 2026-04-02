@@ -51,8 +51,8 @@
 /* ==========================================================================
  * Configuration
  * ========================================================================== */
-#define BENCH_ITERATIONS  1000000 /* iterations per operation                 */
-#define WARMUP_ITERATIONS 1000    /* warmup rounds (discarded)                */
+#define BENCH_ITERATIONS  1000000 /* iterations per operation                  */
+#define WARMUP_ITERATIONS 1000    /* warmup rounds (discarded)                 */
 #define MSG_LEN           64     /* message length for sign/hash/aead         */
 #define AAD_LEN           16     /* additional authenticated data length      */
 #define HKDF_IKM_LEN      32    /* input keying material length              */
@@ -125,6 +125,75 @@ static double stddev_us[NUM_ROWS][NUM_COLS];
 static double min_us[NUM_ROWS][NUM_COLS];
 static double max_us[NUM_ROWS][NUM_COLS];
 static double median_us[NUM_ROWS][NUM_COLS];
+
+/* ==========================================================================
+ * Key / artifact lengths (bytes) per [operation][algorithm].
+ *   -1 means N/A (operation not applicable for that algorithm).
+ *   For keygen: public key length.
+ *   For encap/decap: ciphertext length.
+ *   For signature: signature length.
+ *   For verification: public key length.
+ *   For symmetric ops: key/hash length.
+ *   For key exchange: combined public key length (both sides).
+ *   For secret derivation: output keying material length.
+ * ========================================================================== */
+static int key_length_bytes[NUM_ROWS][NUM_COLS];
+
+static void init_key_lengths(void)
+{
+    /* Default: -1 = N/A (will be overwritten by valid entries) */
+    for (int r = 0; r < NUM_ROWS; r++)
+        for (int c = 0; c < NUM_COLS; c++)
+            key_length_bytes[r][c] = -1;
+
+    /* ── Public key sizes (Keygen) ─────────────────────────────────────── */
+    key_length_bytes[ROW_KEYGEN][COL_X25519]  = crypto_scalarmult_curve25519_BYTES;           /* 32 */
+    key_length_bytes[ROW_KEYGEN][COL_ED25519] = crypto_sign_ed25519_PUBLICKEYBYTES;           /* 32 */
+    key_length_bytes[ROW_KEYGEN][COL_MLKEM768]= PQCLEAN_MLKEM768_CLEAN_CRYPTO_PUBLICKEYBYTES; /* 1184 */
+    key_length_bytes[ROW_KEYGEN][COL_MLDSA65] = PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES;  /* 1952 */
+    key_length_bytes[ROW_KEYGEN][COL_HYBRID]  = crypto_scalarmult_curve25519_BYTES
+                                              + PQCLEAN_MLKEM768_CLEAN_CRYPTO_PUBLICKEYBYTES;  /* 32+1184=1216 */
+
+    /* ── Encap / Shared secret compute: ciphertext or shared secret length ─ */
+    key_length_bytes[ROW_ENCAP][COL_X25519]  = crypto_scalarmult_curve25519_BYTES;             /* 32 (shared secret) */
+    key_length_bytes[ROW_ENCAP][COL_MLKEM768]= PQCLEAN_MLKEM768_CLEAN_CRYPTO_CIPHERTEXTBYTES;  /* 1088 */
+    key_length_bytes[ROW_ENCAP][COL_HYBRID]  = crypto_scalarmult_curve25519_BYTES
+                                             + PQCLEAN_MLKEM768_CLEAN_CRYPTO_CIPHERTEXTBYTES;   /* 32+1088=1120 */
+
+    /* ── Decap: same as encap (ciphertext input) ─────────────────────── */
+    key_length_bytes[ROW_DECAP][COL_X25519]  = crypto_scalarmult_curve25519_BYTES;
+    key_length_bytes[ROW_DECAP][COL_MLKEM768]= PQCLEAN_MLKEM768_CLEAN_CRYPTO_CIPHERTEXTBYTES;
+    key_length_bytes[ROW_DECAP][COL_HYBRID]  = crypto_scalarmult_curve25519_BYTES
+                                             + PQCLEAN_MLKEM768_CLEAN_CRYPTO_CIPHERTEXTBYTES;
+
+    /* ── Signature: signature length ─────────────────────────────────── */
+    key_length_bytes[ROW_SIGNATURE][COL_ED25519] = crypto_sign_ed25519_BYTES;                  /* 64 */
+    key_length_bytes[ROW_SIGNATURE][COL_MLDSA65] = PQCLEAN_MLDSA65_CLEAN_CRYPTO_BYTES;        /* 3309 */
+
+    /* ── Verification: public key length ─────────────────────────────── */
+    key_length_bytes[ROW_VERIFICATION][COL_ED25519] = crypto_sign_ed25519_PUBLICKEYBYTES;      /* 32 */
+    key_length_bytes[ROW_VERIFICATION][COL_MLDSA65] = PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES; /* 1952 */
+
+    /* ── Symmetric operations: same key/output length across all columns ─ */
+    for (int c = 0; c < NUM_COLS; c++) {
+        key_length_bytes[ROW_HKDF_EXTRACT][c]  = 32;   /* PRK output = 32 bytes */
+        key_length_bytes[ROW_HKDF_EXPAND][c]   = HKDF_OKM_LEN; /* OKM = 32 bytes */
+        key_length_bytes[ROW_HASH][c]           = crypto_hash_sha256_BYTES; /* 32 */
+        key_length_bytes[ROW_AEAD_ENCRYPT][c]   = crypto_aead_xchacha20poly1305_ietf_KEYBYTES; /* 32 */
+        key_length_bytes[ROW_AEAD_DECRYPT][c]   = crypto_aead_xchacha20poly1305_ietf_KEYBYTES; /* 32 */
+    }
+
+    /* ── Key Exchange (full): combined public key length (both DH/KEM) ─ */
+    key_length_bytes[ROW_KEY_EXCHANGE][COL_X25519]  = crypto_scalarmult_curve25519_BYTES;       /* 32 */
+    key_length_bytes[ROW_KEY_EXCHANGE][COL_MLKEM768]= PQCLEAN_MLKEM768_CLEAN_CRYPTO_PUBLICKEYBYTES; /* 1184 */
+    key_length_bytes[ROW_KEY_EXCHANGE][COL_HYBRID]  = crypto_scalarmult_curve25519_BYTES
+                                                    + PQCLEAN_MLKEM768_CLEAN_CRYPTO_PUBLICKEYBYTES;
+
+    /* ── Shared Secret Derivation: output length ─────────────────────── */
+    key_length_bytes[ROW_SECRET_DERIVE][COL_X25519]  = HKDF_OKM_LEN; /* 32 */
+    key_length_bytes[ROW_SECRET_DERIVE][COL_MLKEM768]= HKDF_OKM_LEN;
+    key_length_bytes[ROW_SECRET_DERIVE][COL_HYBRID]  = HKDF_OKM_LEN;
+}
 
 /* ==========================================================================
  * Timing helpers
@@ -1091,19 +1160,31 @@ static void write_csv(void)
     }
 
     /* Header */
-    fprintf(f, "operation,algorithm,avg_us,stddev_us,min_us,max_us,median_us,iterations\n");
+    fprintf(f, "operation,algorithm,avg_us,stddev_us,min_us,max_us,median_us,iterations,key_length\n");
 
     for (int r = 0; r < NUM_ROWS; r++) {
         for (int c = 0; c < NUM_COLS; c++) {
+            int kl = key_length_bytes[r][c];
             if (avg_us[r][c] < 0.0) {
-                fprintf(f, "%s,%s,N/A,N/A,N/A,N/A,N/A,%d\n",
-                        row_names[r], col_names[c], BENCH_ITERATIONS);
+                if (kl >= 0)
+                    fprintf(f, "%s,%s,N/A,N/A,N/A,N/A,N/A,%d,%d\n",
+                            row_names[r], col_names[c], BENCH_ITERATIONS, kl);
+                else
+                    fprintf(f, "%s,%s,N/A,N/A,N/A,N/A,N/A,%d,N/A\n",
+                            row_names[r], col_names[c], BENCH_ITERATIONS);
             } else {
-                fprintf(f, "%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
-                        row_names[r], col_names[c],
-                        avg_us[r][c], stddev_us[r][c],
-                        min_us[r][c], max_us[r][c], median_us[r][c],
-                        BENCH_ITERATIONS);
+                if (kl >= 0)
+                    fprintf(f, "%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d\n",
+                            row_names[r], col_names[c],
+                            avg_us[r][c], stddev_us[r][c],
+                            min_us[r][c], max_us[r][c], median_us[r][c],
+                            BENCH_ITERATIONS, kl);
+                else
+                    fprintf(f, "%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%d,N/A\n",
+                            row_names[r], col_names[c],
+                            avg_us[r][c], stddev_us[r][c],
+                            min_us[r][c], max_us[r][c], median_us[r][c],
+                            BENCH_ITERATIONS);
             }
         }
     }
@@ -1125,7 +1206,7 @@ static void write_matrix_csv(void)
     /* Header */
     fprintf(f, "Operation");
     for (int c = 0; c < NUM_COLS; c++) {
-        fprintf(f, ",%s (µs)", col_names[c]);
+        fprintf(f, ",%s (µs),%s key_length", col_names[c], col_names[c]);
     }
     fprintf(f, "\n");
 
@@ -1138,12 +1219,87 @@ static void write_matrix_csv(void)
             } else {
                 fprintf(f, ",%.3f", avg_us[r][c]);
             }
+            if (key_length_bytes[r][c] >= 0) {
+                fprintf(f, ",%d", key_length_bytes[r][c]);
+            } else {
+                fprintf(f, ",N/A");
+            }
         }
         fprintf(f, "\n");
     }
 
     fclose(f);
     printf("  Matrix CSV written to: %s\n\n", MATRIX_FILE);
+}
+
+/* Write the simplified CSV: algorithm-grouped, only relevant ops per algo,
+ * symmetric ops listed once at the bottom.
+ * Format:
+ *   algorithm,operation,avg_us,stddev_us,min_us,max_us,median_us,iterations,key_length
+ */
+static void write_simple_csv(void)
+{
+    const char *SIMPLE_FILE = OUTPUT_DIR "/benchmark_crypto_simple.csv";
+    FILE *f = fopen(SIMPLE_FILE, "w");
+    if (!f) { perror("fopen simple CSV"); return; }
+
+    fprintf(f, "algorithm,operation,avg_us,stddev_us,min_us,max_us,median_us,iterations,key_length\n");
+
+    /* Helper macro: print one data row.
+     * first=1 → print algo name, first=0 → leave blank (grouped look) */
+#define ROW(algo_str, op_str, row, col)                                  \
+    do {                                                                 \
+        if (avg_us[row][col] >= 0.0) {                                   \
+            int _kl = key_length_bytes[row][col];                        \
+            if (_kl >= 0)                                                \
+                fprintf(f, "%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d\n",    \
+                        (algo_str), (op_str),                            \
+                        avg_us[row][col], stddev_us[row][col],           \
+                        min_us[row][col], max_us[row][col],              \
+                        median_us[row][col], BENCH_ITERATIONS, _kl);     \
+            else                                                         \
+                fprintf(f, "%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%d,N/A\n",   \
+                        (algo_str), (op_str),                            \
+                        avg_us[row][col], stddev_us[row][col],           \
+                        min_us[row][col], max_us[row][col],              \
+                        median_us[row][col], BENCH_ITERATIONS);          \
+        }                                                                \
+    } while (0)
+
+    /* ── X25519 ─────────────────────────────────────────────────────── */
+    ROW("X25519",            "Keygen",        ROW_KEYGEN,  COL_X25519);
+    ROW("",                  "Shared Secret", ROW_ENCAP,   COL_X25519);
+
+    /* ── Ed25519 ────────────────────────────────────────────────────── */
+    ROW("Ed25519",           "Keygen",        ROW_KEYGEN,       COL_ED25519);
+    ROW("",                  "Signature",     ROW_SIGNATURE,    COL_ED25519);
+    ROW("",                  "Verification",  ROW_VERIFICATION, COL_ED25519);
+
+    /* ── ML-KEM-768 ─────────────────────────────────────────────────── */
+    ROW("ML-KEM-768",        "Keygen",        ROW_KEYGEN,  COL_MLKEM768);
+    ROW("",                  "Encap",         ROW_ENCAP,   COL_MLKEM768);
+    ROW("",                  "Decap",         ROW_DECAP,   COL_MLKEM768);
+
+    /* ── ML-DSA-65 ──────────────────────────────────────────────────── */
+    ROW("ML-DSA-65",         "Keygen",        ROW_KEYGEN,       COL_MLDSA65);
+    ROW("",                  "Signature",     ROW_SIGNATURE,    COL_MLDSA65);
+    ROW("",                  "Verification",  ROW_VERIFICATION, COL_MLDSA65);
+
+    /* ── X25519+ML-KEM-768 (Hybrid) ─────────────────────────────────── */
+    ROW("X25519+ML-KEM-768", "Keygen",        ROW_KEYGEN,  COL_HYBRID);
+    ROW("",                  "Encap",         ROW_ENCAP,   COL_HYBRID);
+    ROW("",                  "Decap",         ROW_DECAP,   COL_HYBRID);
+
+    /* ── Symmetric (shared, benchmarked once via X25519 context) ───── */
+    ROW("Hash (SHA-256)",    "Cryptography",  ROW_HASH,         COL_X25519);
+    ROW("HKDF",              "Cryptography",  ROW_HKDF_EXTRACT, COL_X25519);
+    ROW("AEAD Encrypt",      "Cryptography",  ROW_AEAD_ENCRYPT, COL_X25519);
+    ROW("AEAD Decrypt",      "Cryptography",  ROW_AEAD_DECRYPT, COL_X25519);
+
+#undef ROW
+
+    fclose(f);
+    printf("  Simple CSV written to: %s\n\n", SIMPLE_FILE);
 }
 
 /* ==========================================================================
@@ -1164,6 +1320,9 @@ int main(void)
     for (int r = 0; r < NUM_ROWS; r++)
         for (int c = 0; c < NUM_COLS; c++)
             mark_na(r, c);
+
+    /* Initialize key length table */
+    init_key_lengths();
 
     /* Count total bench operations for progress display */
     /* X25519: 10, Ed25519: 8, ML-KEM: 10, ML-DSA: 8, Hybrid: 10 = 46 */
@@ -1258,6 +1417,7 @@ int main(void)
     print_table();
     write_csv();
     write_matrix_csv();
+    write_simple_csv();
 
     printf("  Benchmark complete.\n\n");
     return 0;

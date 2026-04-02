@@ -80,8 +80,8 @@ struct sck_op_result {
 
 struct sck_ops_benchmark {
 	struct sck_op_result keygen;
-	struct sck_op_result encap;
-	struct sck_op_result decap;
+	struct sck_op_result aead_enc;
+	struct sck_op_result aead_dec;
 	struct sck_op_result signature;
 	struct sck_op_result verification;
 	struct sck_op_result ecdh;
@@ -567,8 +567,8 @@ static struct sck_op_result sck_bench_pq_sig_verify(int iterations)
 struct sck_prim_cache {
 	/* Classic */
 	struct sck_op_result keygen;      /* X25519 keygen */
-	struct sck_op_result encap;       /* AEAD encrypt (classic) */
-	struct sck_op_result decap;       /* AEAD decrypt (classic) */
+	struct sck_op_result aead_enc;    /* AEAD encrypt (classic) */
+	struct sck_op_result aead_dec;    /* AEAD decrypt (classic) */
 	struct sck_op_result signature;   /* Ed25519 sign */
 	struct sck_op_result verification;/* Ed25519 verify */
 	struct sck_op_result ecdh;        /* X25519 shared secret */
@@ -613,8 +613,8 @@ static void sck_bench_all_primitives(struct sck_prim_cache *c)
 	/* Measurement pass */
 	/* Classic */
 	c->keygen       = sck_bench_keygen_x25519(N);
-	c->encap        = sck_bench_encap(N);
-	c->decap        = sck_bench_decap(N);
+	c->aead_enc     = sck_bench_encap(N);     /* actually AEAD encrypt */
+	c->aead_dec     = sck_bench_decap(N);     /* actually AEAD decrypt */
 	c->signature    = sck_bench_signature(N);
 	c->verification = sck_bench_verification(N);
 	c->ecdh         = sck_bench_ecdh(N);
@@ -655,8 +655,9 @@ static void sck_assemble_classic_ops(const struct sck_prim_cache *c,
 				     struct sck_ops_benchmark *ops)
 {
 	ops->keygen       = sck_op(&c->keygen, 1);
-	ops->encap        = sck_op(&c->encap,  is_initiator ? 1 : 0);
-	ops->decap        = sck_op(&c->decap,  is_initiator ? 0 : 1);
+	/* Classic EDHOC has no KEM encap/decap — uses AEAD encrypt/decrypt */
+	ops->aead_enc     = sck_op(&c->aead_enc, is_initiator ? 1 : 0);
+	ops->aead_dec     = sck_op(&c->aead_dec, is_initiator ? 0 : 1);
 	if (type_num == 0) {
 		ops->signature    = sck_op(&c->signature, 1);
 		ops->verification = sck_op(&c->verification, 1);
@@ -700,13 +701,15 @@ static void sck_assemble_hybrid_ops(const struct sck_prim_cache *c,
 				    struct sck_ops_benchmark *ops)
 {
 	ops->keygen       = sck_op(&c->keygen, 1);
-	ops->encap        = sck_op(&c->encap, 1);
-	ops->decap        = sck_op(&c->decap, 1);
+	/* Hybrid uses AEAD enc/dec (not KEM encap/decap for classic part) */
+	ops->aead_enc     = sck_op(&c->aead_enc, 1);
+	ops->aead_dec     = sck_op(&c->aead_dec, 1);
 	ops->signature    = sck_op_zero();
 	ops->verification = sck_op_zero();
 	ops->ecdh         = sck_op(&c->ecdh, 2);
 	ops->hkdf         = sck_op(&c->hkdf, 10);
 	ops->hash         = sck_op(&c->hash, 3);
+	/* PQ KEM encaps/decaps — actually measured */
 	ops->pq_keygen    = sck_op(&c->pq_keygen, is_initiator ? 1 : 0);
 	ops->pq_encaps    = sck_op(&c->pq_encaps, is_initiator ? 0 : 1);
 	ops->pq_decaps    = sck_op(&c->pq_decaps, is_initiator ? 1 : 0);
@@ -2720,16 +2723,20 @@ static int sck_write_operations_csv(const char *path,
 
 	/* Classic Type 0 */
 	SWRITE_OP("Type0_SigSig","Initiator","KeyGen",t0i->keygen);
-	SWRITE_OP("Type0_SigSig","Initiator","Encap",t0i->encap);
-	SWRITE_OP("Type0_SigSig","Initiator","Decap",t0i->decap);
+	SWRITE_OP("Type0_SigSig","Initiator","Encap",t0i->pq_encaps);
+	SWRITE_OP("Type0_SigSig","Initiator","Decap",t0i->pq_decaps);
+	SWRITE_OP("Type0_SigSig","Initiator","AEAD_Enc",t0i->aead_enc);
+	SWRITE_OP("Type0_SigSig","Initiator","AEAD_Dec",t0i->aead_dec);
 	SWRITE_OP("Type0_SigSig","Initiator","Signature",t0i->signature);
 	SWRITE_OP("Type0_SigSig","Initiator","Verification",t0i->verification);
 	SWRITE_OP("Type0_SigSig","Initiator","ECDH",t0i->ecdh);
 	SWRITE_OP("Type0_SigSig","Initiator","HKDF",t0i->hkdf);
 	SWRITE_OP("Type0_SigSig","Initiator","Hash",t0i->hash);
 	SWRITE_OP("Type0_SigSig","Responder","KeyGen",t0r->keygen);
-	SWRITE_OP("Type0_SigSig","Responder","Encap",t0r->encap);
-	SWRITE_OP("Type0_SigSig","Responder","Decap",t0r->decap);
+	SWRITE_OP("Type0_SigSig","Responder","Encap",t0r->pq_encaps);
+	SWRITE_OP("Type0_SigSig","Responder","Decap",t0r->pq_decaps);
+	SWRITE_OP("Type0_SigSig","Responder","AEAD_Enc",t0r->aead_enc);
+	SWRITE_OP("Type0_SigSig","Responder","AEAD_Dec",t0r->aead_dec);
 	SWRITE_OP("Type0_SigSig","Responder","Signature",t0r->signature);
 	SWRITE_OP("Type0_SigSig","Responder","Verification",t0r->verification);
 	SWRITE_OP("Type0_SigSig","Responder","ECDH",t0r->ecdh);
@@ -2738,16 +2745,20 @@ static int sck_write_operations_csv(const char *path,
 
 	/* Classic Type 3 */
 	SWRITE_OP("Type3_MACMAC","Initiator","KeyGen",t3i->keygen);
-	SWRITE_OP("Type3_MACMAC","Initiator","Encap",t3i->encap);
-	SWRITE_OP("Type3_MACMAC","Initiator","Decap",t3i->decap);
+	SWRITE_OP("Type3_MACMAC","Initiator","Encap",t3i->pq_encaps);
+	SWRITE_OP("Type3_MACMAC","Initiator","Decap",t3i->pq_decaps);
+	SWRITE_OP("Type3_MACMAC","Initiator","AEAD_Enc",t3i->aead_enc);
+	SWRITE_OP("Type3_MACMAC","Initiator","AEAD_Dec",t3i->aead_dec);
 	SWRITE_OP("Type3_MACMAC","Initiator","Signature",t3i->signature);
 	SWRITE_OP("Type3_MACMAC","Initiator","Verification",t3i->verification);
 	SWRITE_OP("Type3_MACMAC","Initiator","ECDH",t3i->ecdh);
 	SWRITE_OP("Type3_MACMAC","Initiator","HKDF",t3i->hkdf);
 	SWRITE_OP("Type3_MACMAC","Initiator","Hash",t3i->hash);
 	SWRITE_OP("Type3_MACMAC","Responder","KeyGen",t3r->keygen);
-	SWRITE_OP("Type3_MACMAC","Responder","Encap",t3r->encap);
-	SWRITE_OP("Type3_MACMAC","Responder","Decap",t3r->decap);
+	SWRITE_OP("Type3_MACMAC","Responder","Encap",t3r->pq_encaps);
+	SWRITE_OP("Type3_MACMAC","Responder","Decap",t3r->pq_decaps);
+	SWRITE_OP("Type3_MACMAC","Responder","AEAD_Enc",t3r->aead_enc);
+	SWRITE_OP("Type3_MACMAC","Responder","AEAD_Dec",t3r->aead_dec);
 	SWRITE_OP("Type3_MACMAC","Responder","Signature",t3r->signature);
 	SWRITE_OP("Type3_MACMAC","Responder","Verification",t3r->verification);
 	SWRITE_OP("Type3_MACMAC","Responder","ECDH",t3r->ecdh);
@@ -2796,8 +2807,8 @@ static int sck_write_operations_csv(const char *path,
 
 	/* Hybrid Type 3 */
 	SWRITE_OP("Type3_Hybrid","Initiator","KeyGen",thi->keygen);
-	SWRITE_OP("Type3_Hybrid","Initiator","Encap",thi->encap);
-	SWRITE_OP("Type3_Hybrid","Initiator","Decap",thi->decap);
+	SWRITE_OP("Type3_Hybrid","Initiator","AEAD_Enc",thi->aead_enc);
+	SWRITE_OP("Type3_Hybrid","Initiator","AEAD_Dec",thi->aead_dec);
 	SWRITE_OP("Type3_Hybrid","Initiator","ECDH",thi->ecdh);
 	SWRITE_OP("Type3_Hybrid","Initiator","HKDF",thi->hkdf);
 	SWRITE_OP("Type3_Hybrid","Initiator","Hash",thi->hash);
@@ -2805,8 +2816,8 @@ static int sck_write_operations_csv(const char *path,
 	SWRITE_OP("Type3_Hybrid","Initiator","PQ_Encaps",thi->pq_encaps);
 	SWRITE_OP("Type3_Hybrid","Initiator","PQ_Decaps",thi->pq_decaps);
 	SWRITE_OP("Type3_Hybrid","Responder","KeyGen",thr->keygen);
-	SWRITE_OP("Type3_Hybrid","Responder","Encap",thr->encap);
-	SWRITE_OP("Type3_Hybrid","Responder","Decap",thr->decap);
+	SWRITE_OP("Type3_Hybrid","Responder","AEAD_Enc",thr->aead_enc);
+	SWRITE_OP("Type3_Hybrid","Responder","AEAD_Dec",thr->aead_dec);
 	SWRITE_OP("Type3_Hybrid","Responder","ECDH",thr->ecdh);
 	SWRITE_OP("Type3_Hybrid","Responder","HKDF",thr->hkdf);
 	SWRITE_OP("Type3_Hybrid","Responder","Hash",thr->hash);
