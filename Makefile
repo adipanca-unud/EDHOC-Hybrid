@@ -37,12 +37,11 @@ APP_SRCS  = $(SRC_DIR)/main.c
 APP_SRCS += $(SRC_DIR)/edhoc_common.c
 APP_SRCS += $(SRC_DIR)/edhoc_type0_classic.c
 APP_SRCS += $(SRC_DIR)/edhoc_type3_classic.c
-APP_SRCS += $(SRC_DIR)/edhoc_benchmark.c
 APP_SRCS += $(SRC_DIR)/edhoc_pq_kem.c
 APP_SRCS += $(SRC_DIR)/edhoc_type0_pq.c
 APP_SRCS += $(SRC_DIR)/edhoc_type3_pq.c
 APP_SRCS += $(SRC_DIR)/edhoc_type3_hybrid.c
-APP_SRCS += $(SRC_DIR)/edhoc_benchmark_socket.c
+APP_SRCS += $(SRC_DIR)/edhoc_benchmark.c
 
 TV_SRCS = $(TV_DIR)/edhoc_test_vectors_rfc9529.c
 
@@ -157,7 +156,6 @@ run: all
 clean:
 	rm -f $(BUILD_DIR)/main.o $(BUILD_DIR)/edhoc_common.o
 	rm -f $(BUILD_DIR)/edhoc_type0_classic.o $(BUILD_DIR)/edhoc_type3_classic.o
-	rm -f $(BUILD_DIR)/edhoc_benchmark.o
 	rm -f $(BUILD_DIR)/edhoc_pq_kem.o $(BUILD_DIR)/edhoc_type0_pq.o $(BUILD_DIR)/edhoc_type3_pq.o
 	rm -f $(BUILD_DIR)/edhoc_type3_hybrid.o
 	rm -f $(BUILD_DIR)/edhoc_type3_hybrid.o

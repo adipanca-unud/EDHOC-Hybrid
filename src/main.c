@@ -23,7 +23,7 @@
  *   ./build/edhoc_hybrid       # Interactive menu
  *   ./build/edhoc_hybrid 1     # Run Type 0 (Sig-Sig) directly
  *   ./build/edhoc_hybrid 2     # Run Type 3 (MAC-MAC) directly
- *   ./build/edhoc_hybrid 3     # Run Benchmark (Type 0 + Type 3)
+ *   ./build/edhoc_hybrid 6     # Run Socket Benchmark (all variants)
  */
 
 #include <stdio.h>
@@ -37,7 +37,6 @@
 #include "edhoc_type3_pq.h"
 #include "edhoc_type3_hybrid.h"
 #include "edhoc_benchmark.h"
-#include "edhoc_benchmark_socket.h"
 
 static void print_banner(void)
 {
@@ -66,39 +65,24 @@ static void print_menu(void)
 	printf("      %sMethod 3 | Suite 0 | X25519 (Static DH + MAC)%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
-	printf("  %s[3]%s Benchmark Classic (Type 0 + Type 3)\n",
-	       CLR_GREEN, CLR_RESET);
-	printf("      %sMeasure operations, overhead, handshake → 3 CSV files%s\n",
-	       CLR_CYAN, CLR_RESET);
-	printf("\n");
-	printf("  %s[4]%s EDHOC Type 0 PQ - KEM-based Sig-Sig (ML-KEM-768)\n",
+	printf("  %s[3]%s EDHOC Type 0 PQ - KEM-based Sig-Sig (ML-KEM-768)\n",
 	       CLR_GREEN, CLR_RESET);
 	printf("      %sPost-Quantum | ML-KEM-768 | KEM Encaps/Decaps + MAC%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
-	printf("  %s[5]%s EDHOC Type 3 PQ - KEM-based MAC-MAC (ML-KEM-768)\n",
+	printf("  %s[4]%s EDHOC Type 3 PQ - KEM-based MAC-MAC (ML-KEM-768)\n",
 	       CLR_GREEN, CLR_RESET);
 	printf("      %sPost-Quantum | ML-KEM-768 | KEM Encaps/Decaps + MAC%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
-	printf("  %s[6]%s Full Benchmark (Classic + PQ)\n",
-	       CLR_GREEN, CLR_RESET);
-	printf("      %sAll 4 variants → 3 CSV files (operations, overhead, handshake)%s\n",
-	       CLR_CYAN, CLR_RESET);
-	printf("\n");
-	printf("  %s[7]%s EDHOC Type 3 Hybrid (X25519 + ML-KEM-768)\n",
+	printf("  %s[5]%s EDHOC Type 3 Hybrid (X25519 + ML-KEM-768)\n",
 	       CLR_GREEN, CLR_RESET);
 	printf("      %sHybrid | ECDHE + KEM | MAC-MAC (static DH auth)%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
-	printf("  %s[8]%s Full Benchmark (Classic + PQ + Hybrid)\n",
+	printf("  %s[6]%s Socket Benchmark (TCP Client-Server, All 5 Variants)\n",
 	       CLR_GREEN, CLR_RESET);
-	printf("      %sAll 5 variants → 3 CSV files%s\n",
-	       CLR_CYAN, CLR_RESET);
-	printf("\n");
-	printf("  %s[9]%s Socket Benchmark (TCP Client-Server, All 5 Variants)\n",
-	       CLR_GREEN, CLR_RESET);
-	printf("      %sTCP localhost | All 5 variants → 3 CSV files (output_socket/)%s\n",
+	printf("      %sTCP localhost | All 5 variants → 3 CSV files (output/)%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
 	printf("  %s[0]%s Exit\n", CLR_RED, CLR_RESET);
@@ -127,7 +111,7 @@ int main(int argc, char *argv[])
 				while ((c = getchar()) != '\n' && c != EOF)
 					;
 				printf("\n");
-				print_error("Invalid input. Please enter 0-9.");
+				print_error("Invalid input. Please enter 0-6.");
 				choice = -1;
 				continue;
 			}
@@ -155,48 +139,27 @@ int main(int argc, char *argv[])
 			break;
 
 		case 3:
-			result = run_edhoc_benchmark();
-			if (result != 0) {
-				print_error("Benchmark failed!");
-			}
-			break;
-
-		case 4:
 			result = run_edhoc_type0_pq();
 			if (result != 0) {
 				print_error("Type 0 PQ (KEM Sig-Sig) failed!");
 			}
 			break;
 
-		case 5:
+		case 4:
 			result = run_edhoc_type3_pq();
 			if (result != 0) {
 				print_error("Type 3 PQ (KEM MAC-MAC) failed!");
 			}
 			break;
 
-		case 6:
-			result = run_edhoc_benchmark_full();
-			if (result != 0) {
-				print_error("Full Benchmark (Classic + PQ) failed!");
-			}
-			break;
-
-		case 7:
+		case 5:
 			result = run_edhoc_type3_hybrid();
 			if (result != 0) {
 				print_error("Type 3 Hybrid (ECDHE + KEM) failed!");
 			}
 			break;
 
-		case 8:
-			result = run_edhoc_benchmark_full_hybrid();
-			if (result != 0) {
-				print_error("Full Benchmark (Classic + PQ + Hybrid) failed!");
-			}
-			break;
-
-		case 9:
+		case 6:
 			result = run_edhoc_benchmark_socket();
 			if (result != 0) {
 				print_error("Socket Benchmark (TCP) failed!");
@@ -205,7 +168,7 @@ int main(int argc, char *argv[])
 
 		default:
 			printf("\n");
-			print_error("Invalid choice. Please enter 0-9.");
+			print_error("Invalid choice. Please enter 0-6.");
 			break;
 		}
 

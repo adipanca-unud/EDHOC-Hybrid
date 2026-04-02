@@ -1,79 +1,19 @@
 /*
  * =============================================================================
- * EDHOC-Hybrid: Comprehensive Benchmark System (Corrected)
+ * EDHOC-Hybrid: Socket-based (TCP) Benchmark
  * =============================================================================
  *
- * Benchmark komprehensif untuk mengukur performa dua varian EDHOC Protocol
- * berdasarkan RFC 9528, dengan mapping yang benar ke alur protokol:
+ * Mirrors edhoc_benchmark.c but uses TCP localhost sockets for all
+ * handshake message exchange.  The crypto operations benchmark is
+ * identical (transport-independent).  The handshake benchmark spawns a
+ * server thread (Responder) and a client thread (Initiator) that
+ * communicate via TCP with length-prefix framing.
  *
- *   Type 0 (Sig-Sig): Method 0, Suite 0 — X25519 + EdDSA Sign/Verify
- *   Type 3 (MAC-MAC): Method 3, Suite 0 — X25519 Static DH + MAC
- *
- * === MAPPING OPERASI KRIPTOGRAFI KE ALUR EDHOC ===
- *
- * Type 0 Initiator:
- *   msg1_gen:  X25519 KeyGen(ephemeral), Hash(msg1)
- *   msg2_proc: ECDH(x,G_Y), Hash(TH2), HKDF-Extract(PRK_2e),
- *              XOR(decrypt CT2), edhoc_kdf(MAC_2),
- *              Verify(Signature_or_MAC_2), Hash(TH3), edhoc_kdf(SALT_4e3m)→memcpy
- *   msg3_gen:  edhoc_kdf(MAC_3), Sign(Signature_or_MAC_3),
- *              edhoc_kdf(K_3), edhoc_kdf(IV_3), AEAD-Encrypt(CT3),
- *              Hash(TH4), edhoc_kdf(PRK_out)
- *
- * Type 0 Responder:
- *   msg1_proc: Hash(msg1)
- *   msg2_gen:  Hash(TH2), ECDH(y,G_X), HKDF-Extract(PRK_2e),
- *              prk_derive(PRK_3e2m)→memcpy, edhoc_kdf(MAC_2),
- *              Sign(Signature_or_MAC_2),
- *              XOR(encrypt CT2), Hash(TH3)
- *   msg3_proc: AEAD-Decrypt(CT3),
- *              prk_derive(PRK_4e3m)→memcpy, edhoc_kdf(MAC_3),
- *              Verify(Signature_or_MAC_3), Hash(TH4), edhoc_kdf(PRK_out)
- *
- * Type 3 Initiator:
- *   msg1_gen:  X25519 KeyGen(ephemeral), Hash(msg1)
- *   msg2_proc: ECDH(x,G_Y), Hash(TH2), HKDF-Extract(PRK_2e),
- *              prk_derive(PRK_3e2m)→ECDH(x,G_R)+HKDF-Extract,
- *              XOR(decrypt CT2), edhoc_kdf(MAC_2), MAC-verify,
- *              Hash(TH3),
- *              prk_derive(PRK_4e3m)→ECDH(i,G_Y)+HKDF-Extract
- *   msg3_gen:  edhoc_kdf(MAC_3),
- *              edhoc_kdf(K_3), edhoc_kdf(IV_3), AEAD-Encrypt(CT3),
- *              Hash(TH4), edhoc_kdf(PRK_out)
- *
- * Type 3 Responder:
- *   msg1_proc: Hash(msg1)
- *   msg2_gen:  Hash(TH2), ECDH(y,G_X), HKDF-Extract(PRK_2e),
- *              prk_derive(PRK_3e2m)→ECDH(r,G_X)+HKDF-Extract,
- *              edhoc_kdf(MAC_2),
- *              XOR(encrypt CT2), Hash(TH3)
- *   msg3_proc: AEAD-Decrypt(CT3),
- *              prk_derive(PRK_4e3m)→ECDH(y,G_I)+HKDF-Extract,
- *              edhoc_kdf(MAC_3), MAC-verify,
- *              Hash(TH4), edhoc_kdf(PRK_out)
- *
- * === RINGKASAN JUMLAH OPERASI PER ROLE/TYPE ===
- *
- *   Operasi         | T0-Init | T0-Resp | T3-Init | T3-Resp
- *   ----------------+---------+---------+---------+--------
- *   X25519 KeyGen   |    1    |    1    |    1    |    1
- *   ECDH            |    1    |    1    |    3    |    3
- *   HKDF-Extract    |    1    |    1    |    3    |    3
- *   HKDF-Expand     |   ~7    |   ~7    |   ~7    |   ~7
- *   Hash (SHA-256)  |   ~4    |   ~4    |   ~4    |   ~4
- *   AEAD Encrypt    |    1    |    0*   |    1    |    0*
- *   AEAD Decrypt    |    0*   |    1    |    0*   |    1
- *   Sign (EdDSA)    |    1    |    1    |    0    |    0
- *   Verify (EdDSA)  |    1    |    1    |    0    |    0
- *
- *   * CIPHERTEXT_2 menggunakan XOR bukan AEAD (RFC 9528 §5.3.2)
- *     Initiator: Encrypt CT3 (AEAD), Decrypt CT2 (XOR → bukan AEAD)
- *     Responder: Encrypt CT2 (XOR → bukan AEAD), Decrypt CT3 (AEAD)
- *
+ * CSV output goes to output/ so it can be verified independently.
  * =============================================================================
  */
 
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,6 +21,12 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <errno.h>
 
@@ -100,35 +46,22 @@
 #include "edhoc/suites.h"
 
 /* =============================================================================
- * Timing utilities
+ * Timing utilities (identical to edhoc_benchmark.c)
  * =============================================================================
  */
-
-/**
- * @brief Mendapatkan waktu saat ini dalam nanoseconds (monotonic clock).
- */
-static inline uint64_t get_time_ns(void)
+static inline uint64_t sck_get_time_ns(void)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-/**
- * @brief Menghitung selisih waktu dalam microseconds.
- */
-static inline double elapsed_us(uint64_t start, uint64_t end)
+static inline double sck_elapsed_us(uint64_t start, uint64_t end)
 {
 	return (double)(end - start) / 1000.0;
 }
 
-/**
- * @brief Mendapatkan CPU time thread saat ini dalam nanoseconds.
- *
- * Menggunakan CLOCK_THREAD_CPUTIME_ID untuk mengukur CPU time
- * per-thread yang akurat, bukan process-wide getrusage().
- */
-static inline uint64_t get_thread_cpu_ns(void)
+static inline uint64_t sck_get_thread_cpu_ns(void)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
@@ -136,3340 +69,2941 @@ static inline uint64_t get_thread_cpu_ns(void)
 }
 
 /* =============================================================================
- * Struktur data untuk menyimpan hasil benchmark
+ * Benchmark data structures (identical to edhoc_benchmark.c)
  * =============================================================================
  */
-
-/* Hasil benchmark satu operasi kriptografi */
-struct op_result {
-	double avg_us;    /* Rata-rata waktu per-call dalam µs */
-	int    count;     /* Jumlah iterasi yang berhasil */
-	int    calls;     /* Jumlah pemanggilan dalam 1 handshake (multiplier) */
+struct sck_op_result {
+	double avg_us;
+	int    count;
+	int    calls;
 };
 
-/* Semua operasi kriptografi untuk satu (type, role) */
-struct ops_benchmark {
-	struct op_result keygen;        /* X25519 ephemeral key generation */
-	struct op_result encap;         /* AEAD Encrypt (AES-CCM) */
-	struct op_result decap;         /* AEAD Decrypt (AES-CCM) */
-	struct op_result signature;     /* EdDSA Sign (Type 0 only) */
-	struct op_result verification;  /* EdDSA Verify (Type 0 only) */
-	struct op_result ecdh;          /* X25519 shared secret derivation */
-	struct op_result hkdf;          /* HKDF-Extract + HKDF-Expand */
-	struct op_result hash;          /* SHA-256 Hash */
-	/* PQ KEM operations (PQ variants only) */
-	struct op_result pq_keygen;     /* ML-KEM-768 KeyGen */
-	struct op_result pq_encaps;     /* ML-KEM-768 Encaps */
-	struct op_result pq_decaps;     /* ML-KEM-768 Decaps */
-	struct op_result pq_sig_sign;   /* ML-DSA-65 Sign (Type 0 PQ only) */
-	struct op_result pq_sig_verify; /* ML-DSA-65 Verify (Type 0 PQ only) */
-	struct op_result pq_aead_enc;   /* PQ AEAD Encrypt (AES-CCM via PSA) */
-	struct op_result pq_aead_dec;   /* PQ AEAD Decrypt (AES-CCM via PSA) */
-	struct op_result pq_hkdf;       /* PQ HKDF (Extract + Expand via PSA) */
-	struct op_result pq_hash;       /* PQ Hash (SHA-256 via PSA) */
+struct sck_ops_benchmark {
+	struct sck_op_result keygen;
+	struct sck_op_result encap;
+	struct sck_op_result decap;
+	struct sck_op_result signature;
+	struct sck_op_result verification;
+	struct sck_op_result ecdh;
+	struct sck_op_result hkdf;
+	struct sck_op_result hash;
+	struct sck_op_result pq_keygen;
+	struct sck_op_result pq_encaps;
+	struct sck_op_result pq_decaps;
+	struct sck_op_result pq_sig_sign;
+	struct sck_op_result pq_sig_verify;
+	struct sck_op_result pq_aead_enc;
+	struct sck_op_result pq_aead_dec;
+	struct sck_op_result pq_hkdf;
+	struct sck_op_result pq_hash;
 };
 
-/* Overhead resource untuk satu (type, role) */
-struct overhead_benchmark {
-	double cpu_us;         /* Crypto CPU cost (µs) — derived from calibrated ops.
-				  Classic: sum(calibrated ops) - keygen
-				  PQ: sum(ops × calls) = same as ops CSV */
-	long   memory_bytes;   /* Estimated stack + heap memory dalam bytes */
+struct sck_overhead_benchmark {
+	double cpu_us;
+	long   memory_bytes;
 };
 
-/* Waktu handshake per fase untuk satu (type, role) */
-struct handshake_benchmark {
-	double processing_us;     /* Crypto processing cost (= cpu_time_us from overhead CSV) */
-	double txrx_us;           /* Waktu transmisi/penerimaan pesan */
-	double precomputation_us; /* Waktu setup kunci (calibrated keygen) */
-	double overhead_us;       /* Scheduling & IPC overhead (≥ 0) */
-	double total_us;          /* Total = processing + txrx + precomp + overhead */
+struct sck_handshake_benchmark {
+	double processing_us;
+	double txrx_us;
+	double precomputation_us;
+	double overhead_us;
+	double total_us;
 };
 
 /* =============================================================================
- * 1. INDIVIDUAL PRIMITIVE BENCHMARKS
- *
- * Setiap primitif kriptografi diukur secara independen, lalu
- * di-multiplikasi dengan jumlah pemanggilan aktual dalam protokol.
+ * TCP Socket Helper Functions
  * =============================================================================
  */
 
 /**
- * @brief Benchmark KeyGen — pembangkitan kunci ephemeral X25519.
- *
- * Menggunakan crypto_wrapper (X25519 via libsodium) untuk membangkitkan
- * pasangan kunci DH ephemeral (32-byte private + 32-byte public) dari seed
- * deterministik.
- *
- * Dalam EDHOC: setiap sisi (Initiator & Responder) membangkitkan
- * tepat 1 pasang kunci ephemeral per handshake.
- *
- * Catatan: Kunci EdDSA (Type 0) dan kunci static DH (Type 3) adalah
- * kunci LONG-TERM yang di-provisioning sebelumnya, bukan di-generate
- * per handshake. Oleh karena itu TIDAK dimasukkan dalam KeyGen benchmark.
+ * @brief Send a message over TCP with 4-byte length prefix (network byte order).
  */
-static struct op_result bench_keygen_x25519(int iterations)
+static int sock_send_msg(int fd, const uint8_t *data, uint32_t len)
 {
-	struct op_result res = {0};
-	uint64_t total_ns = 0;
+	uint32_t net_len = htonl(len);
+	/* Send length prefix */
+	ssize_t n = send(fd, &net_len, 4, MSG_NOSIGNAL);
+	if (n != 4) return -1;
+	/* Send payload */
+	uint32_t sent = 0;
+	while (sent < len) {
+		n = send(fd, data + sent, len - sent, MSG_NOSIGNAL);
+		if (n <= 0) return -1;
+		sent += (uint32_t)n;
+	}
+	return 0;
+}
 
+/**
+ * @brief Receive a message over TCP with 4-byte length prefix.
+ * @param buf Output buffer (must be large enough)
+ * @param buf_size Size of output buffer
+ * @param out_len Output: number of bytes received
+ */
+static int sock_recv_msg(int fd, uint8_t *buf, uint32_t buf_size, uint32_t *out_len)
+{
+	uint32_t net_len;
+	ssize_t n = 0;
+	uint32_t got = 0;
+	/* Read 4-byte length prefix */
+	while (got < 4) {
+		n = recv(fd, ((uint8_t *)&net_len) + got, 4 - got, 0);
+		if (n <= 0) return -1;
+		got += (uint32_t)n;
+	}
+	uint32_t msg_len = ntohl(net_len);
+	if (msg_len > buf_size) return -1;
+	/* Read payload */
+	got = 0;
+	while (got < msg_len) {
+		n = recv(fd, buf + got, msg_len - got, 0);
+		if (n <= 0) return -1;
+		got += (uint32_t)n;
+	}
+	*out_len = msg_len;
+	return 0;
+}
+
+/**
+ * @brief Create a TCP server socket bound to localhost:port.
+ * @return listening socket fd, or -1 on error
+ */
+static int sock_create_server(int port)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return -1;
+
+	int opt = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = htons((uint16_t)port);
+
+	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(fd);
+		return -1;
+	}
+	if (listen(fd, 1) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/**
+ * @brief Connect to localhost:port.
+ * @return connected socket fd, or -1 on error
+ */
+static int sock_connect_client(int port)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return -1;
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = htons((uint16_t)port);
+
+	/* Retry connect a few times (server may not be ready yet) */
+	for (int retry = 0; retry < 50; retry++) {
+		if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+			return fd;
+		usleep(1000); /* 1ms */
+	}
+	close(fd);
+	return -1;
+}
+
+/* =============================================================================
+ * 1. CRYPTO PRIMITIVE BENCHMARKS (identical to edhoc_benchmark.c)
+ * =============================================================================
+ */
+
+static struct sck_op_result sck_bench_keygen_x25519(int iterations)
+{
+	struct sck_op_result res = {0};
+	uint64_t total_ns = 0;
 	for (int i = 0; i < iterations; i++) {
-		uint8_t sk_buf[32] = {0};
-		uint8_t pk_buf[32] = {0};
-		struct byte_array sk = { .len = sizeof(sk_buf), .ptr = sk_buf };
-		struct byte_array pk = { .len = sizeof(pk_buf), .ptr = pk_buf };
+		uint8_t sk_buf[32] = {0}, pk_buf[32] = {0};
+		struct byte_array sk = { .len = 32, .ptr = sk_buf };
+		struct byte_array pk = { .len = 32, .ptr = pk_buf };
 		uint32_t seed = (uint32_t)(i * 37U + 42U);
-
-		uint64_t start = get_time_ns();
+		uint64_t start = sck_get_time_ns();
 		enum err r = ephemeral_dh_key_gen(X25519, seed, &sk, &pk);
-		uint64_t end = get_time_ns();
-
-		if (r == ok) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t end = sck_get_time_ns();
+		if (r == ok) { total_ns += (end - start); res.count++; }
 	}
-
-	if (res.count > 0) {
-		res.avg_us =
-			(double)total_ns / (double)res.count / 1000.0;
-	}
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark AEAD Encrypt (Encap) — AES-CCM-16-64-128.
- *
- * Dalam EDHOC:
- *   - CIPHERTEXT_2 = XOR (bukan AEAD!) — lihat RFC 9528 §5.3.2
- *   - CIPHERTEXT_3 = AEAD (AES-CCM-16-64-128)
- *   - Initiator mengenkripsi CIPHERTEXT_3 → 1× AEAD Encrypt
- *   - Responder mengenkripsi CIPHERTEXT_2 → XOR → 0× AEAD Encrypt
- */
-static struct op_result bench_encap(int iterations)
+static struct sck_op_result sck_bench_encap(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-
 	uint8_t plain_data[32], key_data[16], nonce_data[13];
 	uint8_t aad_data[16], cipher_data[64], tag_data[8];
-
-	memset(plain_data, 0xAA, sizeof(plain_data));
-	memset(key_data, 0xBB, sizeof(key_data));
-	memset(nonce_data, 0xCC, sizeof(nonce_data));
-	memset(aad_data, 0xDD, sizeof(aad_data));
-
-	struct byte_array plain  = { .len = 32, .ptr = plain_data };
-	struct byte_array key    = { .len = 16, .ptr = key_data };
-	struct byte_array nonce  = { .len = 13, .ptr = nonce_data };
-	struct byte_array a_ad   = { .len = 16, .ptr = aad_data };
-	struct byte_array cipher = { .len = 32, .ptr = cipher_data };
-	struct byte_array tag    = { .len = 8,  .ptr = tag_data };
-
+	memset(plain_data, 0xAA, 32); memset(key_data, 0xBB, 16);
+	memset(nonce_data, 0xCC, 13); memset(aad_data, 0xDD, 16);
+	struct byte_array plain  = {.len=32,.ptr=plain_data};
+	struct byte_array key    = {.len=16,.ptr=key_data};
+	struct byte_array nonce  = {.len=13,.ptr=nonce_data};
+	struct byte_array a_ad   = {.len=16,.ptr=aad_data};
+	struct byte_array cipher = {.len=32,.ptr=cipher_data};
+	struct byte_array tag    = {.len=8, .ptr=tag_data};
 	for (int i = 0; i < iterations; i++) {
-		cipher.len = 32;
-		tag.len = 8;
-
-		uint64_t start = get_time_ns();
-		enum err r = aead(ENCRYPT, &plain, &key, &nonce, &a_ad,
-				  &cipher, &tag);
-		uint64_t end = get_time_ns();
-
-		if (r == ok) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		cipher.len = 32; tag.len = 8;
+		uint64_t start = sck_get_time_ns();
+		enum err r = aead(ENCRYPT, &plain, &key, &nonce, &a_ad, &cipher, &tag);
+		uint64_t end = sck_get_time_ns();
+		if (r == ok) { total_ns += (end - start); res.count++; }
 	}
-
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark AEAD Decrypt (Decap) — AES-CCM-16-64-128.
- *
- * Dalam EDHOC:
- *   - Initiator mendekripsi CIPHERTEXT_2 → XOR → 0× AEAD Decrypt
- *   - Responder mendekripsi CIPHERTEXT_3 → 1× AEAD Decrypt
- */
-static struct op_result bench_decap(int iterations)
+static struct sck_op_result sck_bench_decap(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-
 	uint8_t plain_data[32], key_data[16], nonce_data[13];
-	uint8_t aad_data[16], cipher_data[64], tag_data[8];
-	uint8_t decrypted_data[64];
-
-	memset(plain_data, 0xAA, sizeof(plain_data));
-	memset(key_data, 0xBB, sizeof(key_data));
-	memset(nonce_data, 0xCC, sizeof(nonce_data));
-	memset(aad_data, 0xDD, sizeof(aad_data));
-
-	struct byte_array plain  = { .len = 32, .ptr = plain_data };
-	struct byte_array key    = { .len = 16, .ptr = key_data };
-	struct byte_array nonce  = { .len = 13, .ptr = nonce_data };
-	struct byte_array a_ad   = { .len = 16, .ptr = aad_data };
-	struct byte_array cipher = { .len = 32, .ptr = cipher_data };
-	struct byte_array tag    = { .len = 8,  .ptr = tag_data };
-
-	/* Buat ciphertext valid terlebih dahulu */
+	uint8_t aad_data[16], cipher_data[64], tag_data[8], decrypted_data[64];
+	memset(plain_data, 0xAA, 32); memset(key_data, 0xBB, 16);
+	memset(nonce_data, 0xCC, 13); memset(aad_data, 0xDD, 16);
+	struct byte_array plain  = {.len=32,.ptr=plain_data};
+	struct byte_array key    = {.len=16,.ptr=key_data};
+	struct byte_array nonce  = {.len=13,.ptr=nonce_data};
+	struct byte_array a_ad   = {.len=16,.ptr=aad_data};
+	struct byte_array cipher = {.len=32,.ptr=cipher_data};
+	struct byte_array tag    = {.len=8, .ptr=tag_data};
 	enum err r = aead(ENCRYPT, &plain, &key, &nonce, &a_ad, &cipher, &tag);
-	if (r != ok)
-		return res;
-
-	/*
-	 * psa_aead_decrypt membutuhkan ciphertext+tag yang digabung.
-	 * Buat buffer gabungan: cipher (32 bytes) + tag (8 bytes) = 40 bytes.
-	 */
+	if (r != ok) return res;
 	uint8_t ct_plus_tag[64];
 	memcpy(ct_plus_tag, cipher.ptr, cipher.len);
 	memcpy(ct_plus_tag + cipher.len, tag.ptr, tag.len);
 	uint32_t ct_tag_len = cipher.len + tag.len;
-
-	struct byte_array ct_input  = { .len = ct_tag_len, .ptr = ct_plus_tag };
-	struct byte_array decrypted = { .len = 32, .ptr = decrypted_data };
-	struct byte_array dec_tag   = { .len = 8,  .ptr = tag_data };
-
+	struct byte_array ct_input  = {.len=ct_tag_len,.ptr=ct_plus_tag};
+	struct byte_array decrypted = {.len=32,.ptr=decrypted_data};
+	struct byte_array dec_tag   = {.len=8, .ptr=tag_data};
 	for (int i = 0; i < iterations; i++) {
-		decrypted.len = 32;
-		dec_tag.len = 8;
-
-		uint64_t start = get_time_ns();
-		r = aead(DECRYPT, &ct_input, &key, &nonce, &a_ad,
-			 &decrypted, &dec_tag);
-		uint64_t end = get_time_ns();
-
-		if (r == ok) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		decrypted.len = 32; dec_tag.len = 8;
+		uint64_t start = sck_get_time_ns();
+		r = aead(DECRYPT, &ct_input, &key, &nonce, &a_ad, &decrypted, &dec_tag);
+		uint64_t end = sck_get_time_ns();
+		if (r == ok) { total_ns += (end - start); res.count++; }
 	}
-
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark EdDSA Signature — Ed25519 Sign.
- *
- * Dalam EDHOC Type 0:
- *   - Initiator: 1× Sign(Signature_or_MAC_3)
- *   - Responder: 1× Sign(Signature_or_MAC_2)
- * Type 3: 0× (menggunakan MAC)
- */
-static struct op_result bench_signature(int iterations)
+static struct sck_op_result sck_bench_signature(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-
-	struct byte_array sk = {
-		.len = T1_RFC9529__SK_I_LEN,
-		.ptr = (uint8_t *)T1_RFC9529__SK_I
-	};
-	struct byte_array pk = {
-		.len = T1_RFC9529__PK_I_LEN,
-		.ptr = (uint8_t *)T1_RFC9529__PK_I
-	};
-
-	uint8_t msg_data[64];
-	memset(msg_data, 0x42, sizeof(msg_data));
-	struct byte_array msg = { .len = 64, .ptr = msg_data };
+	struct byte_array sk = {.len=T1_RFC9529__SK_I_LEN,.ptr=(uint8_t*)T1_RFC9529__SK_I};
+	struct byte_array pk = {.len=T1_RFC9529__PK_I_LEN,.ptr=(uint8_t*)T1_RFC9529__PK_I};
+	uint8_t msg_data[64]; memset(msg_data, 0x42, 64);
+	struct byte_array msg = {.len=64,.ptr=msg_data};
 	uint8_t sig_out[64];
-
 	for (int i = 0; i < iterations; i++) {
-		uint64_t start = get_time_ns();
+		uint64_t start = sck_get_time_ns();
 		enum err r = sign(EdDSA, &sk, &pk, &msg, sig_out);
-		uint64_t end = get_time_ns();
-
-		if (r == ok) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t end = sck_get_time_ns();
+		if (r == ok) { total_ns += (end - start); res.count++; }
 	}
-
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark EdDSA Verification — Ed25519 Verify.
- *
- * Dalam EDHOC Type 0:
- *   - Initiator: 1× Verify(Signature_or_MAC_2) dari Responder
- *   - Responder: 1× Verify(Signature_or_MAC_3) dari Initiator
- * Type 3: 0× (verifikasi via memcmp pada MAC)
- */
-static struct op_result bench_verification(int iterations)
+static struct sck_op_result sck_bench_verification(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-
-	struct byte_array sk = {
-		.len = T1_RFC9529__SK_I_LEN,
-		.ptr = (uint8_t *)T1_RFC9529__SK_I
-	};
-	struct byte_array pk = {
-		.len = T1_RFC9529__PK_I_LEN,
-		.ptr = (uint8_t *)T1_RFC9529__PK_I
-	};
-
-	uint8_t msg_data[64];
-	memset(msg_data, 0x42, sizeof(msg_data));
-	struct byte_array msg = { .len = 64, .ptr = msg_data };
+	struct byte_array sk = {.len=T1_RFC9529__SK_I_LEN,.ptr=(uint8_t*)T1_RFC9529__SK_I};
+	struct byte_array pk = {.len=T1_RFC9529__PK_I_LEN,.ptr=(uint8_t*)T1_RFC9529__PK_I};
+	uint8_t msg_data[64]; memset(msg_data, 0x42, 64);
+	struct byte_array msg = {.len=64,.ptr=msg_data};
 	uint8_t sig_out[64];
-
 	enum err r = sign(EdDSA, &sk, &pk, &msg, sig_out);
-	if (r != ok)
-		return res;
-
-	struct const_byte_array c_msg = { .len = msg.len, .ptr = msg.ptr };
-	struct const_byte_array c_sgn = { .len = 64, .ptr = sig_out };
-
+	if (r != ok) return res;
+	struct const_byte_array c_msg = {.len=msg.len,.ptr=msg.ptr};
+	struct const_byte_array c_sgn = {.len=64,.ptr=sig_out};
 	for (int i = 0; i < iterations; i++) {
 		bool verified = false;
-
-		uint64_t start = get_time_ns();
+		uint64_t start = sck_get_time_ns();
 		r = verify(EdDSA, &pk, &c_msg, &c_sgn, &verified);
-		uint64_t end = get_time_ns();
-
-		if (r == ok && verified) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t end = sck_get_time_ns();
+		if (r == ok && verified) { total_ns += (end - start); res.count++; }
 	}
-
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark ECDH — X25519 Shared Secret Derivation (single call).
- *
- * Mengukur waktu 1× shared_secret_derive(X25519).
- *
- * Dalam EDHOC:
- *   - Type 0: 1× (ephemeral DH saja)
- *   - Type 3: 3× (ephemeral + 2 static DH melalui prk_derive)
- *     Initiator: ECDH(x,G_Y) + ECDH(x,G_R) + ECDH(i,G_Y)
- *     Responder: ECDH(y,G_X) + ECDH(r,G_X) + ECDH(y,G_I)
- */
-static struct op_result bench_ecdh(int iterations)
+static struct sck_op_result sck_bench_ecdh(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-
-	struct byte_array sk = {
-		.len = T1_RFC9529__X_LEN,
-		.ptr = (uint8_t *)T1_RFC9529__X
-	};
-	struct byte_array pk = {
-		.len = T1_RFC9529__G_Y_LEN,
-		.ptr = (uint8_t *)T1_RFC9529__G_Y
-	};
-	uint8_t shared_secret[32];
-
+	struct byte_array sk = {.len=T1_RFC9529__X_LEN,.ptr=(uint8_t*)T1_RFC9529__X};
+	struct byte_array pk = {.len=T1_RFC9529__G_Y_LEN,.ptr=(uint8_t*)T1_RFC9529__G_Y};
+	uint8_t shared[32];
 	for (int i = 0; i < iterations; i++) {
-		uint64_t start = get_time_ns();
-		enum err r = shared_secret_derive(X25519, &sk, &pk,
-						  shared_secret);
-		uint64_t end = get_time_ns();
-
-		if (r == ok) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t start = sck_get_time_ns();
+		enum err r = shared_secret_derive(X25519, &sk, &pk, shared);
+		uint64_t end = sck_get_time_ns();
+		if (r == ok) { total_ns += (end - start); res.count++; }
 	}
-
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark HKDF — HKDF-Extract + HKDF-Expand gabungan.
- *
- * Mengukur waktu satu pasang HKDF-Extract + HKDF-Expand (SHA-256).
- *
- * Jumlah total per handshake (approx):
- *   - Type 0: ~8 calls (1 Extract + ~7 Expand via edhoc_kdf)
- *   - Type 3: ~10 calls (3 Extract + ~7 Expand via edhoc_kdf)
- */
-static struct op_result bench_hkdf(int iterations)
+static struct sck_op_result sck_bench_hkdf(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-
-	uint8_t salt_data[32], ikm_data[32], prk_data[32];
-	uint8_t info_data[16], okm_data[32];
-
-	memset(salt_data, 0x11, sizeof(salt_data));
-	memset(ikm_data, 0x22, sizeof(ikm_data));
-	memset(info_data, 0x33, sizeof(info_data));
-
-	struct byte_array salt = { .len = 32, .ptr = salt_data };
-	struct byte_array ikm  = { .len = 32, .ptr = ikm_data };
-	struct byte_array prk  = { .len = 32, .ptr = prk_data };
-	struct byte_array info = { .len = 16, .ptr = info_data };
-	struct byte_array okm  = { .len = 32, .ptr = okm_data };
-
+	uint8_t salt_data[32], ikm_data[32], prk_data[32], info_data[16], okm_data[32];
+	memset(salt_data, 0x11, 32); memset(ikm_data, 0x22, 32); memset(info_data, 0x33, 16);
+	struct byte_array salt = {.len=32,.ptr=salt_data};
+	struct byte_array ikm  = {.len=32,.ptr=ikm_data};
+	struct byte_array prk  = {.len=32,.ptr=prk_data};
+	struct byte_array info = {.len=16,.ptr=info_data};
+	struct byte_array okm  = {.len=32,.ptr=okm_data};
 	for (int i = 0; i < iterations; i++) {
-		uint64_t start = get_time_ns();
-
+		uint64_t start = sck_get_time_ns();
 		enum err r = hkdf_extract(SHA_256, &salt, &ikm, prk_data);
-		if (r != ok)
-			continue;
-
+		if (r != ok) continue;
 		okm.len = 32;
 		r = hkdf_expand(SHA_256, &prk, &info, &okm);
-
-		uint64_t end = get_time_ns();
-
-		if (r == ok) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t end = sck_get_time_ns();
+		if (r == ok) { total_ns += (end - start); res.count++; }
 	}
-
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark Hash — SHA-256.
- *
- * Mengukur waktu satu pemanggilan hash SHA-256.
- * Dalam EDHOC: ~4× per role (Hash msg1, TH2, TH3, TH4).
- */
-static struct op_result bench_hash(int iterations)
+static struct sck_op_result sck_bench_hash(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-
-	uint8_t msg_data[128];
-	uint8_t hash_out[32];
-	memset(msg_data, 0x55, sizeof(msg_data));
-
-	struct byte_array msg  = { .len = 128, .ptr = msg_data };
-	struct byte_array hout = { .len = 32,  .ptr = hash_out };
-
+	uint8_t msg_data[128], hash_out[32];
+	memset(msg_data, 0x55, 128);
+	struct byte_array msg = {.len=128,.ptr=msg_data};
+	struct byte_array hout = {.len=32,.ptr=hash_out};
 	for (int i = 0; i < iterations; i++) {
 		hout.len = 32;
-
-		uint64_t start = get_time_ns();
+		uint64_t start = sck_get_time_ns();
 		enum err r = hash(SHA_256, &msg, &hout);
-		uint64_t end = get_time_ns();
-
-		if (r == ok) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t end = sck_get_time_ns();
+		if (r == ok) { total_ns += (end - start); res.count++; }
 	}
-
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/* =============================================================================
- * PQ KEM PRIMITIVE BENCHMARKS (ML-KEM-768 via liboqs + PSA)
- * =============================================================================
- */
-
-/**
- * @brief Benchmark ML-KEM-768 KeyGen.
- */
-static struct op_result bench_pq_keygen(int iterations)
+/* PQ primitive benchmarks */
+static struct sck_op_result sck_bench_pq_keygen(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
 	uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN];
-
 	for (int i = 0; i < iterations; i++) {
-		uint64_t start = get_time_ns();
+		uint64_t start = sck_get_time_ns();
 		int r = pq_kem_keygen(pk, sk);
-		uint64_t end = get_time_ns();
-		if (r == 0) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t end = sck_get_time_ns();
+		if (r == 0) { total_ns += (end - start); res.count++; }
 	}
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark ML-KEM-768 Encaps.
- */
-static struct op_result bench_pq_encaps(int iterations)
+static struct sck_op_result sck_bench_pq_encaps(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
 	uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN];
 	uint8_t ct[PQ_KEM_CT_LEN], ss[PQ_KEM_SS_LEN];
-
-	if (pq_kem_keygen(pk, sk) != 0)
-		return res;
-
+	if (pq_kem_keygen(pk, sk) != 0) return res;
 	for (int i = 0; i < iterations; i++) {
-		uint64_t start = get_time_ns();
+		uint64_t start = sck_get_time_ns();
 		int r = pq_kem_encaps(ct, ss, pk);
-		uint64_t end = get_time_ns();
-		if (r == 0) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t end = sck_get_time_ns();
+		if (r == 0) { total_ns += (end - start); res.count++; }
 	}
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark ML-KEM-768 Decaps.
- */
-static struct op_result bench_pq_decaps(int iterations)
+static struct sck_op_result sck_bench_pq_decaps(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
 	uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN];
 	uint8_t ct[PQ_KEM_CT_LEN], ss[PQ_KEM_SS_LEN], ss2[PQ_KEM_SS_LEN];
-
-	if (pq_kem_keygen(pk, sk) != 0)
-		return res;
-	if (pq_kem_encaps(ct, ss, pk) != 0)
-		return res;
-
+	if (pq_kem_keygen(pk, sk) != 0) return res;
+	if (pq_kem_encaps(ct, ss, pk) != 0) return res;
 	for (int i = 0; i < iterations; i++) {
-		uint64_t start = get_time_ns();
+		uint64_t start = sck_get_time_ns();
 		int r = pq_kem_decaps(ss2, ct, sk);
-		uint64_t end = get_time_ns();
-		if (r == 0) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t end = sck_get_time_ns();
+		if (r == 0) { total_ns += (end - start); res.count++; }
 	}
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark PQ AEAD Encrypt (AES-CCM via PSA).
- */
-static struct op_result bench_pq_aead_enc(int iterations)
+static struct sck_op_result sck_bench_pq_aead_enc(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-	uint8_t key[PQ_AEAD_KEY_LEN], iv[PQ_AEAD_NONCE_LEN];
-	uint8_t pt[32], ct[32 + PQ_AEAD_TAG_LEN];
-	memset(key, 0xBB, sizeof(key));
-	memset(iv, 0xCC, sizeof(iv));
-	memset(pt, 0xAA, sizeof(pt));
-
+	uint8_t key[PQ_AEAD_KEY_LEN], iv[PQ_AEAD_NONCE_LEN], pt[32], ct[32+PQ_AEAD_TAG_LEN];
+	memset(key, 0xBB, sizeof(key)); memset(iv, 0xCC, sizeof(iv)); memset(pt, 0xAA, 32);
 	for (int i = 0; i < iterations; i++) {
 		size_t ct_len = 0;
-		uint64_t start = get_time_ns();
+		uint64_t start = sck_get_time_ns();
 		int r = pq_aead_encrypt(key, iv, NULL, 0, pt, 32, ct, &ct_len);
-		uint64_t end = get_time_ns();
-		if (r == 0) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t end = sck_get_time_ns();
+		if (r == 0) { total_ns += (end - start); res.count++; }
 	}
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark PQ AEAD Decrypt (AES-CCM via PSA).
- */
-static struct op_result bench_pq_aead_dec(int iterations)
+static struct sck_op_result sck_bench_pq_aead_dec(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-	uint8_t key[PQ_AEAD_KEY_LEN], iv[PQ_AEAD_NONCE_LEN];
-	uint8_t pt[32], ct[32 + PQ_AEAD_TAG_LEN], dec[32];
-	memset(key, 0xBB, sizeof(key));
-	memset(iv, 0xCC, sizeof(iv));
-	memset(pt, 0xAA, sizeof(pt));
-
+	uint8_t key[PQ_AEAD_KEY_LEN], iv[PQ_AEAD_NONCE_LEN], pt[32], ct[32+PQ_AEAD_TAG_LEN], dec[32];
+	memset(key, 0xBB, sizeof(key)); memset(iv, 0xCC, sizeof(iv)); memset(pt, 0xAA, 32);
 	size_t ct_len = 0;
-	if (pq_aead_encrypt(key, iv, NULL, 0, pt, 32, ct, &ct_len) != 0)
-		return res;
-
+	if (pq_aead_encrypt(key, iv, NULL, 0, pt, 32, ct, &ct_len) != 0) return res;
 	for (int i = 0; i < iterations; i++) {
 		size_t dec_len = 0;
-		uint64_t start = get_time_ns();
+		uint64_t start = sck_get_time_ns();
 		int r = pq_aead_decrypt(key, iv, NULL, 0, ct, ct_len, dec, &dec_len);
-		uint64_t end = get_time_ns();
-		if (r == 0) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t end = sck_get_time_ns();
+		if (r == 0) { total_ns += (end - start); res.count++; }
 	}
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark PQ HKDF (Extract + Expand via PSA).
- */
-static struct op_result bench_pq_hkdf(int iterations)
+static struct sck_op_result sck_bench_pq_hkdf(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
 	uint8_t salt[32], ikm[32], prk[32], info[16], okm[32];
-	memset(salt, 0x11, sizeof(salt));
-	memset(ikm, 0x22, sizeof(ikm));
-	memset(info, 0x33, sizeof(info));
-
+	memset(salt, 0x11, 32); memset(ikm, 0x22, 32); memset(info, 0x33, 16);
 	for (int i = 0; i < iterations; i++) {
-		uint64_t start = get_time_ns();
+		uint64_t start = sck_get_time_ns();
 		int r = pq_hkdf_extract(salt, 32, ikm, 32, prk);
-		if (r == 0)
-			r = pq_hkdf_expand(prk, info, 16, okm, 32);
-		uint64_t end = get_time_ns();
-		if (r == 0) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		if (r == 0) r = pq_hkdf_expand(prk, info, 16, okm, 32);
+		uint64_t end = sck_get_time_ns();
+		if (r == 0) { total_ns += (end - start); res.count++; }
 	}
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark PQ Hash (SHA-256 via PSA).
- */
-static struct op_result bench_pq_hash(int iterations)
+static struct sck_op_result sck_bench_pq_hash(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-	uint8_t msg[128], out[32];
-	memset(msg, 0x55, sizeof(msg));
-
+	uint8_t msg[128], out[32]; memset(msg, 0x55, 128);
 	for (int i = 0; i < iterations; i++) {
-		uint64_t start = get_time_ns();
+		uint64_t start = sck_get_time_ns();
 		int r = pq_hash_sha256(msg, 128, out);
-		uint64_t end = get_time_ns();
-		if (r == 0) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t end = sck_get_time_ns();
+		if (r == 0) { total_ns += (end - start); res.count++; }
 	}
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark ML-DSA-65 Sign.
- */
-static struct op_result bench_pq_sig_sign(int iterations)
+static struct sck_op_result sck_bench_pq_sig_sign(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-	uint8_t pk[PQ_SIG_PK_LEN], sk[PQ_SIG_SK_LEN];
-	uint8_t sig[PQ_SIG_MAX_LEN];
-	uint8_t msg[64];
-	memset(msg, 0xAA, sizeof(msg));
-
-	if (pq_sig_keygen(pk, sk) != 0)
-		return res;
-
+	uint8_t pk[PQ_SIG_PK_LEN], sk[PQ_SIG_SK_LEN], sig[PQ_SIG_MAX_LEN], msg[64];
+	memset(msg, 0xAA, 64);
+	if (pq_sig_keygen(pk, sk) != 0) return res;
 	for (int i = 0; i < iterations; i++) {
 		size_t sig_len = 0;
-		uint64_t start = get_time_ns();
-		int r = pq_sig_sign(msg, sizeof(msg), sk, sig, &sig_len);
-		uint64_t end = get_time_ns();
-		if (r == 0) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t start = sck_get_time_ns();
+		int r = pq_sig_sign(msg, 64, sk, sig, &sig_len);
+		uint64_t end = sck_get_time_ns();
+		if (r == 0) { total_ns += (end - start); res.count++; }
 	}
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
-/**
- * @brief Benchmark ML-DSA-65 Verify.
- */
-static struct op_result bench_pq_sig_verify(int iterations)
+static struct sck_op_result sck_bench_pq_sig_verify(int iterations)
 {
-	struct op_result res = {0};
+	struct sck_op_result res = {0};
 	uint64_t total_ns = 0;
-	uint8_t pk[PQ_SIG_PK_LEN], sk[PQ_SIG_SK_LEN];
-	uint8_t sig[PQ_SIG_MAX_LEN];
+	uint8_t pk[PQ_SIG_PK_LEN], sk[PQ_SIG_SK_LEN], sig[PQ_SIG_MAX_LEN], msg[64];
 	size_t sig_len = 0;
-	uint8_t msg[64];
-	memset(msg, 0xAA, sizeof(msg));
-
-	if (pq_sig_keygen(pk, sk) != 0)
-		return res;
-	if (pq_sig_sign(msg, sizeof(msg), sk, sig, &sig_len) != 0)
-		return res;
-
+	memset(msg, 0xAA, 64);
+	if (pq_sig_keygen(pk, sk) != 0) return res;
+	if (pq_sig_sign(msg, 64, sk, sig, &sig_len) != 0) return res;
 	for (int i = 0; i < iterations; i++) {
-		uint64_t start = get_time_ns();
-		int r = pq_sig_verify(msg, sizeof(msg), sig, sig_len, pk);
-		uint64_t end = get_time_ns();
-		if (r == 0) {
-			total_ns += (end - start);
-			res.count++;
-		}
+		uint64_t start = sck_get_time_ns();
+		int r = pq_sig_verify(msg, 64, sig, sig_len, pk);
+		uint64_t end = sck_get_time_ns();
+		if (r == 0) { total_ns += (end - start); res.count++; }
 	}
-	if (res.count > 0)
-		res.avg_us = (double)total_ns / (double)res.count / 1000.0;
+	if (res.count > 0) res.avg_us = (double)total_ns / (double)res.count / 1000.0;
 	return res;
 }
 
 /* =============================================================================
- * 1. OPERATIONS BENCHMARK — Mapping ke alur EDHOC yang benar
+ * Shared primitive timing cache — each operation benchmarked exactly once
  * =============================================================================
  */
+struct sck_prim_cache {
+	/* Classic */
+	struct sck_op_result keygen;      /* X25519 keygen */
+	struct sck_op_result encap;       /* AEAD encrypt (classic) */
+	struct sck_op_result decap;       /* AEAD decrypt (classic) */
+	struct sck_op_result signature;   /* Ed25519 sign */
+	struct sck_op_result verification;/* Ed25519 verify */
+	struct sck_op_result ecdh;        /* X25519 shared secret */
+	struct sck_op_result hkdf;        /* SHA-256 HKDF extract+expand */
+	struct sck_op_result hash;        /* SHA-256 hash */
+	/* PQ */
+	struct sck_op_result pq_keygen;
+	struct sck_op_result pq_encaps;
+	struct sck_op_result pq_decaps;
+	struct sck_op_result pq_sig_sign;
+	struct sck_op_result pq_sig_verify;
+	struct sck_op_result pq_aead_enc;
+	struct sck_op_result pq_aead_dec;
+	struct sck_op_result pq_hkdf;
+	struct sck_op_result pq_hash;
+};
 
-/**
- * @brief Menjalankan benchmark untuk satu kombinasi (type, role).
- *
- * Setiap operasi dijalankan BENCH_ITERATIONS kali untuk rata-rata.
- * Field 'calls' diisi sesuai jumlah pemanggilan aktual per handshake.
- */
-static void bench_operations_for_role(int type_num, bool is_initiator,
-				      struct ops_benchmark *ops)
+static void sck_bench_all_primitives(struct sck_prim_cache *c)
 {
-	/* KeyGen: 1× X25519 ephemeral per handshake.
-	 * Kunci long-term TIDAK di-generate per handshake. */
-	ops->keygen = bench_keygen_x25519(BENCH_ITERATIONS);
-	ops->keygen.calls = 1;
+	const int N = SOCK_BENCH_ITERATIONS;
+	const int W = 20; /* warmup iterations — prime caches, results discarded */
 
-	/* AEAD Encrypt:
-	 * CT2 = XOR (bukan AEAD), CT3 = AEAD.
-	 * Initiator: encrypt CT3 → 1×, Responder: encrypt CT2 → XOR → 0× */
-	ops->encap = bench_encap(BENCH_ITERATIONS);
-	ops->encap.calls = is_initiator ? 1 : 0;
+	/* Warmup pass */
+	(void)sck_bench_keygen_x25519(W);
+	(void)sck_bench_encap(W);
+	(void)sck_bench_decap(W);
+	(void)sck_bench_signature(W);
+	(void)sck_bench_verification(W);
+	(void)sck_bench_ecdh(W);
+	(void)sck_bench_hkdf(W);
+	(void)sck_bench_hash(W);
+	(void)sck_bench_pq_keygen(W);
+	(void)sck_bench_pq_encaps(W);
+	(void)sck_bench_pq_decaps(W);
+	(void)sck_bench_pq_sig_sign(W);
+	(void)sck_bench_pq_sig_verify(W);
+	(void)sck_bench_pq_aead_enc(W);
+	(void)sck_bench_pq_aead_dec(W);
+	(void)sck_bench_pq_hkdf(W);
+	(void)sck_bench_pq_hash(W);
 
-	/* AEAD Decrypt:
-	 * Initiator: decrypt CT2 → XOR → 0×, Responder: decrypt CT3 → 1× */
-	ops->decap = bench_decap(BENCH_ITERATIONS);
-	ops->decap.calls = is_initiator ? 0 : 1;
-
-	/* EdDSA Signature — hanya Type 0, 1× per role */
-	if (type_num == 0) {
-		ops->signature = bench_signature(BENCH_ITERATIONS);
-		ops->signature.calls = 1;
-	} else {
-		ops->signature.avg_us = 0;
-		ops->signature.count = 0;
-		ops->signature.calls = 0;
-	}
-
-	/* EdDSA Verification — hanya Type 0, 1× per role */
-	if (type_num == 0) {
-		ops->verification = bench_verification(BENCH_ITERATIONS);
-		ops->verification.calls = 1;
-	} else {
-		ops->verification.avg_us = 0;
-		ops->verification.count = 0;
-		ops->verification.calls = 0;
-	}
-
-	/* ECDH: Type 0 = 1×, Type 3 = 3× */
-	ops->ecdh = bench_ecdh(BENCH_ITERATIONS);
-	ops->ecdh.calls = (type_num == 0) ? 1 : 3;
-
-	/* HKDF: Type 0 ≈ 8, Type 3 ≈ 10 */
-	ops->hkdf = bench_hkdf(BENCH_ITERATIONS);
-	ops->hkdf.calls = (type_num == 0) ? 8 : 10;
-
-	/* Hash: ~4× per role */
-	ops->hash = bench_hash(BENCH_ITERATIONS);
-	ops->hash.calls = 4;
+	/* Measurement pass */
+	/* Classic */
+	c->keygen       = sck_bench_keygen_x25519(N);
+	c->encap        = sck_bench_encap(N);
+	c->decap        = sck_bench_decap(N);
+	c->signature    = sck_bench_signature(N);
+	c->verification = sck_bench_verification(N);
+	c->ecdh         = sck_bench_ecdh(N);
+	c->hkdf         = sck_bench_hkdf(N);
+	c->hash         = sck_bench_hash(N);
+	/* PQ */
+	c->pq_keygen     = sck_bench_pq_keygen(N);
+	c->pq_encaps     = sck_bench_pq_encaps(N);
+	c->pq_decaps     = sck_bench_pq_decaps(N);
+	c->pq_sig_sign   = sck_bench_pq_sig_sign(N);
+	c->pq_sig_verify = sck_bench_pq_sig_verify(N);
+	c->pq_aead_enc   = sck_bench_pq_aead_enc(N);
+	c->pq_aead_dec   = sck_bench_pq_aead_dec(N);
+	c->pq_hkdf       = sck_bench_pq_hkdf(N);
+	c->pq_hash       = sck_bench_pq_hash(N);
 }
 
-static void bench_all_operations(const char *type_name, int type_num,
-				 struct ops_benchmark *initiator_ops,
-				 struct ops_benchmark *responder_ops)
+/* Helper: copy timing from cache, set calls count */
+static struct sck_op_result sck_op(const struct sck_op_result *src, int calls)
 {
-	char buf[128];
-	snprintf(buf, sizeof(buf), "Running operations benchmark for %s...",
-		 type_name);
-	print_info(buf);
-
-	bench_operations_for_role(type_num, true,  initiator_ops);
-	bench_operations_for_role(type_num, false, responder_ops);
-
-	print_success("Operations benchmark completed.");
+	struct sck_op_result r = *src;
+	r.calls = calls;
+	return r;
 }
 
-/**
- * @brief Menjalankan benchmark PQ operations untuk satu (pq_type, role).
- *
- * PQ variants menggunakan ML-KEM-768 untuk KEM, ML-DSA-65 untuk signatures
- * (Type 0 PQ only), dan PSA untuk symmetric.
- *
- * Jumlah operasi PQ per role:
- *
- * Type 0 PQ (SigSig — KEM key exchange + ML-DSA-65 authentication):
- *   Initiator: KEM.KeyGen=1(eph), Encaps=1, Decaps=1, SigSign=1, SigVerify=1,
- *              AEAD_Enc=2, AEAD_Dec=1, HKDF=8, Hash=3
- *   Responder: KEM.KeyGen=1(lt),  Encaps=1, Decaps=1, SigSign=1, SigVerify=1,
- *              AEAD_Enc=1, AEAD_Dec=2, HKDF=8, Hash=3
- *
- * Type 3 PQ (MACMAC — KEM-based implicit authentication, no signatures):
- *   Initiator: KEM.KeyGen=1(eph), Encaps=1, Decaps=2, AEAD_Enc=2, AEAD_Dec=1, HKDF=8, Hash=3
- *   Responder: KEM.KeyGen=1(lt),  Encaps=2, Decaps=1, AEAD_Enc=1, AEAD_Dec=2, HKDF=8, Hash=3
- *
- * Both roles need exactly 1 KEM.KeyGen as precomputation:
- *   - Initiator: generates ephemeral KEM keypair (pk_eph, sk_eph)
- *   - Responder: generates long-term KEM keypair (pkR, skR)
- */
-static void bench_pq_operations_for_role(int pq_type_num, bool is_initiator,
-					 struct ops_benchmark *ops)
+static struct sck_op_result sck_op_zero(void)
 {
-	/* PQ KEM KeyGen: 1× per role as precomputation.
-	 * Initiator: ephemeral keypair; Responder: long-term keypair. */
-	ops->pq_keygen = bench_pq_keygen(BENCH_ITERATIONS);
-	ops->pq_keygen.calls = 1;
-
-	/* PQ KEM Encaps:
-	 * Type 0 PQ: 1× for both (key exchange only, no KEM auth)
-	 * Type 3 PQ: Initiator 1×, Responder 2× (key exchange + auth) */
-	ops->pq_encaps = bench_pq_encaps(BENCH_ITERATIONS);
-	if (pq_type_num == 0)
-		ops->pq_encaps.calls = 1;
-	else
-		ops->pq_encaps.calls = is_initiator ? 1 : 2;
-
-	/* PQ KEM Decaps:
-	 * Type 0 PQ: 1× for both (key exchange only, no KEM auth)
-	 * Type 3 PQ: Initiator 2×, Responder 1× (key exchange + auth) */
-	ops->pq_decaps = bench_pq_decaps(BENCH_ITERATIONS);
-	if (pq_type_num == 0)
-		ops->pq_decaps.calls = 1;
-	else
-		ops->pq_decaps.calls = is_initiator ? 2 : 1;
-
-	/* PQ Signature Sign (ML-DSA-65) — Type 0 PQ only, 1× per role */
-	if (pq_type_num == 0) {
-		ops->pq_sig_sign = bench_pq_sig_sign(BENCH_ITERATIONS);
-		ops->pq_sig_sign.calls = 1;
-	} else {
-		ops->pq_sig_sign.avg_us = 0;
-		ops->pq_sig_sign.count = 0;
-		ops->pq_sig_sign.calls = 0;
-	}
-
-	/* PQ Signature Verify (ML-DSA-65) — Type 0 PQ only, 1× per role */
-	if (pq_type_num == 0) {
-		ops->pq_sig_verify = bench_pq_sig_verify(BENCH_ITERATIONS);
-		ops->pq_sig_verify.calls = 1;
-	} else {
-		ops->pq_sig_verify.avg_us = 0;
-		ops->pq_sig_verify.count = 0;
-		ops->pq_sig_verify.calls = 0;
-	}
-
-	/* PQ AEAD Encrypt */
-	ops->pq_aead_enc = bench_pq_aead_enc(BENCH_ITERATIONS);
-	ops->pq_aead_enc.calls = is_initiator ? 2 : 1;
-
-	/* PQ AEAD Decrypt */
-	ops->pq_aead_dec = bench_pq_aead_dec(BENCH_ITERATIONS);
-	ops->pq_aead_dec.calls = is_initiator ? 1 : 2;
-
-	/* PQ HKDF (Extract + Expand) ≈ 8 calls per role */
-	ops->pq_hkdf = bench_pq_hkdf(BENCH_ITERATIONS);
-	ops->pq_hkdf.calls = 8;
-
-	/* PQ Hash (SHA-256) ≈ 3 calls per role (TH2, TH3, TH4) */
-	ops->pq_hash = bench_pq_hash(BENCH_ITERATIONS);
-	ops->pq_hash.calls = 3;
-
-	/* Zero out classic fields for PQ variants */
-	memset(&ops->keygen, 0, sizeof(ops->keygen));
-	memset(&ops->encap, 0, sizeof(ops->encap));
-	memset(&ops->decap, 0, sizeof(ops->decap));
-	memset(&ops->signature, 0, sizeof(ops->signature));
-	memset(&ops->verification, 0, sizeof(ops->verification));
-	memset(&ops->ecdh, 0, sizeof(ops->ecdh));
-	memset(&ops->hkdf, 0, sizeof(ops->hkdf));
-	memset(&ops->hash, 0, sizeof(ops->hash));
-}
-
-static void bench_pq_all_operations(const char *type_name, int pq_type_num,
-				    struct ops_benchmark *initiator_ops,
-				    struct ops_benchmark *responder_ops)
-{
-	char buf[128];
-	snprintf(buf, sizeof(buf), "Running PQ operations benchmark for %s...",
-		 type_name);
-	print_info(buf);
-
-	bench_pq_operations_for_role(pq_type_num, true,  initiator_ops);
-	bench_pq_operations_for_role(pq_type_num, false, responder_ops);
-
-	print_success("PQ operations benchmark completed.");
+	return (struct sck_op_result){0};
 }
 
 /* =============================================================================
- * Helpers: Compute crypto cost from operations benchmark (sum of ops × calls)
- *
- * This ensures processing_us (handshake CSV) and cpu_time_us (overhead CSV)
- * are DERIVED from the same operations data as benchmark_operations.csv,
- * guaranteeing cross-table consistency.
+ * Operations benchmark assembly (same call counts as edhoc_benchmark.c)
  * =============================================================================
  */
 
-static double compute_classic_ops_total(const struct ops_benchmark *ops)
+static void sck_assemble_classic_ops(const struct sck_prim_cache *c,
+				     int type_num, bool is_initiator,
+				     struct sck_ops_benchmark *ops)
 {
-	#define COST(OP) ((OP).avg_us * (double)(OP).calls)
-	double total = COST(ops->keygen) + COST(ops->encap) +
-		       COST(ops->decap) + COST(ops->signature) +
-		       COST(ops->verification) + COST(ops->ecdh) +
-		       COST(ops->hkdf) + COST(ops->hash);
-	#undef COST
-	return total;
+	ops->keygen       = sck_op(&c->keygen, 1);
+	ops->encap        = sck_op(&c->encap,  is_initiator ? 1 : 0);
+	ops->decap        = sck_op(&c->decap,  is_initiator ? 0 : 1);
+	if (type_num == 0) {
+		ops->signature    = sck_op(&c->signature, 1);
+		ops->verification = sck_op(&c->verification, 1);
+	} else {
+		ops->signature    = sck_op_zero();
+		ops->verification = sck_op_zero();
+	}
+	ops->ecdh = sck_op(&c->ecdh, (type_num == 0) ? 1 : 3);
+	ops->hkdf = sck_op(&c->hkdf, (type_num == 0) ? 8 : 10);
+	ops->hash = sck_op(&c->hash, 4);
+	/* Zero PQ fields */
+	memset(&ops->pq_keygen, 0, sizeof(struct sck_op_result) * 9);
 }
 
-static double compute_pq_ops_total(const struct ops_benchmark *ops)
+static void sck_assemble_pq_ops(const struct sck_prim_cache *c,
+				int pq_type_num, bool is_initiator,
+				struct sck_ops_benchmark *ops)
 {
-	#define COST(OP) ((OP).avg_us * (double)(OP).calls)
-	double total = COST(ops->pq_keygen) + COST(ops->pq_encaps) +
-		       COST(ops->pq_decaps) + COST(ops->pq_sig_sign) +
-		       COST(ops->pq_sig_verify) + COST(ops->pq_aead_enc) +
-		       COST(ops->pq_aead_dec) + COST(ops->pq_hkdf) +
-		       COST(ops->pq_hash);
-	#undef COST
-	return total;
+	ops->pq_keygen = sck_op(&c->pq_keygen, 1);
+	ops->pq_encaps = sck_op(&c->pq_encaps,
+		(pq_type_num == 0) ? 1 : (is_initiator ? 1 : 2));
+	ops->pq_decaps = sck_op(&c->pq_decaps,
+		(pq_type_num == 0) ? 1 : (is_initiator ? 2 : 1));
+	if (pq_type_num == 0) {
+		ops->pq_sig_sign   = sck_op(&c->pq_sig_sign, 1);
+		ops->pq_sig_verify = sck_op(&c->pq_sig_verify, 1);
+	} else {
+		ops->pq_sig_sign   = sck_op_zero();
+		ops->pq_sig_verify = sck_op_zero();
+	}
+	ops->pq_aead_enc = sck_op(&c->pq_aead_enc, is_initiator ? 2 : 1);
+	ops->pq_aead_dec = sck_op(&c->pq_aead_dec, is_initiator ? 1 : 2);
+	ops->pq_hkdf     = sck_op(&c->pq_hkdf, 8);
+	ops->pq_hash     = sck_op(&c->pq_hash, 3);
+	/* Zero classic fields */
+	memset(&ops->keygen, 0, sizeof(struct sck_op_result) * 8);
 }
 
-/**
- * @brief Calibrate Classic ops using measured thread CPU time.
- *
- * Isolated microbenchmarks overestimate in-situ cost by ~18-32% due to
- * cold cache, pipeline effects, and per-iteration overhead. We apply a
- * calibration factor (measured_cpu / isolated_sum) to scale each operation's
- * avg_us so that sum(avg_us × calls) == measured_cpu exactly.
- *
- * This preserves the RELATIVE cost ratio between operations while matching
- * the absolute total to the real measured value. The calibration factor is
- * always < 1.0 for Classic (isolation overhead) and ≈ 1.0 for PQ (fast ops).
- */
-static void calibrate_classic_ops(struct ops_benchmark *ops,
-				  double measured_cpu_us)
+static void sck_assemble_hybrid_ops(const struct sck_prim_cache *c,
+				    bool is_initiator,
+				    struct sck_ops_benchmark *ops)
 {
-	double isolated_sum = compute_classic_ops_total(ops);
-	if (isolated_sum <= 0) return;
-
-	double factor = measured_cpu_us / isolated_sum;
-
-	ops->keygen.avg_us       *= factor;
-	ops->encap.avg_us        *= factor;
-	ops->decap.avg_us        *= factor;
-	ops->signature.avg_us    *= factor;
-	ops->verification.avg_us *= factor;
-	ops->ecdh.avg_us         *= factor;
-	ops->hkdf.avg_us         *= factor;
-	ops->hash.avg_us         *= factor;
-}
-
-/**
- * @brief Calibrate PQ ops using measured thread CPU time.
- *
- * Same approach as calibrate_classic_ops() — scales each PQ operation's
- * avg_us so that sum(avg_us × calls) == measured_cpu exactly.
- */
-static void calibrate_pq_ops(struct ops_benchmark *ops,
-			     double measured_cpu_us)
-{
-	double isolated_sum = compute_pq_ops_total(ops);
-	if (isolated_sum <= 0) return;
-
-	double factor = measured_cpu_us / isolated_sum;
-
-	ops->pq_keygen.avg_us     *= factor;
-	ops->pq_encaps.avg_us     *= factor;
-	ops->pq_decaps.avg_us     *= factor;
-	ops->pq_sig_sign.avg_us   *= factor;
-	ops->pq_sig_verify.avg_us *= factor;
-	ops->pq_aead_enc.avg_us   *= factor;
-	ops->pq_aead_dec.avg_us   *= factor;
-	ops->pq_hkdf.avg_us       *= factor;
-	ops->pq_hash.avg_us       *= factor;
+	ops->keygen       = sck_op(&c->keygen, 1);
+	ops->encap        = sck_op(&c->encap, 1);
+	ops->decap        = sck_op(&c->decap, 1);
+	ops->signature    = sck_op_zero();
+	ops->verification = sck_op_zero();
+	ops->ecdh         = sck_op(&c->ecdh, 2);
+	ops->hkdf         = sck_op(&c->hkdf, 10);
+	ops->hash         = sck_op(&c->hash, 3);
+	ops->pq_keygen    = sck_op(&c->pq_keygen, is_initiator ? 1 : 0);
+	ops->pq_encaps    = sck_op(&c->pq_encaps, is_initiator ? 0 : 1);
+	ops->pq_decaps    = sck_op(&c->pq_decaps, is_initiator ? 1 : 0);
+	ops->pq_sig_sign  = sck_op_zero();
+	ops->pq_sig_verify = sck_op_zero();
+	ops->pq_aead_enc  = sck_op_zero();
+	ops->pq_aead_dec  = sck_op_zero();
+	ops->pq_hkdf      = sck_op_zero();
+	ops->pq_hash      = sck_op_zero();
 }
 
 /* =============================================================================
- * 2. OVERHEAD & 3. HANDSHAKE BENCHMARK
+ * Compute / Calibrate helpers
  * =============================================================================
  */
 
-struct bench_thread_data {
+#define SCOST(OP) ((OP).avg_us * (double)(OP).calls)
+
+/* Memory estimation (same as edhoc_benchmark.c) */
+static long sck_estimate_classic_memory(int type_num)
+{
+	return 1116 + 1536 + 640 + 256 + 128 + 256 +
+	       ((type_num == 0) ? 512 : 0) + 384 + 512 + 256;
+}
+
+static long sck_estimate_pq_memory(int pq_type_num)
+{
+	long base = 2*(PQ_KEM_PK_LEN+PQ_KEM_SK_LEN) + 3*PQ_KEM_CT_LEN +
+		    3*PQ_KEM_SS_LEN + 4*PQ_PRK_LEN + 4*PQ_HASH_LEN +
+		    3*8192 + 1024 + 4096 + 512 + 512;
+	if (pq_type_num == 0)
+		base += 2*(PQ_SIG_PK_LEN+PQ_SIG_SK_LEN) + PQ_SIG_MAX_LEN + 4096;
+	return base;
+}
+
+static long sck_estimate_hybrid_memory(void)
+{
+	return sck_estimate_classic_memory(3) + PQ_KEM_PK_LEN + PQ_KEM_SK_LEN +
+	       PQ_KEM_CT_LEN + PQ_KEM_SS_LEN + 3*8192 + 4096;
+}
+
+/* =============================================================================
+ * Socket-based Classic Handshake (Type 0 / Type 3)
+ *
+ * Classic variants use the uoscore-uedhoc library's edhoc_initiator_run /
+ * edhoc_responder_run which take tx/rx callback function pointers.
+ * We provide socket-based tx/rx callbacks here.
+ * =============================================================================
+ */
+
+/* Per-thread socket fd and txrx accumulator */
+static __thread int tl_sock_fd = -1;
+static __thread uint64_t tl_sock_txrx_ns = 0;
+
+/* Classic Initiator tx: send data over socket (Initiator → Responder) */
+static enum err sock_tx_initiator(void *sock, struct byte_array *data)
+{
+	uint64_t start = sck_get_time_ns();
+	int r = sock_send_msg(tl_sock_fd, data->ptr, data->len);
+	uint64_t end = sck_get_time_ns();
+	tl_sock_txrx_ns += (end - start);
+	return (r == 0) ? ok : buffer_to_small;
+}
+
+/* Classic Initiator rx: receive data from socket */
+static enum err sock_rx_initiator(void *sock, struct byte_array *data)
+{
+	uint64_t start = sck_get_time_ns();
+	uint32_t recv_len = 0;
+	int r = sock_recv_msg(tl_sock_fd, data->ptr, data->len, &recv_len);
+	uint64_t end = sck_get_time_ns();
+	tl_sock_txrx_ns += (end - start);
+	if (r != 0) return buffer_to_small;
+	data->len = recv_len;
+	return ok;
+}
+
+/* Classic Responder tx: send data over socket */
+static enum err sock_tx_responder(void *sock, struct byte_array *data)
+{
+	uint64_t start = sck_get_time_ns();
+	int r = sock_send_msg(tl_sock_fd, data->ptr, data->len);
+	uint64_t end = sck_get_time_ns();
+	tl_sock_txrx_ns += (end - start);
+	return (r == 0) ? ok : buffer_to_small;
+}
+
+/* Classic Responder rx: receive data from socket */
+static enum err sock_rx_responder(void *sock, struct byte_array *data)
+{
+	uint64_t start = sck_get_time_ns();
+	uint32_t recv_len = 0;
+	int r = sock_recv_msg(tl_sock_fd, data->ptr, data->len, &recv_len);
+	uint64_t end = sck_get_time_ns();
+	tl_sock_txrx_ns += (end - start);
+	if (r != 0) return buffer_to_small;
+	data->len = recv_len;
+	return ok;
+}
+
+/* Thread data for classic handshake benchmark */
+struct sck_classic_thread_data {
+	int type_num;
+	int port;         /* TCP port */
 	enum err error;
 	uint8_t prk_out_buf[32];
 	struct byte_array prk_out;
-	uint64_t cpu_start_ns;
-	uint64_t cpu_end_ns;
-	uint64_t wall_start_ns;
-	uint64_t wall_end_ns;
+	uint64_t cpu_start_ns, cpu_end_ns;
+	uint64_t wall_start_ns, wall_end_ns;
+	uint64_t txrx_ns;
 };
 
-static __thread uint64_t tl_txrx_ns = 0;
-
-/* Instrumented transport callbacks */
-static enum err tx_initiator_bench(void *sock, struct byte_array *data)
+/* Classic Initiator thread (client: connects to Responder) */
+static void *sck_classic_initiator_thread(void *arg)
 {
-	uint64_t start = get_time_ns();
-	enum err r = tx_initiator(sock, data);
-	uint64_t end = get_time_ns();
-	tl_txrx_ns += (end - start);
-	return r;
-}
-
-static enum err rx_initiator_bench(void *sock, struct byte_array *data)
-{
-	uint64_t start = get_time_ns();
-	enum err r = rx_initiator(sock, data);
-	uint64_t end = get_time_ns();
-	tl_txrx_ns += (end - start);
-	return r;
-}
-
-static enum err tx_responder_bench(void *sock, struct byte_array *data)
-{
-	uint64_t start = get_time_ns();
-	enum err r = tx_responder(sock, data);
-	uint64_t end = get_time_ns();
-	tl_txrx_ns += (end - start);
-	return r;
-}
-
-static enum err rx_responder_bench(void *sock, struct byte_array *data)
-{
-	uint64_t start = get_time_ns();
-	enum err r = rx_responder(sock, data);
-	uint64_t end = get_time_ns();
-	tl_txrx_ns += (end - start);
-	return r;
-}
-
-/* =============================================================================
- * Type 0 Handshake Benchmark Threads
- * =============================================================================
- */
-
-static void *bench_type0_initiator_thread(void *arg)
-{
-	struct bench_thread_data *data = (struct bench_thread_data *)arg;
-	data->prk_out.ptr = data->prk_out_buf;
-	data->prk_out.len = sizeof(data->prk_out_buf);
+	struct sck_classic_thread_data *d = (struct sck_classic_thread_data *)arg;
+	d->prk_out.ptr = d->prk_out_buf;
+	d->prk_out.len = sizeof(d->prk_out_buf);
 
 	uint8_t err_msg_buf[64];
-	struct byte_array err_msg = { .ptr = err_msg_buf, .len = sizeof(err_msg_buf) };
+	struct byte_array err_msg = {.ptr = err_msg_buf, .len = sizeof(err_msg_buf)};
 
-	struct edhoc_initiator_context c_i;
-	memset(&c_i, 0, sizeof(c_i));
-	c_i.sock = NULL;
-	c_i.method = (enum method_type)T1_RFC9529__METHOD;
-	c_i.c_i.len = T1_RFC9529__C_I_LEN;
-	c_i.c_i.ptr = (uint8_t *)T1_RFC9529__C_I;
-	c_i.suites_i.len = T1_RFC9529__SUITES_I_LEN;
-	c_i.suites_i.ptr = (uint8_t *)T1_RFC9529__SUITES_I;
-	c_i.ead_1.len = 0; c_i.ead_1.ptr = NULL;
-	c_i.ead_3.len = 0; c_i.ead_3.ptr = NULL;
-	c_i.id_cred_i.len = T1_RFC9529__ID_CRED_I_LEN;
-	c_i.id_cred_i.ptr = (uint8_t *)T1_RFC9529__ID_CRED_I;
-	c_i.cred_i.len = T1_RFC9529__CRED_I_LEN;
-	c_i.cred_i.ptr = (uint8_t *)T1_RFC9529__CRED_I;
-	c_i.g_x.len = T1_RFC9529__G_X_LEN;
-	c_i.g_x.ptr = (uint8_t *)T1_RFC9529__G_X;
-	c_i.x.len = T1_RFC9529__X_LEN;
-	c_i.x.ptr = (uint8_t *)T1_RFC9529__X;
-	c_i.sk_i.len = T1_RFC9529__SK_I_LEN;
-	c_i.sk_i.ptr = (uint8_t *)T1_RFC9529__SK_I;
-	c_i.pk_i.len = T1_RFC9529__PK_I_LEN;
-	c_i.pk_i.ptr = (uint8_t *)T1_RFC9529__PK_I;
-	c_i.g_i.len = 0; c_i.g_i.ptr = NULL;
-	c_i.i.len = 0;   c_i.i.ptr = NULL;
+	/* Connect to responder (server) */
+	tl_sock_fd = sock_connect_client(d->port);
+	if (tl_sock_fd < 0) { d->error = buffer_to_small; return NULL; }
+	int opt = 1;
+	setsockopt(tl_sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-	struct other_party_cred cred_r;
-	memset(&cred_r, 0, sizeof(cred_r));
-	cred_r.id_cred.len = T1_RFC9529__ID_CRED_R_LEN;
-	cred_r.id_cred.ptr = (uint8_t *)T1_RFC9529__ID_CRED_R;
-	cred_r.cred.len = T1_RFC9529__CRED_R_LEN;
-	cred_r.cred.ptr = (uint8_t *)T1_RFC9529__CRED_R;
-	cred_r.pk.len = T1_RFC9529__PK_R_LEN;
-	cred_r.pk.ptr = (uint8_t *)T1_RFC9529__PK_R;
-	cred_r.g.len = 0; cred_r.g.ptr = NULL;
-	cred_r.ca.len = 0; cred_r.ca.ptr = NULL;
-	cred_r.ca_pk.len = 0; cred_r.ca_pk.ptr = NULL;
-	struct cred_array cred_r_array = { .len = 1, .ptr = &cred_r };
+	tl_sock_txrx_ns = 0;
 
-	tl_txrx_ns = 0;
-	data->cpu_start_ns = get_thread_cpu_ns();
-	data->wall_start_ns = get_time_ns();
+	if (d->type_num == 0) {
+		struct edhoc_initiator_context c_i;
+		memset(&c_i, 0, sizeof(c_i));
+		c_i.sock = NULL;
+		c_i.method = (enum method_type)T1_RFC9529__METHOD;
+		c_i.c_i.len = T1_RFC9529__C_I_LEN; c_i.c_i.ptr = (uint8_t*)T1_RFC9529__C_I;
+		c_i.suites_i.len = T1_RFC9529__SUITES_I_LEN; c_i.suites_i.ptr = (uint8_t*)T1_RFC9529__SUITES_I;
+		c_i.ead_1.len = 0; c_i.ead_1.ptr = NULL;
+		c_i.ead_3.len = 0; c_i.ead_3.ptr = NULL;
+		c_i.id_cred_i.len = T1_RFC9529__ID_CRED_I_LEN; c_i.id_cred_i.ptr = (uint8_t*)T1_RFC9529__ID_CRED_I;
+		c_i.cred_i.len = T1_RFC9529__CRED_I_LEN; c_i.cred_i.ptr = (uint8_t*)T1_RFC9529__CRED_I;
+		c_i.g_x.len = T1_RFC9529__G_X_LEN; c_i.g_x.ptr = (uint8_t*)T1_RFC9529__G_X;
+		c_i.x.len = T1_RFC9529__X_LEN; c_i.x.ptr = (uint8_t*)T1_RFC9529__X;
+		c_i.sk_i.len = T1_RFC9529__SK_I_LEN; c_i.sk_i.ptr = (uint8_t*)T1_RFC9529__SK_I;
+		c_i.pk_i.len = T1_RFC9529__PK_I_LEN; c_i.pk_i.ptr = (uint8_t*)T1_RFC9529__PK_I;
+		c_i.g_i.len = 0; c_i.g_i.ptr = NULL;
+		c_i.i.len = 0; c_i.i.ptr = NULL;
+		struct other_party_cred cred_r;
+		memset(&cred_r, 0, sizeof(cred_r));
+		cred_r.id_cred.len = T1_RFC9529__ID_CRED_R_LEN; cred_r.id_cred.ptr = (uint8_t*)T1_RFC9529__ID_CRED_R;
+		cred_r.cred.len = T1_RFC9529__CRED_R_LEN; cred_r.cred.ptr = (uint8_t*)T1_RFC9529__CRED_R;
+		cred_r.pk.len = T1_RFC9529__PK_R_LEN; cred_r.pk.ptr = (uint8_t*)T1_RFC9529__PK_R;
+		cred_r.g.len = 0; cred_r.g.ptr = NULL;
+		cred_r.ca.len = 0; cred_r.ca.ptr = NULL; cred_r.ca_pk.len = 0; cred_r.ca_pk.ptr = NULL;
+		struct cred_array ca = {.len = 1, .ptr = &cred_r};
 
-	data->error = edhoc_initiator_run(&c_i, &cred_r_array, &err_msg,
-					  &data->prk_out,
-					  tx_initiator_bench,
-					  rx_initiator_bench,
-					  ead_process);
+		d->cpu_start_ns = sck_get_thread_cpu_ns();
+		d->wall_start_ns = sck_get_time_ns();
+		d->error = edhoc_initiator_run(&c_i, &ca, &err_msg, &d->prk_out,
+					       sock_tx_initiator, sock_rx_initiator, ead_process);
+		d->wall_end_ns = sck_get_time_ns();
+		d->cpu_end_ns = sck_get_thread_cpu_ns();
+	} else {
+		/* Type 3 */
+		struct edhoc_initiator_context c_i;
+		memset(&c_i, 0, sizeof(c_i));
+		c_i.sock = NULL;
+		c_i.method = (enum method_type)T3_X25519_METHOD;
+		c_i.c_i.len = T3_X25519_C_I_LEN; c_i.c_i.ptr = (uint8_t*)T3_X25519_C_I;
+		c_i.suites_i.len = T3_X25519_SUITES_I_LEN; c_i.suites_i.ptr = (uint8_t*)T3_X25519_SUITES_I;
+		c_i.ead_1.len = 0; c_i.ead_1.ptr = NULL;
+		c_i.ead_3.len = 0; c_i.ead_3.ptr = NULL;
+		c_i.id_cred_i.len = T1_RFC9529__ID_CRED_I_LEN; c_i.id_cred_i.ptr = (uint8_t*)T1_RFC9529__ID_CRED_I;
+		c_i.cred_i.len = T1_RFC9529__CRED_I_LEN; c_i.cred_i.ptr = (uint8_t*)T1_RFC9529__CRED_I;
+		c_i.g_x.len = T3_X25519_G_X_LEN; c_i.g_x.ptr = (uint8_t*)T3_X25519_G_X;
+		c_i.x.len = T3_X25519_X_LEN; c_i.x.ptr = (uint8_t*)T3_X25519_X;
+		c_i.g_i.len = T3_X25519_G_I_LEN; c_i.g_i.ptr = (uint8_t*)T3_X25519_G_I;
+		c_i.i.len = T3_X25519_I_LEN; c_i.i.ptr = (uint8_t*)T3_X25519_I;
+		c_i.sk_i.len = 0; c_i.sk_i.ptr = NULL;
+		c_i.pk_i.len = 0; c_i.pk_i.ptr = NULL;
+		struct other_party_cred cred_r;
+		memset(&cred_r, 0, sizeof(cred_r));
+		cred_r.id_cred.len = T1_RFC9529__ID_CRED_R_LEN; cred_r.id_cred.ptr = (uint8_t*)T1_RFC9529__ID_CRED_R;
+		cred_r.cred.len = T1_RFC9529__CRED_R_LEN; cred_r.cred.ptr = (uint8_t*)T1_RFC9529__CRED_R;
+		cred_r.g.len = T3_X25519_G_R_LEN; cred_r.g.ptr = (uint8_t*)T3_X25519_G_R;
+		cred_r.pk.len = 0; cred_r.pk.ptr = NULL;
+		cred_r.ca.len = 0; cred_r.ca.ptr = NULL; cred_r.ca_pk.len = 0; cred_r.ca_pk.ptr = NULL;
+		struct cred_array ca = {.len = 1, .ptr = &cred_r};
 
-	data->wall_end_ns = get_time_ns();
-	data->cpu_end_ns = get_thread_cpu_ns();
-	return (void *)(uintptr_t)tl_txrx_ns;
-}
+		d->cpu_start_ns = sck_get_thread_cpu_ns();
+		d->wall_start_ns = sck_get_time_ns();
+		d->error = edhoc_initiator_run(&c_i, &ca, &err_msg, &d->prk_out,
+					       sock_tx_initiator, sock_rx_initiator, ead_process);
+		d->wall_end_ns = sck_get_time_ns();
+		d->cpu_end_ns = sck_get_thread_cpu_ns();
+	}
 
-static void *bench_type0_responder_thread(void *arg)
-{
-	struct bench_thread_data *data = (struct bench_thread_data *)arg;
-	data->prk_out.ptr = data->prk_out_buf;
-	data->prk_out.len = sizeof(data->prk_out_buf);
-
-	uint8_t err_msg_buf[64];
-	struct byte_array err_msg = { .ptr = err_msg_buf, .len = sizeof(err_msg_buf) };
-
-	struct edhoc_responder_context c_r;
-	memset(&c_r, 0, sizeof(c_r));
-	c_r.sock = NULL;
-	c_r.c_r.len = T1_RFC9529__C_R_LEN;
-	c_r.c_r.ptr = (uint8_t *)T1_RFC9529__C_R;
-	c_r.suites_r.len = T1_RFC9529__SUITES_R_LEN;
-	c_r.suites_r.ptr = (uint8_t *)T1_RFC9529__SUITES_R;
-	c_r.ead_2.len = 0; c_r.ead_2.ptr = NULL;
-	c_r.ead_4.len = 0; c_r.ead_4.ptr = NULL;
-	c_r.id_cred_r.len = T1_RFC9529__ID_CRED_R_LEN;
-	c_r.id_cred_r.ptr = (uint8_t *)T1_RFC9529__ID_CRED_R;
-	c_r.cred_r.len = T1_RFC9529__CRED_R_LEN;
-	c_r.cred_r.ptr = (uint8_t *)T1_RFC9529__CRED_R;
-	c_r.g_y.len = T1_RFC9529__G_Y_LEN;
-	c_r.g_y.ptr = (uint8_t *)T1_RFC9529__G_Y;
-	c_r.y.len = T1_RFC9529__Y_LEN;
-	c_r.y.ptr = (uint8_t *)T1_RFC9529__Y;
-	c_r.sk_r.len = T1_RFC9529__SK_R_LEN;
-	c_r.sk_r.ptr = (uint8_t *)T1_RFC9529__SK_R;
-	c_r.pk_r.len = T1_RFC9529__PK_R_LEN;
-	c_r.pk_r.ptr = (uint8_t *)T1_RFC9529__PK_R;
-	c_r.g_r.len = 0; c_r.g_r.ptr = NULL;
-	c_r.r.len = 0;   c_r.r.ptr = NULL;
-
-	struct other_party_cred cred_i;
-	memset(&cred_i, 0, sizeof(cred_i));
-	cred_i.id_cred.len = T1_RFC9529__ID_CRED_I_LEN;
-	cred_i.id_cred.ptr = (uint8_t *)T1_RFC9529__ID_CRED_I;
-	cred_i.cred.len = T1_RFC9529__CRED_I_LEN;
-	cred_i.cred.ptr = (uint8_t *)T1_RFC9529__CRED_I;
-	cred_i.pk.len = T1_RFC9529__PK_I_LEN;
-	cred_i.pk.ptr = (uint8_t *)T1_RFC9529__PK_I;
-	cred_i.g.len = 0; cred_i.g.ptr = NULL;
-	cred_i.ca.len = 0; cred_i.ca.ptr = NULL;
-	cred_i.ca_pk.len = 0; cred_i.ca_pk.ptr = NULL;
-	struct cred_array cred_i_array = { .len = 1, .ptr = &cred_i };
-
-	tl_txrx_ns = 0;
-	data->cpu_start_ns = get_thread_cpu_ns();
-	data->wall_start_ns = get_time_ns();
-
-	data->error = edhoc_responder_run(&c_r, &cred_i_array, &err_msg,
-					  &data->prk_out,
-					  tx_responder_bench,
-					  rx_responder_bench,
-					  ead_process);
-
-	data->wall_end_ns = get_time_ns();
-	data->cpu_end_ns = get_thread_cpu_ns();
-	return (void *)(uintptr_t)tl_txrx_ns;
-}
-
-/* =============================================================================
- * Type 3 Handshake Benchmark Threads
- * =============================================================================
- */
-
-static void *bench_type3_initiator_thread(void *arg)
-{
-	struct bench_thread_data *data = (struct bench_thread_data *)arg;
-	data->prk_out.ptr = data->prk_out_buf;
-	data->prk_out.len = sizeof(data->prk_out_buf);
-
-	uint8_t err_msg_buf[64];
-	struct byte_array err_msg = { .ptr = err_msg_buf, .len = sizeof(err_msg_buf) };
-
-	struct edhoc_initiator_context c_i;
-	memset(&c_i, 0, sizeof(c_i));
-	c_i.sock = NULL;
-	c_i.method = (enum method_type)T3_X25519_METHOD;
-	c_i.c_i.len = T3_X25519_C_I_LEN;
-	c_i.c_i.ptr = (uint8_t *)T3_X25519_C_I;
-	c_i.suites_i.len = T3_X25519_SUITES_I_LEN;
-	c_i.suites_i.ptr = (uint8_t *)T3_X25519_SUITES_I;
-	c_i.ead_1.len = 0; c_i.ead_1.ptr = NULL;
-	c_i.ead_3.len = 0; c_i.ead_3.ptr = NULL;
-	c_i.id_cred_i.len = T1_RFC9529__ID_CRED_I_LEN;
-	c_i.id_cred_i.ptr = (uint8_t *)T1_RFC9529__ID_CRED_I;
-	c_i.cred_i.len = T1_RFC9529__CRED_I_LEN;
-	c_i.cred_i.ptr = (uint8_t *)T1_RFC9529__CRED_I;
-	c_i.g_x.len = T3_X25519_G_X_LEN;
-	c_i.g_x.ptr = (uint8_t *)T3_X25519_G_X;
-	c_i.x.len = T3_X25519_X_LEN;
-	c_i.x.ptr = (uint8_t *)T3_X25519_X;
-	c_i.g_i.len = T3_X25519_G_I_LEN;
-	c_i.g_i.ptr = (uint8_t *)T3_X25519_G_I;
-	c_i.i.len = T3_X25519_I_LEN;
-	c_i.i.ptr = (uint8_t *)T3_X25519_I;
-	c_i.sk_i.len = 0; c_i.sk_i.ptr = NULL;
-	c_i.pk_i.len = 0; c_i.pk_i.ptr = NULL;
-
-	struct other_party_cred cred_r;
-	memset(&cred_r, 0, sizeof(cred_r));
-	cred_r.id_cred.len = T1_RFC9529__ID_CRED_R_LEN;
-	cred_r.id_cred.ptr = (uint8_t *)T1_RFC9529__ID_CRED_R;
-	cred_r.cred.len = T1_RFC9529__CRED_R_LEN;
-	cred_r.cred.ptr = (uint8_t *)T1_RFC9529__CRED_R;
-	cred_r.g.len = T3_X25519_G_R_LEN;
-	cred_r.g.ptr = (uint8_t *)T3_X25519_G_R;
-	cred_r.pk.len = 0; cred_r.pk.ptr = NULL;
-	cred_r.ca.len = 0; cred_r.ca.ptr = NULL;
-	cred_r.ca_pk.len = 0; cred_r.ca_pk.ptr = NULL;
-	struct cred_array cred_r_array = { .len = 1, .ptr = &cred_r };
-
-	tl_txrx_ns = 0;
-	data->cpu_start_ns = get_thread_cpu_ns();
-	data->wall_start_ns = get_time_ns();
-
-	data->error = edhoc_initiator_run(&c_i, &cred_r_array, &err_msg,
-					  &data->prk_out,
-					  tx_initiator_bench,
-					  rx_initiator_bench,
-					  ead_process);
-
-	data->wall_end_ns = get_time_ns();
-	data->cpu_end_ns = get_thread_cpu_ns();
-	return (void *)(uintptr_t)tl_txrx_ns;
-}
-
-static void *bench_type3_responder_thread(void *arg)
-{
-	struct bench_thread_data *data = (struct bench_thread_data *)arg;
-	data->prk_out.ptr = data->prk_out_buf;
-	data->prk_out.len = sizeof(data->prk_out_buf);
-
-	uint8_t err_msg_buf[64];
-	struct byte_array err_msg = { .ptr = err_msg_buf, .len = sizeof(err_msg_buf) };
-
-	struct edhoc_responder_context c_r;
-	memset(&c_r, 0, sizeof(c_r));
-	c_r.sock = NULL;
-	c_r.c_r.len = T3_X25519_C_R_LEN;
-	c_r.c_r.ptr = (uint8_t *)T3_X25519_C_R;
-	c_r.suites_r.len = T3_X25519_SUITES_R_LEN;
-	c_r.suites_r.ptr = (uint8_t *)T3_X25519_SUITES_R;
-	c_r.ead_2.len = 0; c_r.ead_2.ptr = NULL;
-	c_r.ead_4.len = 0; c_r.ead_4.ptr = NULL;
-	c_r.id_cred_r.len = T1_RFC9529__ID_CRED_R_LEN;
-	c_r.id_cred_r.ptr = (uint8_t *)T1_RFC9529__ID_CRED_R;
-	c_r.cred_r.len = T1_RFC9529__CRED_R_LEN;
-	c_r.cred_r.ptr = (uint8_t *)T1_RFC9529__CRED_R;
-	c_r.g_y.len = T3_X25519_G_Y_LEN;
-	c_r.g_y.ptr = (uint8_t *)T3_X25519_G_Y;
-	c_r.y.len = T3_X25519_Y_LEN;
-	c_r.y.ptr = (uint8_t *)T3_X25519_Y;
-	c_r.g_r.len = T3_X25519_G_R_LEN;
-	c_r.g_r.ptr = (uint8_t *)T3_X25519_G_R;
-	c_r.r.len = T3_X25519_R_LEN;
-	c_r.r.ptr = (uint8_t *)T3_X25519_R;
-	c_r.sk_r.len = 0; c_r.sk_r.ptr = NULL;
-	c_r.pk_r.len = 0; c_r.pk_r.ptr = NULL;
-
-	struct other_party_cred cred_i;
-	memset(&cred_i, 0, sizeof(cred_i));
-	cred_i.id_cred.len = T1_RFC9529__ID_CRED_I_LEN;
-	cred_i.id_cred.ptr = (uint8_t *)T1_RFC9529__ID_CRED_I;
-	cred_i.cred.len = T1_RFC9529__CRED_I_LEN;
-	cred_i.cred.ptr = (uint8_t *)T1_RFC9529__CRED_I;
-	cred_i.g.len = T3_X25519_G_I_LEN;
-	cred_i.g.ptr = (uint8_t *)T3_X25519_G_I;
-	cred_i.pk.len = 0; cred_i.pk.ptr = NULL;
-	cred_i.ca.len = 0; cred_i.ca.ptr = NULL;
-	cred_i.ca_pk.len = 0; cred_i.ca_pk.ptr = NULL;
-	struct cred_array cred_i_array = { .len = 1, .ptr = &cred_i };
-
-	tl_txrx_ns = 0;
-	data->cpu_start_ns = get_thread_cpu_ns();
-	data->wall_start_ns = get_time_ns();
-
-	data->error = edhoc_responder_run(&c_r, &cred_i_array, &err_msg,
-					  &data->prk_out,
-					  tx_responder_bench,
-					  rx_responder_bench,
-					  ead_process);
-
-	data->wall_end_ns = get_time_ns();
-	data->cpu_end_ns = get_thread_cpu_ns();
-	return (void *)(uintptr_t)tl_txrx_ns;
-}
-
-/* =============================================================================
- * PQ Handshake Benchmark
- *
- * PQ variants use standalone threads (not uoscore-uedhoc library).
- * We measure wall time and CPU time for the full PQ handshake.
- * =============================================================================
- */
-
-/* =============================================================================
- * PQ Handshake Benchmark Threads
- *
- * Same approach as Classic: dedicated wrapper threads that measure
- * CLOCK_THREAD_CPUTIME_ID and wall time per-thread.
- * txrx = wall - cpu (condvar wait = message exchange time).
- * =============================================================================
- */
-
-struct pq_bench_thread_data {
-	void *party_ctx;             /* pq_party_ctx* or pq3_party_ctx* */
-	void *(*protocol_fn)(void *); /* actual PQ thread function */
-	uint64_t cpu_start_ns;
-	uint64_t cpu_end_ns;
-	uint64_t wall_start_ns;
-	uint64_t wall_end_ns;
-	int success;
-};
-
-static void *pq_bench_wrapper_thread(void *arg)
-{
-	struct pq_bench_thread_data *data = (struct pq_bench_thread_data *)arg;
-
-	data->cpu_start_ns  = get_thread_cpu_ns();
-	data->wall_start_ns = get_time_ns();
-
-	data->protocol_fn(data->party_ctx);
-
-	data->wall_end_ns = get_time_ns();
-	data->cpu_end_ns  = get_thread_cpu_ns();
-
+	d->txrx_ns = tl_sock_txrx_ns;
+	close(tl_sock_fd);
+	tl_sock_fd = -1;
 	return NULL;
 }
 
-/**
- * @brief Estimate memory for PQ EDHOC variant.
- *
- * ML-KEM-768: pk=1184, sk=2400, ct=1088, ss=32 bytes
- * ML-DSA-65 (Type 0 PQ only): pk=1952, sk=4032, sig=3309 bytes
- * Party context: 2×pk + 2×sk + 3×ct + 4×ss + 4×PRK + 4×Hash ≈ 12KB
- * + sig keys for Type 0 PQ: 2×sig_pk + 2×sig_sk + sig_buf ≈ 15KB
- * Message buffers: 3×8192 = 24KB (shared)
- * Crypto workspace: OQS KEM+SIG state ≈ 8KB
- */
-static long estimate_pq_memory(int pq_type_num)
+/* Classic Responder thread (server: accepts connection from Initiator) */
+static void *sck_classic_responder_thread(void *arg)
 {
-	long party_ctx     = 2 * (PQ_KEM_PK_LEN + PQ_KEM_SK_LEN); /* lt + eph keys */
-	long kem_buffers   = 3 * PQ_KEM_CT_LEN;  /* ct_R, ct_eph2, ct_I */
-	long ss_buffers    = 3 * PQ_KEM_SS_LEN;  /* shared secrets */
-	long prk_buffers   = 4 * PQ_PRK_LEN;     /* PRK1-3 + PRK_out */
-	long hash_buffers  = 4 * PQ_HASH_LEN;    /* TH2-4 + workspace */
-	long msg_buffers   = 3 * 8192;           /* shared msg exchange */
-	long aead_buffers  = 1024;               /* AEAD encrypt/decrypt workspace */
-	long oqs_workspace = 4096;               /* liboqs internal state (KEM) */
-	long psa_workspace = 512;                /* mbedTLS PSA state */
-	long overhead      = 512;                /* misc stack, labels, etc. */
+	struct sck_classic_thread_data *d = (struct sck_classic_thread_data *)arg;
+	d->prk_out.ptr = d->prk_out_buf;
+	d->prk_out.len = sizeof(d->prk_out_buf);
 
-	/* ML-DSA-65 signature keys and buffers (Type 0 PQ only) */
-	long sig_keys = 0;
-	long sig_workspace = 0;
-	if (pq_type_num == 0) {
-		sig_keys = 2 * (PQ_SIG_PK_LEN + PQ_SIG_SK_LEN); /* own + peer sig keys */
-		sig_workspace = PQ_SIG_MAX_LEN + 4096;  /* sig buffer + OQS SIG state */
+	uint8_t err_msg_buf[64];
+	struct byte_array err_msg = {.ptr = err_msg_buf, .len = sizeof(err_msg_buf)};
+
+	/* Create server socket and accept connection */
+	int listen_fd = sock_create_server(d->port);
+	if (listen_fd < 0) { d->error = buffer_to_small; return NULL; }
+
+	tl_sock_fd = accept(listen_fd, NULL, NULL);
+	close(listen_fd);
+	if (tl_sock_fd < 0) { d->error = buffer_to_small; return NULL; }
+	int opt = 1;
+	setsockopt(tl_sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	tl_sock_txrx_ns = 0;
+
+	if (d->type_num == 0) {
+		struct edhoc_responder_context c_r;
+		memset(&c_r, 0, sizeof(c_r));
+		c_r.sock = NULL;
+		c_r.c_r.len = T1_RFC9529__C_R_LEN; c_r.c_r.ptr = (uint8_t*)T1_RFC9529__C_R;
+		c_r.suites_r.len = T1_RFC9529__SUITES_R_LEN; c_r.suites_r.ptr = (uint8_t*)T1_RFC9529__SUITES_R;
+		c_r.ead_2.len = 0; c_r.ead_2.ptr = NULL;
+		c_r.ead_4.len = 0; c_r.ead_4.ptr = NULL;
+		c_r.id_cred_r.len = T1_RFC9529__ID_CRED_R_LEN; c_r.id_cred_r.ptr = (uint8_t*)T1_RFC9529__ID_CRED_R;
+		c_r.cred_r.len = T1_RFC9529__CRED_R_LEN; c_r.cred_r.ptr = (uint8_t*)T1_RFC9529__CRED_R;
+		c_r.g_y.len = T1_RFC9529__G_Y_LEN; c_r.g_y.ptr = (uint8_t*)T1_RFC9529__G_Y;
+		c_r.y.len = T1_RFC9529__Y_LEN; c_r.y.ptr = (uint8_t*)T1_RFC9529__Y;
+		c_r.sk_r.len = T1_RFC9529__SK_R_LEN; c_r.sk_r.ptr = (uint8_t*)T1_RFC9529__SK_R;
+		c_r.pk_r.len = T1_RFC9529__PK_R_LEN; c_r.pk_r.ptr = (uint8_t*)T1_RFC9529__PK_R;
+		c_r.g_r.len = 0; c_r.g_r.ptr = NULL;
+		c_r.r.len = 0; c_r.r.ptr = NULL;
+		struct other_party_cred cred_i;
+		memset(&cred_i, 0, sizeof(cred_i));
+		cred_i.id_cred.len = T1_RFC9529__ID_CRED_I_LEN; cred_i.id_cred.ptr = (uint8_t*)T1_RFC9529__ID_CRED_I;
+		cred_i.cred.len = T1_RFC9529__CRED_I_LEN; cred_i.cred.ptr = (uint8_t*)T1_RFC9529__CRED_I;
+		cred_i.pk.len = T1_RFC9529__PK_I_LEN; cred_i.pk.ptr = (uint8_t*)T1_RFC9529__PK_I;
+		cred_i.g.len = 0; cred_i.g.ptr = NULL;
+		cred_i.ca.len = 0; cred_i.ca.ptr = NULL; cred_i.ca_pk.len = 0; cred_i.ca_pk.ptr = NULL;
+		struct cred_array ca = {.len = 1, .ptr = &cred_i};
+
+		d->cpu_start_ns = sck_get_thread_cpu_ns();
+		d->wall_start_ns = sck_get_time_ns();
+		d->error = edhoc_responder_run(&c_r, &ca, &err_msg, &d->prk_out,
+					       sock_tx_responder, sock_rx_responder, ead_process);
+		d->wall_end_ns = sck_get_time_ns();
+		d->cpu_end_ns = sck_get_thread_cpu_ns();
+	} else {
+		/* Type 3 */
+		struct edhoc_responder_context c_r;
+		memset(&c_r, 0, sizeof(c_r));
+		c_r.sock = NULL;
+		c_r.c_r.len = T3_X25519_C_R_LEN; c_r.c_r.ptr = (uint8_t*)T3_X25519_C_R;
+		c_r.suites_r.len = T3_X25519_SUITES_R_LEN; c_r.suites_r.ptr = (uint8_t*)T3_X25519_SUITES_R;
+		c_r.ead_2.len = 0; c_r.ead_2.ptr = NULL;
+		c_r.ead_4.len = 0; c_r.ead_4.ptr = NULL;
+		c_r.id_cred_r.len = T1_RFC9529__ID_CRED_R_LEN; c_r.id_cred_r.ptr = (uint8_t*)T1_RFC9529__ID_CRED_R;
+		c_r.cred_r.len = T1_RFC9529__CRED_R_LEN; c_r.cred_r.ptr = (uint8_t*)T1_RFC9529__CRED_R;
+		c_r.g_y.len = T3_X25519_G_Y_LEN; c_r.g_y.ptr = (uint8_t*)T3_X25519_G_Y;
+		c_r.y.len = T3_X25519_Y_LEN; c_r.y.ptr = (uint8_t*)T3_X25519_Y;
+		c_r.g_r.len = T3_X25519_G_R_LEN; c_r.g_r.ptr = (uint8_t*)T3_X25519_G_R;
+		c_r.r.len = T3_X25519_R_LEN; c_r.r.ptr = (uint8_t*)T3_X25519_R;
+		c_r.sk_r.len = 0; c_r.sk_r.ptr = NULL;
+		c_r.pk_r.len = 0; c_r.pk_r.ptr = NULL;
+		struct other_party_cred cred_i;
+		memset(&cred_i, 0, sizeof(cred_i));
+		cred_i.id_cred.len = T1_RFC9529__ID_CRED_I_LEN; cred_i.id_cred.ptr = (uint8_t*)T1_RFC9529__ID_CRED_I;
+		cred_i.cred.len = T1_RFC9529__CRED_I_LEN; cred_i.cred.ptr = (uint8_t*)T1_RFC9529__CRED_I;
+		cred_i.g.len = T3_X25519_G_I_LEN; cred_i.g.ptr = (uint8_t*)T3_X25519_G_I;
+		cred_i.pk.len = 0; cred_i.pk.ptr = NULL;
+		cred_i.ca.len = 0; cred_i.ca.ptr = NULL; cred_i.ca_pk.len = 0; cred_i.ca_pk.ptr = NULL;
+		struct cred_array ca = {.len = 1, .ptr = &cred_i};
+
+		d->cpu_start_ns = sck_get_thread_cpu_ns();
+		d->wall_start_ns = sck_get_time_ns();
+		d->error = edhoc_responder_run(&c_r, &ca, &err_msg, &d->prk_out,
+					       sock_tx_responder, sock_rx_responder, ead_process);
+		d->wall_end_ns = sck_get_time_ns();
+		d->cpu_end_ns = sck_get_thread_cpu_ns();
 	}
 
-	return party_ctx + kem_buffers + ss_buffers + prk_buffers +
-	       hash_buffers + msg_buffers + aead_buffers +
-	       oqs_workspace + psa_workspace + overhead +
-	       sig_keys + sig_workspace;
+	d->txrx_ns = tl_sock_txrx_ns;
+	close(tl_sock_fd);
+	tl_sock_fd = -1;
+	return NULL;
 }
 
-/**
- * @brief Run PQ handshake benchmark.
+/* =============================================================================
+ * Socket-based PQ Type 0 Handshake (ML-KEM-768 + ML-DSA-65)
  *
- * Uses the SAME per-thread measurement approach as Classic:
- *   - Spawns dedicated PQ threads with CPU time + wall time instrumentation
- *   - txrx = wall_time - cpu_time (condvar wait = message exchange)
- *   - Calibrates ops to match measured CPU time
- *   - Precomp derived from calibrated keygen in ops table
+ * Complete reimplementation of the PQ Type 0 initiator/responder threads
+ * that exchanges all 3 messages via real TCP socket instead of the
+ * pthread-based global g_pq_exchange struct.
  *
- * This ensures fair and consistent comparison between Classic and PQ.
+ * Each thread keeps LOCAL copies of raw wire messages (needed for
+ * transcript hash computation: TH2 = H(msg1||ct_eph2), etc.).
+ * =============================================================================
  */
-static int run_pq_handshake_benchmark(int pq_type_num,
-				      struct ops_benchmark *ops_init,
-				      struct ops_benchmark *ops_resp,
-				      struct overhead_benchmark *overhead_init,
-				      struct overhead_benchmark *overhead_resp,
-				      struct handshake_benchmark *handshake_init,
-				      struct handshake_benchmark *handshake_resp)
+
+#define SCK_PQ_MSG_BUF_SIZE  8192
+
+/* ── PQ Type 0 key-derivation helpers (same as edhoc_type0_pq.c) ─── */
+static const uint8_t SCK_PQ0_K1[]   = "EDHOC-PQ-K1";
+static const uint8_t SCK_PQ0_IV1[]  = "EDHOC-PQ-IV1";
+static const uint8_t SCK_PQ0_K2[]   = "EDHOC-PQ-K2";
+static const uint8_t SCK_PQ0_IV2[]  = "EDHOC-PQ-IV2";
+static const uint8_t SCK_PQ0_K3[]   = "EDHOC-PQ-K3";
+static const uint8_t SCK_PQ0_IV3[]  = "EDHOC-PQ-IV3";
+static const uint8_t SCK_PQ0_MAC2[] = "EDHOC-PQ-MAC2";
+static const uint8_t SCK_PQ0_MAC3[] = "EDHOC-PQ-MAC3";
+static const uint8_t SCK_PQ0_OUT[]  = "EDHOC-PQ-PRK_out";
+static const uint8_t SCK_PQ0_IDI[]  = "EDHOC-PQ-Initiator";
+static const uint8_t SCK_PQ0_IDR[]  = "EDHOC-PQ-Responder";
+
+static int sck_pq0_derive_key_iv(const uint8_t *prk, const uint8_t *label,
+				  size_t label_len, uint8_t *key, uint8_t *iv)
+{
+	uint8_t info[64];
+	memcpy(info, label, label_len);
+	if (pq_hkdf_expand(prk, info, label_len, key, PQ_AEAD_KEY_LEN) != 0)
+		return -1;
+	uint8_t iv_info[64];
+	memcpy(iv_info, label, label_len);
+	iv_info[0] ^= 0xFF;
+	if (pq_hkdf_expand(prk, iv_info, label_len, iv, PQ_AEAD_NONCE_LEN) != 0)
+		return -1;
+	return 0;
+}
+
+/* Thread data for socket-based PQ handshake */
+struct sck_pq_thread_data {
+	int sock_fd;                     /* connected TCP socket (set internally) */
+	int port;                        /* TCP port for accept/connect */
+	struct pq_party_ctx *ctx;        /* PQ crypto context */
+	int error;                       /* 0=ok, -1=fail */
+	uint64_t cpu_start_ns, cpu_end_ns;
+	uint64_t wall_start_ns, wall_end_ns;
+	uint64_t txrx_ns;
+	/* Local message buffers for transcript hash */
+	uint8_t msg1_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg1_len;
+	uint8_t msg2_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg2_len;
+	uint8_t msg3_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg3_len;
+};
+
+/* ── PQ Type 0 Initiator (socket-based, client) ─────────────────────── */
+static void *sck_pq0_initiator_thread(void *arg)
+{
+	struct sck_pq_thread_data *d = (struct sck_pq_thread_data *)arg;
+	struct pq_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+
+	/* Connect to responder */
+	d->sock_fd = sock_connect_client(d->port);
+	if (d->sock_fd < 0) return NULL;
+	int opt = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Step 1: Generate ephemeral KEM key pair */
+	ret = pq_kem_keygen(ctx->eph_pk, ctx->eph_sk);
+	if (ret != 0) goto fail;
+
+	/* Encaps to pkR */
+	uint8_t ct_R[PQ_KEM_CT_LEN], ss_R[PQ_KEM_SS_LEN];
+	ret = pq_kem_encaps(ct_R, ss_R, ctx->other_lt_pk);
+	if (ret != 0) goto fail;
+
+	/* PRK1 */
+	ret = pq_hkdf_extract(NULL, 0, ss_R, PQ_KEM_SS_LEN, ctx->prk1);
+	if (ret != 0) goto fail;
+
+	/* K1, IV1 */
+	uint8_t k1[PQ_AEAD_KEY_LEN], iv1[PQ_AEAD_NONCE_LEN];
+	ret = sck_pq0_derive_key_iv(ctx->prk1, SCK_PQ0_K1, sizeof(SCK_PQ0_K1)-1, k1, iv1);
+	if (ret != 0) goto fail;
+
+	/* Plaintext: METHOD || SUITES || C_I */
+	uint8_t pt1[256]; uint32_t pt1_len = 0;
+	pt1[pt1_len++] = 0x00; pt1[pt1_len++] = 0x00; pt1[pt1_len++] = 0x37;
+
+	/* AEAD encrypt msg1 */
+	uint8_t ct1_aead[256+PQ_AEAD_TAG_LEN]; size_t ct1_aead_len = 0;
+	ret = pq_aead_encrypt(k1, iv1, NULL, 0, pt1, pt1_len, ct1_aead, &ct1_aead_len);
+	if (ret != 0) goto fail;
+
+	/* Build wire msg1: pk_eph || ct_R || aead_len(2) || AEAD_ct */
+	{
+		uint8_t *p = d->msg1_buf; uint32_t off = 0;
+		memcpy(p+off, ctx->eph_pk, PQ_KEM_PK_LEN); off += PQ_KEM_PK_LEN;
+		memcpy(p+off, ct_R, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		p[off++] = (uint8_t)(ct1_aead_len >> 8);
+		p[off++] = (uint8_t)(ct1_aead_len & 0xFF);
+		memcpy(p+off, ct1_aead, ct1_aead_len); off += ct1_aead_len;
+		d->msg1_len = off;
+	}
+
+	/* Send msg1 via TCP */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_send_msg(d->sock_fd, d->msg1_buf, d->msg1_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Receive msg2 via TCP */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_recv_msg(d->sock_fd, d->msg2_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg2_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Parse msg2: ct_eph2 || sig2_len(2) || sig2 || aead_len(2) || AEAD_ct */
+	uint8_t *msg2 = d->msg2_buf; uint32_t m2off = 0;
+	uint8_t ct_eph2[PQ_KEM_CT_LEN];
+	memcpy(ct_eph2, msg2+m2off, PQ_KEM_CT_LEN); m2off += PQ_KEM_CT_LEN;
+	uint16_t sig2_len = (msg2[m2off]<<8)|msg2[m2off+1]; m2off += 2;
+	uint8_t sig2_buf[PQ_SIG_MAX_LEN];
+	memcpy(sig2_buf, msg2+m2off, sig2_len); m2off += sig2_len;
+	uint16_t ct2_aead_len = (msg2[m2off]<<8)|msg2[m2off+1]; m2off += 2;
+	uint8_t ct2_aead[512+PQ_AEAD_TAG_LEN];
+	memcpy(ct2_aead, msg2+m2off, ct2_aead_len);
+
+	/* Decaps ct_eph2 */
+	uint8_t ss_eph[PQ_KEM_SS_LEN];
+	ret = pq_kem_decaps(ss_eph, ct_eph2, ctx->eph_sk);
+	if (ret != 0) goto fail;
+
+	/* PRK2 */
+	ret = pq_hkdf_extract(ctx->prk1, PQ_PRK_LEN, ss_eph, PQ_KEM_SS_LEN, ctx->prk2);
+	if (ret != 0) goto fail;
+
+	uint8_t k2[PQ_AEAD_KEY_LEN], iv2[PQ_AEAD_NONCE_LEN];
+	ret = sck_pq0_derive_key_iv(ctx->prk2, SCK_PQ0_K2, sizeof(SCK_PQ0_K2)-1, k2, iv2);
+	if (ret != 0) goto fail;
+
+	uint8_t pt2[512]; size_t pt2_len = 0;
+	ret = pq_aead_decrypt(k2, iv2, NULL, 0, ct2_aead, ct2_aead_len, pt2, &pt2_len);
+	if (ret != 0) goto fail;
+
+	/* TH2 = Hash(msg1 || ct_eph2) */
+	uint8_t th2_input[SCK_PQ_MSG_BUF_SIZE];
+	uint32_t th2_input_len = d->msg1_len + PQ_KEM_CT_LEN;
+	memcpy(th2_input, d->msg1_buf, d->msg1_len);
+	memcpy(th2_input + d->msg1_len, ct_eph2, PQ_KEM_CT_LEN);
+	ret = pq_hash_sha256(th2_input, th2_input_len, ctx->th2);
+	if (ret != 0) goto fail;
+
+	/* MAC2 verify */
+	uint8_t mac2_info[PQ_HASH_LEN+64];
+	memcpy(mac2_info, ctx->th2, PQ_HASH_LEN);
+	memcpy(mac2_info+PQ_HASH_LEN, SCK_PQ0_IDR, sizeof(SCK_PQ0_IDR)-1);
+	uint8_t mac2_exp[PQ_AEAD_TAG_LEN];
+	ret = pq_hkdf_expand(ctx->prk2, mac2_info, PQ_HASH_LEN+sizeof(SCK_PQ0_IDR)-1,
+			     mac2_exp, PQ_AEAD_TAG_LEN);
+	if (ret != 0) goto fail;
+
+	/* Verify signature */
+	ret = pq_sig_verify(mac2_exp, PQ_AEAD_TAG_LEN, sig2_buf, sig2_len, ctx->other_sig_pk);
+	if (ret != 0) goto fail;
+
+	/* PRK3 */
+	ret = pq_hkdf_extract(ctx->prk2, PQ_PRK_LEN, ctx->th2, PQ_HASH_LEN, ctx->prk3);
+	if (ret != 0) goto fail;
+
+	/* TH3 = Hash(TH2 || msg2) */
+	uint8_t th3_input[SCK_PQ_MSG_BUF_SIZE];
+	memcpy(th3_input, ctx->th2, PQ_HASH_LEN);
+	memcpy(th3_input+PQ_HASH_LEN, d->msg2_buf, d->msg2_len);
+	ret = pq_hash_sha256(th3_input, PQ_HASH_LEN + d->msg2_len, ctx->th3);
+	if (ret != 0) goto fail;
+
+	/* MAC3 + Sign */
+	uint8_t mac3_info[PQ_HASH_LEN+64];
+	memcpy(mac3_info, ctx->th3, PQ_HASH_LEN);
+	memcpy(mac3_info+PQ_HASH_LEN, SCK_PQ0_IDI, sizeof(SCK_PQ0_IDI)-1);
+	uint8_t mac3[PQ_AEAD_TAG_LEN];
+	ret = pq_hkdf_expand(ctx->prk3, mac3_info, PQ_HASH_LEN+sizeof(SCK_PQ0_IDI)-1,
+			     mac3, PQ_AEAD_TAG_LEN);
+	if (ret != 0) goto fail;
+
+	uint8_t sig3_buf[PQ_SIG_MAX_LEN]; size_t sig3_len = 0;
+	ret = pq_sig_sign(mac3, PQ_AEAD_TAG_LEN, ctx->sig_sk, sig3_buf, &sig3_len);
+	if (ret != 0) goto fail;
+
+	uint8_t k3[PQ_AEAD_KEY_LEN], iv3[PQ_AEAD_NONCE_LEN];
+	ret = sck_pq0_derive_key_iv(ctx->prk3, SCK_PQ0_K3, sizeof(SCK_PQ0_K3)-1, k3, iv3);
+	if (ret != 0) goto fail;
+
+	uint8_t ct3_aead[PQ_SIG_MAX_LEN+64+PQ_AEAD_TAG_LEN]; size_t ct3_aead_len = 0;
+	ret = pq_aead_encrypt(k3, iv3, NULL, 0, sig3_buf, sig3_len, ct3_aead, &ct3_aead_len);
+	if (ret != 0) goto fail;
+
+	/* Send msg3 via TCP */
+	memcpy(d->msg3_buf, ct3_aead, ct3_aead_len);
+	d->msg3_len = (uint32_t)ct3_aead_len;
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_send_msg(d->sock_fd, d->msg3_buf, d->msg3_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* PRK_out */
+	uint8_t th4_in[PQ_HASH_LEN+PQ_SIG_MAX_LEN+64+PQ_AEAD_TAG_LEN];
+	memcpy(th4_in, ctx->th3, PQ_HASH_LEN);
+	memcpy(th4_in+PQ_HASH_LEN, ct3_aead, ct3_aead_len);
+	ret = pq_hash_sha256(th4_in, PQ_HASH_LEN+ct3_aead_len, ctx->th4);
+	if (ret != 0) goto fail;
+	ret = pq_hkdf_expand(ctx->prk3, ctx->th4, PQ_HASH_LEN, ctx->prk_out, PQ_PRK_LEN);
+	if (ret != 0) goto fail;
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* ── PQ Type 0 Responder (socket-based, server) ─────────────────────── */
+static void *sck_pq0_responder_thread(void *arg)
+{
+	struct sck_pq_thread_data *d = (struct sck_pq_thread_data *)arg;
+	struct pq_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+
+	/* Create server, accept connection */
+	int listen_fd = sock_create_server(d->port);
+	if (listen_fd < 0) return NULL;
+	d->sock_fd = accept(listen_fd, NULL, NULL);
+	close(listen_fd);
+	if (d->sock_fd < 0) return NULL;
+	int opt = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Receive msg1 via TCP */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_recv_msg(d->sock_fd, d->msg1_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg1_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Parse msg1: pk_eph || ct_R || aead_len(2) || AEAD_ct */
+	uint8_t *msg1 = d->msg1_buf; uint32_t m1off = 0;
+	uint8_t pk_eph[PQ_KEM_PK_LEN];
+	memcpy(pk_eph, msg1+m1off, PQ_KEM_PK_LEN); m1off += PQ_KEM_PK_LEN;
+	uint8_t ct_R[PQ_KEM_CT_LEN];
+	memcpy(ct_R, msg1+m1off, PQ_KEM_CT_LEN); m1off += PQ_KEM_CT_LEN;
+	uint16_t ct1_aead_len = (msg1[m1off]<<8)|msg1[m1off+1]; m1off += 2;
+	uint8_t ct1_aead[256+PQ_AEAD_TAG_LEN];
+	memcpy(ct1_aead, msg1+m1off, ct1_aead_len);
+
+	/* Decaps ct_R */
+	uint8_t ss_R[PQ_KEM_SS_LEN];
+	ret = pq_kem_decaps(ss_R, ct_R, ctx->lt_sk);
+	if (ret != 0) goto fail;
+
+	ret = pq_hkdf_extract(NULL, 0, ss_R, PQ_KEM_SS_LEN, ctx->prk1);
+	if (ret != 0) goto fail;
+
+	uint8_t k1[PQ_AEAD_KEY_LEN], iv1[PQ_AEAD_NONCE_LEN];
+	ret = sck_pq0_derive_key_iv(ctx->prk1, SCK_PQ0_K1, sizeof(SCK_PQ0_K1)-1, k1, iv1);
+	if (ret != 0) goto fail;
+
+	uint8_t pt1[256]; size_t pt1_len = 0;
+	ret = pq_aead_decrypt(k1, iv1, NULL, 0, ct1_aead, ct1_aead_len, pt1, &pt1_len);
+	if (ret != 0) goto fail;
+
+	/* Encaps to pk_eph */
+	uint8_t ct_eph2[PQ_KEM_CT_LEN], ss_eph[PQ_KEM_SS_LEN];
+	ret = pq_kem_encaps(ct_eph2, ss_eph, pk_eph);
+	if (ret != 0) goto fail;
+
+	ret = pq_hkdf_extract(ctx->prk1, PQ_PRK_LEN, ss_eph, PQ_KEM_SS_LEN, ctx->prk2);
+	if (ret != 0) goto fail;
+
+	uint8_t k2[PQ_AEAD_KEY_LEN], iv2[PQ_AEAD_NONCE_LEN];
+	ret = sck_pq0_derive_key_iv(ctx->prk2, SCK_PQ0_K2, sizeof(SCK_PQ0_K2)-1, k2, iv2);
+	if (ret != 0) goto fail;
+
+	/* TH2 = Hash(msg1 || ct_eph2) */
+	uint8_t th2_input[SCK_PQ_MSG_BUF_SIZE];
+	uint32_t th2_input_len = d->msg1_len + PQ_KEM_CT_LEN;
+	memcpy(th2_input, d->msg1_buf, d->msg1_len);
+	memcpy(th2_input + d->msg1_len, ct_eph2, PQ_KEM_CT_LEN);
+	ret = pq_hash_sha256(th2_input, th2_input_len, ctx->th2);
+	if (ret != 0) goto fail;
+
+	/* MAC2 */
+	uint8_t mac2_info[PQ_HASH_LEN+64];
+	memcpy(mac2_info, ctx->th2, PQ_HASH_LEN);
+	memcpy(mac2_info+PQ_HASH_LEN, SCK_PQ0_IDR, sizeof(SCK_PQ0_IDR)-1);
+	uint8_t mac2[PQ_AEAD_TAG_LEN];
+	ret = pq_hkdf_expand(ctx->prk2, mac2_info, PQ_HASH_LEN+sizeof(SCK_PQ0_IDR)-1,
+			     mac2, PQ_AEAD_TAG_LEN);
+	if (ret != 0) goto fail;
+
+	/* Sign MAC2 */
+	uint8_t sig2_buf[PQ_SIG_MAX_LEN]; size_t sig2_len = 0;
+	ret = pq_sig_sign(mac2, PQ_AEAD_TAG_LEN, ctx->sig_sk, sig2_buf, &sig2_len);
+	if (ret != 0) goto fail;
+
+	/* PRK3 */
+	ret = pq_hkdf_extract(ctx->prk2, PQ_PRK_LEN, ctx->th2, PQ_HASH_LEN, ctx->prk3);
+	if (ret != 0) goto fail;
+
+	/* Build msg2 plaintext */
+	uint8_t pt2[256]; uint32_t pt2_len = 0;
+	pt2[pt2_len++] = 0x27;
+	memcpy(pt2+pt2_len, SCK_PQ0_IDR, sizeof(SCK_PQ0_IDR)-1);
+	pt2_len += sizeof(SCK_PQ0_IDR)-1;
+
+	uint8_t ct2_aead[512+PQ_AEAD_TAG_LEN]; size_t ct2_aead_len = 0;
+	ret = pq_aead_encrypt(k2, iv2, NULL, 0, pt2, pt2_len, ct2_aead, &ct2_aead_len);
+	if (ret != 0) goto fail;
+
+	/* Build wire msg2: ct_eph2 || sig2_len(2) || sig2 || aead_len(2) || AEAD_ct */
+	{
+		uint8_t *p = d->msg2_buf; uint32_t off = 0;
+		memcpy(p+off, ct_eph2, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		p[off++] = (uint8_t)(sig2_len >> 8);
+		p[off++] = (uint8_t)(sig2_len & 0xFF);
+		memcpy(p+off, sig2_buf, sig2_len); off += sig2_len;
+		p[off++] = (uint8_t)(ct2_aead_len >> 8);
+		p[off++] = (uint8_t)(ct2_aead_len & 0xFF);
+		memcpy(p+off, ct2_aead, ct2_aead_len); off += ct2_aead_len;
+		d->msg2_len = off;
+	}
+
+	/* Send msg2 via TCP */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_send_msg(d->sock_fd, d->msg2_buf, d->msg2_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Receive msg3 via TCP */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_recv_msg(d->sock_fd, d->msg3_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg3_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Decrypt msg3 */
+	uint8_t k3[PQ_AEAD_KEY_LEN], iv3[PQ_AEAD_NONCE_LEN];
+	ret = sck_pq0_derive_key_iv(ctx->prk3, SCK_PQ0_K3, sizeof(SCK_PQ0_K3)-1, k3, iv3);
+	if (ret != 0) goto fail;
+
+	uint8_t pt3[PQ_SIG_MAX_LEN+64]; size_t pt3_len = 0;
+	ret = pq_aead_decrypt(k3, iv3, NULL, 0, d->msg3_buf, d->msg3_len, pt3, &pt3_len);
+	if (ret != 0) goto fail;
+
+	/* TH3 = Hash(TH2 || msg2) */
+	uint8_t th3_input[SCK_PQ_MSG_BUF_SIZE];
+	memcpy(th3_input, ctx->th2, PQ_HASH_LEN);
+	memcpy(th3_input+PQ_HASH_LEN, d->msg2_buf, d->msg2_len);
+	ret = pq_hash_sha256(th3_input, PQ_HASH_LEN + d->msg2_len, ctx->th3);
+	if (ret != 0) goto fail;
+
+	/* Verify MAC3 signature */
+	uint8_t mac3_info[PQ_HASH_LEN+64];
+	memcpy(mac3_info, ctx->th3, PQ_HASH_LEN);
+	memcpy(mac3_info+PQ_HASH_LEN, SCK_PQ0_IDI, sizeof(SCK_PQ0_IDI)-1);
+	uint8_t mac3_exp[PQ_AEAD_TAG_LEN];
+	ret = pq_hkdf_expand(ctx->prk3, mac3_info, PQ_HASH_LEN+sizeof(SCK_PQ0_IDI)-1,
+			     mac3_exp, PQ_AEAD_TAG_LEN);
+	if (ret != 0) goto fail;
+	ret = pq_sig_verify(mac3_exp, PQ_AEAD_TAG_LEN, pt3, pt3_len, ctx->other_sig_pk);
+	if (ret != 0) goto fail;
+
+	/* TH4 & PRK_out */
+	uint8_t th4_in[PQ_HASH_LEN+PQ_SIG_MAX_LEN+64+PQ_AEAD_TAG_LEN];
+	memcpy(th4_in, ctx->th3, PQ_HASH_LEN);
+	memcpy(th4_in+PQ_HASH_LEN, d->msg3_buf, d->msg3_len);
+	ret = pq_hash_sha256(th4_in, PQ_HASH_LEN + d->msg3_len, ctx->th4);
+	if (ret != 0) goto fail;
+	ret = pq_hkdf_expand(ctx->prk3, ctx->th4, PQ_HASH_LEN, ctx->prk_out, PQ_PRK_LEN);
+	if (ret != 0) goto fail;
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* =============================================================================
+ * Socket-based PQ Type 3 Handshake (ML-KEM-768 only, MAC-MAC)
+ * =============================================================================
+ */
+
+static const uint8_t SCK_T3PQ_K1[]   = "EDHOC-T3PQ-K1";
+static const uint8_t SCK_T3PQ_K2[]   = "EDHOC-T3PQ-K2";
+static const uint8_t SCK_T3PQ_K3[]   = "EDHOC-T3PQ-K3";
+static const uint8_t SCK_T3PQ_IDI[]  = "EDHOC-T3PQ-Initiator";
+static const uint8_t SCK_T3PQ_IDR[]  = "EDHOC-T3PQ-Responder";
+
+static int sck_t3pq_derive_key_iv(const uint8_t *prk, const uint8_t *label,
+				   size_t label_len, uint8_t *key, uint8_t *iv)
+{
+	if (pq_hkdf_expand(prk, label, label_len, key, PQ_AEAD_KEY_LEN) != 0)
+		return -1;
+	uint8_t iv_info[64];
+	memcpy(iv_info, label, label_len);
+	iv_info[0] ^= 0xFF;
+	if (pq_hkdf_expand(prk, iv_info, label_len, iv, PQ_AEAD_NONCE_LEN) != 0)
+		return -1;
+	return 0;
+}
+
+/* PQ Type 3 thread data reuses sck_pq_thread_data but with pq3_party_ctx */
+struct sck_pq3_thread_data {
+	int sock_fd;
+	int port;
+	struct pq3_party_ctx *ctx;
+	int error;
+	uint64_t cpu_start_ns, cpu_end_ns;
+	uint64_t wall_start_ns, wall_end_ns;
+	uint64_t txrx_ns;
+	uint8_t msg1_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg1_len;
+	uint8_t msg2_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg2_len;
+	uint8_t msg3_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg3_len;
+};
+
+/* ── PQ Type 3 Initiator (socket-based, client) ─────────────────────── */
+static void *sck_pq3_initiator_thread(void *arg)
+{
+	struct sck_pq3_thread_data *d = (struct sck_pq3_thread_data *)arg;
+	struct pq3_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+
+	/* Connect to responder */
+	d->sock_fd = sock_connect_client(d->port);
+	if (d->sock_fd < 0) return NULL;
+	int opt = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Ephemeral keygen + Encaps to pkR */
+	ret = pq_kem_keygen(ctx->eph_pk, ctx->eph_sk);
+	if (ret != 0) goto fail;
+	uint8_t ct_R[PQ_KEM_CT_LEN], ss_R[PQ_KEM_SS_LEN];
+	ret = pq_kem_encaps(ct_R, ss_R, ctx->other_lt_pk);
+	if (ret != 0) goto fail;
+
+	ret = pq_hkdf_extract(NULL, 0, ss_R, PQ_KEM_SS_LEN, ctx->prk1);
+	if (ret != 0) goto fail;
+
+	uint8_t k1[PQ_AEAD_KEY_LEN], iv1[PQ_AEAD_NONCE_LEN];
+	ret = sck_t3pq_derive_key_iv(ctx->prk1, SCK_T3PQ_K1, sizeof(SCK_T3PQ_K1)-1, k1, iv1);
+	if (ret != 0) goto fail;
+
+	uint8_t pt1[256]; uint32_t pt1_len = 0;
+	pt1[pt1_len++] = 0x03; pt1[pt1_len++] = 0x00;
+	memcpy(pt1+pt1_len, SCK_T3PQ_IDI, sizeof(SCK_T3PQ_IDI)-1);
+	pt1_len += sizeof(SCK_T3PQ_IDI)-1;
+	pt1[pt1_len++] = 0x37;
+
+	uint8_t ct1_aead[256+PQ_AEAD_TAG_LEN]; size_t ct1_aead_len = 0;
+	ret = pq_aead_encrypt(k1, iv1, NULL, 0, pt1, pt1_len, ct1_aead, &ct1_aead_len);
+	if (ret != 0) goto fail;
+
+	/* Build wire msg1 */
+	{
+		uint8_t *p = d->msg1_buf; uint32_t off = 0;
+		memcpy(p+off, ctx->eph_pk, PQ_KEM_PK_LEN); off += PQ_KEM_PK_LEN;
+		memcpy(p+off, ct_R, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		p[off++] = (uint8_t)(ct1_aead_len >> 8);
+		p[off++] = (uint8_t)(ct1_aead_len & 0xFF);
+		memcpy(p+off, ct1_aead, ct1_aead_len); off += ct1_aead_len;
+		d->msg1_len = off;
+	}
+
+	/* Send msg1 */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_send_msg(d->sock_fd, d->msg1_buf, d->msg1_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Receive msg2 */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_recv_msg(d->sock_fd, d->msg2_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg2_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Parse msg2: ct_eph2 || ct_I || aead_len(2) || AEAD_ct */
+	uint8_t *msg2 = d->msg2_buf; uint32_t m2off = 0;
+	uint8_t ct_eph2[PQ_KEM_CT_LEN];
+	memcpy(ct_eph2, msg2+m2off, PQ_KEM_CT_LEN); m2off += PQ_KEM_CT_LEN;
+	uint8_t ct_I[PQ_KEM_CT_LEN];
+	memcpy(ct_I, msg2+m2off, PQ_KEM_CT_LEN); m2off += PQ_KEM_CT_LEN;
+	uint16_t ct2_aead_len = (msg2[m2off]<<8)|msg2[m2off+1]; m2off += 2;
+	uint8_t ct2_aead[512+PQ_AEAD_TAG_LEN];
+	memcpy(ct2_aead, msg2+m2off, ct2_aead_len);
+
+	/* Decaps ephemeral */
+	uint8_t ss_eph[PQ_KEM_SS_LEN];
+	ret = pq_kem_decaps(ss_eph, ct_eph2, ctx->eph_sk);
+	if (ret != 0) goto fail;
+
+	ret = pq_hkdf_extract(ctx->prk1, PQ_PRK_LEN, ss_eph, PQ_KEM_SS_LEN, ctx->prk2);
+	if (ret != 0) goto fail;
+
+	uint8_t k2[PQ_AEAD_KEY_LEN], iv2[PQ_AEAD_NONCE_LEN];
+	ret = sck_t3pq_derive_key_iv(ctx->prk2, SCK_T3PQ_K2, sizeof(SCK_T3PQ_K2)-1, k2, iv2);
+	if (ret != 0) goto fail;
+
+	uint8_t pt2[512]; size_t pt2_len = 0;
+	ret = pq_aead_decrypt(k2, iv2, NULL, 0, ct2_aead, ct2_aead_len, pt2, &pt2_len);
+	if (ret != 0) goto fail;
+
+	/* TH2 = Hash(msg1 || ct_eph2) */
+	uint8_t th2_buf[SCK_PQ_MSG_BUF_SIZE];
+	uint32_t th2_len = d->msg1_len + PQ_KEM_CT_LEN;
+	memcpy(th2_buf, d->msg1_buf, d->msg1_len);
+	memcpy(th2_buf + d->msg1_len, ct_eph2, PQ_KEM_CT_LEN);
+	ret = pq_hash_sha256(th2_buf, th2_len, ctx->th2);
+	if (ret != 0) goto fail;
+
+	/* Verify MAC2 */
+	uint8_t mac2_info[PQ_HASH_LEN+64];
+	memcpy(mac2_info, ctx->th2, PQ_HASH_LEN);
+	memcpy(mac2_info+PQ_HASH_LEN, SCK_T3PQ_IDR, sizeof(SCK_T3PQ_IDR)-1);
+	uint8_t mac2_exp[PQ_AEAD_TAG_LEN];
+	ret = pq_hkdf_expand(ctx->prk2, mac2_info, PQ_HASH_LEN+sizeof(SCK_T3PQ_IDR)-1,
+			     mac2_exp, PQ_AEAD_TAG_LEN);
+	if (ret != 0) goto fail;
+	if (pt2_len < PQ_AEAD_TAG_LEN ||
+	    memcmp(mac2_exp, pt2+pt2_len-PQ_AEAD_TAG_LEN, PQ_AEAD_TAG_LEN) != 0)
+		goto fail;
+
+	/* Decaps ct_I (mutual auth) */
+	uint8_t ss_I[PQ_KEM_SS_LEN];
+	ret = pq_kem_decaps(ss_I, ct_I, ctx->lt_sk);
+	if (ret != 0) goto fail;
+
+	ret = pq_hkdf_extract(ctx->prk2, PQ_PRK_LEN, ss_I, PQ_KEM_SS_LEN, ctx->prk3);
+	if (ret != 0) goto fail;
+
+	/* TH3 = Hash(TH2 || msg2) */
+	uint8_t th3_buf[SCK_PQ_MSG_BUF_SIZE];
+	memcpy(th3_buf, ctx->th2, PQ_HASH_LEN);
+	memcpy(th3_buf+PQ_HASH_LEN, d->msg2_buf, d->msg2_len);
+	ret = pq_hash_sha256(th3_buf, PQ_HASH_LEN + d->msg2_len, ctx->th3);
+	if (ret != 0) goto fail;
+
+	/* MAC3 */
+	uint8_t mac3_info[PQ_HASH_LEN+64];
+	memcpy(mac3_info, ctx->th3, PQ_HASH_LEN);
+	memcpy(mac3_info+PQ_HASH_LEN, SCK_T3PQ_IDI, sizeof(SCK_T3PQ_IDI)-1);
+	uint8_t mac3[PQ_AEAD_TAG_LEN];
+	ret = pq_hkdf_expand(ctx->prk3, mac3_info, PQ_HASH_LEN+sizeof(SCK_T3PQ_IDI)-1,
+			     mac3, PQ_AEAD_TAG_LEN);
+	if (ret != 0) goto fail;
+
+	uint8_t k3[PQ_AEAD_KEY_LEN], iv3[PQ_AEAD_NONCE_LEN];
+	ret = sck_t3pq_derive_key_iv(ctx->prk3, SCK_T3PQ_K3, sizeof(SCK_T3PQ_K3)-1, k3, iv3);
+	if (ret != 0) goto fail;
+
+	uint8_t ct3_aead[64+PQ_AEAD_TAG_LEN]; size_t ct3_aead_len = 0;
+	ret = pq_aead_encrypt(k3, iv3, NULL, 0, mac3, PQ_AEAD_TAG_LEN, ct3_aead, &ct3_aead_len);
+	if (ret != 0) goto fail;
+
+	/* Send msg3 */
+	memcpy(d->msg3_buf, ct3_aead, ct3_aead_len);
+	d->msg3_len = (uint32_t)ct3_aead_len;
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_send_msg(d->sock_fd, d->msg3_buf, d->msg3_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* PRK_out */
+	uint8_t th4_in[PQ_HASH_LEN+64];
+	memcpy(th4_in, ctx->th3, PQ_HASH_LEN);
+	memcpy(th4_in+PQ_HASH_LEN, ct3_aead, ct3_aead_len);
+	ret = pq_hash_sha256(th4_in, PQ_HASH_LEN+ct3_aead_len, ctx->th4);
+	if (ret != 0) goto fail;
+	ret = pq_hkdf_expand(ctx->prk3, ctx->th4, PQ_HASH_LEN, ctx->prk_out, PQ_PRK_LEN);
+	if (ret != 0) goto fail;
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* ── PQ Type 3 Responder (socket-based, server) ─────────────────────── */
+static void *sck_pq3_responder_thread(void *arg)
+{
+	struct sck_pq3_thread_data *d = (struct sck_pq3_thread_data *)arg;
+	struct pq3_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+
+	/* Create server, accept connection */
+	int listen_fd = sock_create_server(d->port);
+	if (listen_fd < 0) return NULL;
+	d->sock_fd = accept(listen_fd, NULL, NULL);
+	close(listen_fd);
+	if (d->sock_fd < 0) return NULL;
+	int opt = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Receive msg1 */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_recv_msg(d->sock_fd, d->msg1_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg1_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	uint8_t *msg1 = d->msg1_buf; uint32_t m1off = 0;
+	uint8_t pk_eph[PQ_KEM_PK_LEN];
+	memcpy(pk_eph, msg1+m1off, PQ_KEM_PK_LEN); m1off += PQ_KEM_PK_LEN;
+	uint8_t ct_R[PQ_KEM_CT_LEN];
+	memcpy(ct_R, msg1+m1off, PQ_KEM_CT_LEN); m1off += PQ_KEM_CT_LEN;
+	uint16_t ct1_aead_len = (msg1[m1off]<<8)|msg1[m1off+1]; m1off += 2;
+	uint8_t ct1_aead[256+PQ_AEAD_TAG_LEN];
+	memcpy(ct1_aead, msg1+m1off, ct1_aead_len);
+
+	/* Decaps ct_R */
+	uint8_t ss_R[PQ_KEM_SS_LEN];
+	ret = pq_kem_decaps(ss_R, ct_R, ctx->lt_sk);
+	if (ret != 0) goto fail;
+
+	ret = pq_hkdf_extract(NULL, 0, ss_R, PQ_KEM_SS_LEN, ctx->prk1);
+	if (ret != 0) goto fail;
+
+	uint8_t k1[PQ_AEAD_KEY_LEN], iv1[PQ_AEAD_NONCE_LEN];
+	ret = sck_t3pq_derive_key_iv(ctx->prk1, SCK_T3PQ_K1, sizeof(SCK_T3PQ_K1)-1, k1, iv1);
+	if (ret != 0) goto fail;
+
+	uint8_t pt1[256]; size_t pt1_len = 0;
+	ret = pq_aead_decrypt(k1, iv1, NULL, 0, ct1_aead, ct1_aead_len, pt1, &pt1_len);
+	if (ret != 0) goto fail;
+
+	/* Encaps to pk_eph */
+	uint8_t ct_eph2[PQ_KEM_CT_LEN], ss_eph[PQ_KEM_SS_LEN];
+	ret = pq_kem_encaps(ct_eph2, ss_eph, pk_eph);
+	if (ret != 0) goto fail;
+
+	ret = pq_hkdf_extract(ctx->prk1, PQ_PRK_LEN, ss_eph, PQ_KEM_SS_LEN, ctx->prk2);
+	if (ret != 0) goto fail;
+
+	uint8_t k2[PQ_AEAD_KEY_LEN], iv2[PQ_AEAD_NONCE_LEN];
+	ret = sck_t3pq_derive_key_iv(ctx->prk2, SCK_T3PQ_K2, sizeof(SCK_T3PQ_K2)-1, k2, iv2);
+	if (ret != 0) goto fail;
+
+	/* TH2 */
+	uint8_t th2_buf[SCK_PQ_MSG_BUF_SIZE];
+	uint32_t th2_len = d->msg1_len + PQ_KEM_CT_LEN;
+	memcpy(th2_buf, d->msg1_buf, d->msg1_len);
+	memcpy(th2_buf + d->msg1_len, ct_eph2, PQ_KEM_CT_LEN);
+	ret = pq_hash_sha256(th2_buf, th2_len, ctx->th2);
+	if (ret != 0) goto fail;
+
+	/* MAC2 */
+	uint8_t mac2_info[PQ_HASH_LEN+64];
+	memcpy(mac2_info, ctx->th2, PQ_HASH_LEN);
+	memcpy(mac2_info+PQ_HASH_LEN, SCK_T3PQ_IDR, sizeof(SCK_T3PQ_IDR)-1);
+	uint8_t mac2[PQ_AEAD_TAG_LEN];
+	ret = pq_hkdf_expand(ctx->prk2, mac2_info, PQ_HASH_LEN+sizeof(SCK_T3PQ_IDR)-1,
+			     mac2, PQ_AEAD_TAG_LEN);
+	if (ret != 0) goto fail;
+
+	/* Encaps to pkI (mutual auth) */
+	uint8_t ct_I[PQ_KEM_CT_LEN], ss_I[PQ_KEM_SS_LEN];
+	ret = pq_kem_encaps(ct_I, ss_I, ctx->other_lt_pk);
+	if (ret != 0) goto fail;
+
+	ret = pq_hkdf_extract(ctx->prk2, PQ_PRK_LEN, ss_I, PQ_KEM_SS_LEN, ctx->prk3);
+	if (ret != 0) goto fail;
+
+	/* msg2 plaintext */
+	uint8_t pt2[256]; uint32_t pt2_len = 0;
+	pt2[pt2_len++] = 0x27;
+	memcpy(pt2+pt2_len, SCK_T3PQ_IDR, sizeof(SCK_T3PQ_IDR)-1);
+	pt2_len += sizeof(SCK_T3PQ_IDR)-1;
+	memcpy(pt2+pt2_len, mac2, PQ_AEAD_TAG_LEN);
+	pt2_len += PQ_AEAD_TAG_LEN;
+
+	uint8_t ct2_aead[512+PQ_AEAD_TAG_LEN]; size_t ct2_aead_len = 0;
+	ret = pq_aead_encrypt(k2, iv2, NULL, 0, pt2, pt2_len, ct2_aead, &ct2_aead_len);
+	if (ret != 0) goto fail;
+
+	/* Build wire msg2: ct_eph2 || ct_I || aead_len(2) || AEAD_ct */
+	{
+		uint8_t *p = d->msg2_buf; uint32_t off = 0;
+		memcpy(p+off, ct_eph2, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		memcpy(p+off, ct_I, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		p[off++] = (uint8_t)(ct2_aead_len >> 8);
+		p[off++] = (uint8_t)(ct2_aead_len & 0xFF);
+		memcpy(p+off, ct2_aead, ct2_aead_len); off += ct2_aead_len;
+		d->msg2_len = off;
+	}
+
+	/* Send msg2 */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_send_msg(d->sock_fd, d->msg2_buf, d->msg2_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Receive msg3 */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_recv_msg(d->sock_fd, d->msg3_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg3_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Decrypt msg3 */
+	uint8_t k3[PQ_AEAD_KEY_LEN], iv3[PQ_AEAD_NONCE_LEN];
+	ret = sck_t3pq_derive_key_iv(ctx->prk3, SCK_T3PQ_K3, sizeof(SCK_T3PQ_K3)-1, k3, iv3);
+	if (ret != 0) goto fail;
+
+	uint8_t pt3[64]; size_t pt3_len = 0;
+	ret = pq_aead_decrypt(k3, iv3, NULL, 0, d->msg3_buf, d->msg3_len, pt3, &pt3_len);
+	if (ret != 0) goto fail;
+
+	/* TH3 = Hash(TH2 || msg2) */
+	uint8_t th3_buf[SCK_PQ_MSG_BUF_SIZE];
+	memcpy(th3_buf, ctx->th2, PQ_HASH_LEN);
+	memcpy(th3_buf+PQ_HASH_LEN, d->msg2_buf, d->msg2_len);
+	ret = pq_hash_sha256(th3_buf, PQ_HASH_LEN + d->msg2_len, ctx->th3);
+	if (ret != 0) goto fail;
+
+	/* Verify MAC3 */
+	uint8_t mac3_info[PQ_HASH_LEN+64];
+	memcpy(mac3_info, ctx->th3, PQ_HASH_LEN);
+	memcpy(mac3_info+PQ_HASH_LEN, SCK_T3PQ_IDI, sizeof(SCK_T3PQ_IDI)-1);
+	uint8_t mac3_exp[PQ_AEAD_TAG_LEN];
+	ret = pq_hkdf_expand(ctx->prk3, mac3_info, PQ_HASH_LEN+sizeof(SCK_T3PQ_IDI)-1,
+			     mac3_exp, PQ_AEAD_TAG_LEN);
+	if (ret != 0) goto fail;
+	if (pt3_len != PQ_AEAD_TAG_LEN || memcmp(mac3_exp, pt3, PQ_AEAD_TAG_LEN) != 0)
+		goto fail;
+
+	/* PRK_out */
+	uint8_t th4_in[PQ_HASH_LEN+64];
+	memcpy(th4_in, ctx->th3, PQ_HASH_LEN);
+	memcpy(th4_in+PQ_HASH_LEN, d->msg3_buf, d->msg3_len);
+	ret = pq_hash_sha256(th4_in, PQ_HASH_LEN + d->msg3_len, ctx->th4);
+	if (ret != 0) goto fail;
+	ret = pq_hkdf_expand(ctx->prk3, ctx->th4, PQ_HASH_LEN, ctx->prk_out, PQ_PRK_LEN);
+	if (ret != 0) goto fail;
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* =============================================================================
+ * Socket-based Hybrid Type 3 Handshake (X25519 + ML-KEM-768)
+ *
+ * Complete reimplementation with TCP socket transport.
+ * Uses the same crypto wrappers as edhoc_type3_hybrid.c but with
+ * local message buffers and socket send/recv for all msg exchange.
+ * =============================================================================
+ */
+
+/* Hybrid labels (same as edhoc_type3_hybrid.c) */
+static const uint8_t SCK_HYB_EK2[]  = "EDHOC-HYB-EK2";
+static const uint8_t SCK_HYB_EK3[]  = "EDHOC-HYB-EK3";
+static const uint8_t SCK_HYB_IDI[]  = "EDHOC-HYB-Initiator";
+static const uint8_t SCK_HYB_IDR[]  = "EDHOC-HYB-Responder";
+
+/* Hybrid crypto wrappers — identical to edhoc_type3_hybrid.c static fns */
+static int sck_hyb_hkdf_extract(const uint8_t *salt, size_t salt_len,
+				const uint8_t *ikm, size_t ikm_len,
+				uint8_t *prk_out)
+{
+	struct byte_array s = { .len=(uint32_t)salt_len, .ptr=(uint8_t*)salt };
+	struct byte_array i = { .len=(uint32_t)ikm_len,  .ptr=(uint8_t*)ikm };
+	if (!salt || salt_len == 0) { s.ptr = NULL; s.len = 0; }
+	return (hkdf_extract(SHA_256, &s, &i, prk_out) == ok) ? 0 : -1;
+}
+
+static int sck_hyb_hkdf_expand(const uint8_t *prk, const uint8_t *info,
+			       size_t info_len, uint8_t *okm, size_t okm_len)
+{
+	struct byte_array p = { .len=32, .ptr=(uint8_t*)prk };
+	struct byte_array inf = { .len=(uint32_t)info_len, .ptr=(uint8_t*)info };
+	struct byte_array o = { .len=(uint32_t)okm_len, .ptr=okm };
+	return (hkdf_expand(SHA_256, &p, &inf, &o) == ok) ? 0 : -1;
+}
+
+static int sck_hyb_hash(const uint8_t *data, size_t len, uint8_t *out)
+{
+	struct byte_array in = { .len=(uint32_t)len, .ptr=(uint8_t*)data };
+	struct byte_array o = { .len=32, .ptr=out };
+	return (hash(SHA_256, &in, &o) == ok) ? 0 : -1;
+}
+
+static int sck_hyb_aead_enc(const uint8_t *key, const uint8_t *nonce,
+			    const uint8_t *aad, size_t aad_len,
+			    const uint8_t *pt, size_t pt_len,
+			    uint8_t *ct, size_t *ct_len)
+{
+	uint8_t tag[PQ_AEAD_TAG_LEN];
+	struct byte_array p = { .len=(uint32_t)pt_len,  .ptr=(uint8_t*)pt };
+	struct byte_array k = { .len=PQ_AEAD_KEY_LEN,   .ptr=(uint8_t*)key };
+	struct byte_array n = { .len=PQ_AEAD_NONCE_LEN, .ptr=(uint8_t*)nonce };
+	struct byte_array a = { .len=(uint32_t)aad_len, .ptr=(uint8_t*)aad };
+	struct byte_array c = { .len=(uint32_t)pt_len,  .ptr=ct };
+	struct byte_array t = { .len=PQ_AEAD_TAG_LEN,   .ptr=tag };
+	if (aead(ENCRYPT, &p, &k, &n, &a, &c, &t) != ok) return -1;
+	memcpy(ct+pt_len, tag, PQ_AEAD_TAG_LEN);
+	*ct_len = pt_len + PQ_AEAD_TAG_LEN;
+	return 0;
+}
+
+static int sck_hyb_aead_dec(const uint8_t *key, const uint8_t *nonce,
+			    const uint8_t *aad, size_t aad_len,
+			    const uint8_t *ct, size_t ct_len,
+			    uint8_t *pt, size_t *pt_len)
+{
+	if (ct_len < PQ_AEAD_TAG_LEN) return -1;
+	size_t plain_len = ct_len - PQ_AEAD_TAG_LEN;
+	struct byte_array c = { .len=(uint32_t)ct_len,    .ptr=(uint8_t*)ct };
+	struct byte_array k = { .len=PQ_AEAD_KEY_LEN,     .ptr=(uint8_t*)key };
+	struct byte_array n = { .len=PQ_AEAD_NONCE_LEN,   .ptr=(uint8_t*)nonce };
+	struct byte_array a = { .len=(uint32_t)aad_len,   .ptr=(uint8_t*)aad };
+	struct byte_array p = { .len=(uint32_t)plain_len, .ptr=pt };
+	struct byte_array t = { .len=PQ_AEAD_TAG_LEN, .ptr=(uint8_t*)(ct+plain_len) };
+	if (aead(DECRYPT, &c, &k, &n, &a, &p, &t) != ok) return -1;
+	*pt_len = plain_len;
+	return 0;
+}
+
+static int sck_hyb_derive_key_iv(const uint8_t *prk, const uint8_t *label,
+				 size_t label_len, const uint8_t *th, size_t th_len,
+				 uint8_t *key, uint8_t *iv)
+{
+	uint8_t info[128];
+	size_t info_len = label_len + th_len;
+	memcpy(info, label, label_len);
+	memcpy(info+label_len, th, th_len);
+	if (sck_hyb_hkdf_expand(prk, info, info_len, key, PQ_AEAD_KEY_LEN) != 0)
+		return -1;
+	info[0] ^= 0xFF;
+	if (sck_hyb_hkdf_expand(prk, info, info_len, iv, PQ_AEAD_NONCE_LEN) != 0)
+		return -1;
+	return 0;
+}
+
+static int sck_hyb_ecdh(const uint8_t *my_sk, const uint8_t *peer_pk, uint8_t *out)
+{
+	struct byte_array sk = { .len=32, .ptr=(uint8_t*)my_sk };
+	struct byte_array pk = { .len=32, .ptr=(uint8_t*)peer_pk };
+	return (shared_secret_derive(X25519, &sk, &pk, out) == ok) ? 0 : -1;
+}
+
+#define SCK_HYB_MSG_BUF_SIZE 8192
+
+struct sck_hyb_thread_data {
+	int sock_fd;
+	int port;
+	struct hybrid_party_ctx *ctx;
+	int error;
+	uint64_t cpu_start_ns, cpu_end_ns;
+	uint64_t wall_start_ns, wall_end_ns;
+	uint64_t txrx_ns;
+	uint8_t msg1_buf[SCK_HYB_MSG_BUF_SIZE]; uint32_t msg1_len;
+	uint8_t msg2_buf[SCK_HYB_MSG_BUF_SIZE]; uint32_t msg2_len;
+	uint8_t msg3_buf[SCK_HYB_MSG_BUF_SIZE]; uint32_t msg3_len;
+};
+
+/* ── Hybrid Initiator (socket-based, client) ────────────────────────── */
+static void *sck_hyb_initiator_thread(void *arg)
+{
+	struct sck_hyb_thread_data *d = (struct sck_hyb_thread_data *)arg;
+	struct hybrid_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+
+	/* Connect to responder */
+	d->sock_fd = sock_connect_client(d->port);
+	if (d->sock_fd < 0) return NULL;
+	int opt = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Build M1 = (Method, Suites, CI, X[32], PK_KEM) */
+	uint8_t m1[SCK_HYB_MSG_BUF_SIZE]; uint32_t m1_len = 0;
+	m1[m1_len++] = 0x03; m1[m1_len++] = 0xFE; m1[m1_len++] = 0x37;
+	memcpy(m1+m1_len, ctx->eph_pk, 32); m1_len += 32;
+	memcpy(m1+m1_len, ctx->kem_pk, PQ_KEM_PK_LEN); m1_len += PQ_KEM_PK_LEN;
+
+	memcpy(d->msg1_buf, m1, m1_len); d->msg1_len = m1_len;
+
+	/* Send M1 */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_send_msg(d->sock_fd, d->msg1_buf, d->msg1_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Receive M2 */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_recv_msg(d->sock_fd, d->msg2_buf, SCK_HYB_MSG_BUF_SIZE, &d->msg2_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Parse M2: Y[32], C_KEM[1088], len16, AEAD_ct */
+	uint8_t *m2 = d->msg2_buf; uint32_t off = 0;
+	uint8_t peer_eph_pk[32];
+	memcpy(peer_eph_pk, m2+off, 32); off += 32;
+	uint8_t c_kem[PQ_KEM_CT_LEN];
+	memcpy(c_kem, m2+off, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+	uint16_t ct2_len = (m2[off]<<8)|m2[off+1]; off += 2;
+	uint8_t ct2_aead[512+PQ_AEAD_TAG_LEN];
+	memcpy(ct2_aead, m2+off, ct2_len);
+
+	/* KEM.Dec */
+	uint8_t k_kem[PQ_KEM_SS_LEN];
+	ret = pq_kem_decaps(k_kem, c_kem, ctx->kem_sk);
+	if (ret != 0) goto fail;
+
+	/* ECDH: Yx */
+	uint8_t ss_eph[32];
+	ret = sck_hyb_ecdh(ctx->eph_sk, peer_eph_pk, ss_eph);
+	if (ret != 0) goto fail;
+
+	/* TH2 = H(M1, Y, C_KEM) */
+	{
+		uint8_t th2_in[SCK_HYB_MSG_BUF_SIZE]; uint32_t tl = 0;
+		memcpy(th2_in, m1, m1_len); tl += m1_len;
+		memcpy(th2_in+tl, peer_eph_pk, 32); tl += 32;
+		memcpy(th2_in+tl, c_kem, PQ_KEM_CT_LEN); tl += PQ_KEM_CT_LEN;
+		ret = sck_hyb_hash(th2_in, tl, ctx->th2);
+		if (ret != 0) goto fail;
+	}
+
+	/* PRK2e = Extract(Yx, k_KEM || TH2) */
+	{
+		uint8_t ikm[PQ_KEM_SS_LEN+32];
+		memcpy(ikm, k_kem, PQ_KEM_SS_LEN);
+		memcpy(ikm+PQ_KEM_SS_LEN, ctx->th2, 32);
+		ret = sck_hyb_hkdf_extract(ss_eph, 32, ikm, PQ_KEM_SS_LEN+32, ctx->prk2e);
+		if (ret != 0) goto fail;
+	}
+
+	/* ECDH: Bx */
+	uint8_t ss_bx[32];
+	ret = sck_hyb_ecdh(ctx->eph_sk, ctx->other_static_pk, ss_bx);
+	if (ret != 0) goto fail;
+
+	/* EK2/IV2 */
+	uint8_t ek2[PQ_AEAD_KEY_LEN], iv2[PQ_AEAD_NONCE_LEN];
+	{
+		uint8_t ec[64]; memcpy(ec, ss_bx, 32); memcpy(ec+32, ctx->th2, 32);
+		ret = sck_hyb_derive_key_iv(ctx->prk2e, SCK_HYB_EK2, sizeof(SCK_HYB_EK2)-1, ec, 64, ek2, iv2);
+		if (ret != 0) goto fail;
+	}
+
+	/* Decrypt msg2 */
+	uint8_t pt2[512]; size_t pt2_len = 0;
+	ret = sck_hyb_aead_dec(ek2, iv2, NULL, 0, ct2_aead, ct2_len, pt2, &pt2_len);
+	if (ret != 0) goto fail;
+
+	/* PRK3e2m */
+	ret = sck_hyb_hkdf_extract(ss_bx, 32, ctx->prk2e, 32, ctx->prk3e2m);
+	if (ret != 0) goto fail;
+
+	/* Verify MAC2 */
+	uint8_t mk2[PQ_AEAD_TAG_LEN];
+	{
+		uint8_t mk2_info[32+64];
+		memcpy(mk2_info, ctx->th2, 32);
+		memcpy(mk2_info+32, SCK_HYB_IDR, sizeof(SCK_HYB_IDR)-1);
+		ret = sck_hyb_hkdf_expand(ctx->prk3e2m, mk2_info, 32+sizeof(SCK_HYB_IDR)-1, mk2, PQ_AEAD_TAG_LEN);
+		if (ret != 0) goto fail;
+	}
+	if (pt2_len < PQ_AEAD_TAG_LEN || memcmp(mk2, pt2+pt2_len-PQ_AEAD_TAG_LEN, PQ_AEAD_TAG_LEN) != 0)
+		goto fail;
+
+	/* TH3 = H(TH2, msg2, B) */
+	{
+		uint8_t th3_in[SCK_HYB_MSG_BUF_SIZE]; uint32_t len = 0;
+		memcpy(th3_in, ctx->th2, 32); len += 32;
+		memcpy(th3_in+len, d->msg2_buf, d->msg2_len); len += d->msg2_len;
+		memcpy(th3_in+len, ctx->other_static_pk, 32); len += 32;
+		ret = sck_hyb_hash(th3_in, len, ctx->th3);
+		if (ret != 0) goto fail;
+	}
+
+	/* EK3/IV3 */
+	uint8_t ek3[PQ_AEAD_KEY_LEN], iv3[PQ_AEAD_NONCE_LEN];
+	ret = sck_hyb_derive_key_iv(ctx->prk3e2m, SCK_HYB_EK3, sizeof(SCK_HYB_EK3)-1, ctx->th3, 32, ek3, iv3);
+	if (ret != 0) goto fail;
+
+	/* PRK4e3m = Extract(Ya, PRK3e2m) */
+	uint8_t ss_ya[32];
+	ret = sck_hyb_ecdh(ctx->static_sk, peer_eph_pk, ss_ya);
+	if (ret != 0) goto fail;
+	ret = sck_hyb_hkdf_extract(ss_ya, 32, ctx->prk3e2m, 32, ctx->prk4e3m);
+	if (ret != 0) goto fail;
+
+	/* MAC3 */
+	uint8_t mac3[PQ_AEAD_TAG_LEN];
+	{
+		uint8_t mk3_info[32+64];
+		memcpy(mk3_info, ctx->th3, 32);
+		memcpy(mk3_info+32, SCK_HYB_IDI, sizeof(SCK_HYB_IDI)-1);
+		ret = sck_hyb_hkdf_expand(ctx->prk4e3m, mk3_info, 32+sizeof(SCK_HYB_IDI)-1, mac3, PQ_AEAD_TAG_LEN);
+		if (ret != 0) goto fail;
+	}
+
+	/* msg3 plaintext */
+	uint8_t pt3[128]; uint32_t pt3_len = 0;
+	memcpy(pt3+pt3_len, SCK_HYB_IDI, sizeof(SCK_HYB_IDI)-1);
+	pt3_len += sizeof(SCK_HYB_IDI)-1;
+	memcpy(pt3+pt3_len, mac3, PQ_AEAD_TAG_LEN);
+	pt3_len += PQ_AEAD_TAG_LEN;
+
+	uint8_t ct3_aead[128+PQ_AEAD_TAG_LEN]; size_t ct3_len = 0;
+	ret = sck_hyb_aead_enc(ek3, iv3, NULL, 0, pt3, pt3_len, ct3_aead, &ct3_len);
+	if (ret != 0) goto fail;
+
+	/* TH4 = H(TH3, msg3, A) */
+	{
+		uint8_t th4_in[256]; uint32_t len = 0;
+		memcpy(th4_in, ctx->th3, 32); len += 32;
+		memcpy(th4_in+len, ct3_aead, ct3_len); len += ct3_len;
+		memcpy(th4_in+len, ctx->static_pk, 32); len += 32;
+		ret = sck_hyb_hash(th4_in, len, ctx->th4);
+		if (ret != 0) goto fail;
+	}
+
+	/* PRK_out */
+	ret = sck_hyb_hkdf_expand(ctx->prk4e3m, ctx->th4, 32, ctx->prk_out, 32);
+	if (ret != 0) goto fail;
+
+	/* Send M3 */
+	memcpy(d->msg3_buf, ct3_aead, ct3_len);
+	d->msg3_len = (uint32_t)ct3_len;
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_send_msg(d->sock_fd, d->msg3_buf, d->msg3_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* ── Hybrid Responder (socket-based, server) ────────────────────────── */
+static void *sck_hyb_responder_thread(void *arg)
+{
+	struct sck_hyb_thread_data *d = (struct sck_hyb_thread_data *)arg;
+	struct hybrid_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+
+	/* Create server, accept connection */
+	int listen_fd = sock_create_server(d->port);
+	if (listen_fd < 0) return NULL;
+	d->sock_fd = accept(listen_fd, NULL, NULL);
+	close(listen_fd);
+	if (d->sock_fd < 0) return NULL;
+	int opt = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Receive M1 */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_recv_msg(d->sock_fd, d->msg1_buf, SCK_HYB_MSG_BUF_SIZE, &d->msg1_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Parse M1: method(1), suites(1), C_I(1), X(32), PK_KEM */
+	uint8_t *m1 = d->msg1_buf;
+	uint32_t m1_len = d->msg1_len;
+	uint32_t off = 3;
+	uint8_t peer_eph_pk[32];
+	memcpy(peer_eph_pk, m1+off, 32); off += 32;
+	uint8_t pk_kem[PQ_KEM_PK_LEN];
+	memcpy(pk_kem, m1+off, PQ_KEM_PK_LEN);
+
+	/* KEM.Enc */
+	uint8_t k_kem[PQ_KEM_SS_LEN], c_kem[PQ_KEM_CT_LEN];
+	ret = pq_kem_encaps(c_kem, k_kem, pk_kem);
+	if (ret != 0) goto fail;
+
+	/* ECDH: Xy */
+	uint8_t ss_eph[32];
+	ret = sck_hyb_ecdh(ctx->eph_sk, peer_eph_pk, ss_eph);
+	if (ret != 0) goto fail;
+
+	/* TH2 = H(M1, Y, C_KEM) */
+	{
+		uint8_t th2_in[SCK_HYB_MSG_BUF_SIZE]; uint32_t tl = 0;
+		memcpy(th2_in, m1, m1_len); tl += m1_len;
+		memcpy(th2_in+tl, ctx->eph_pk, 32); tl += 32;
+		memcpy(th2_in+tl, c_kem, PQ_KEM_CT_LEN); tl += PQ_KEM_CT_LEN;
+		ret = sck_hyb_hash(th2_in, tl, ctx->th2);
+		if (ret != 0) goto fail;
+	}
+
+	/* PRK2e */
+	{
+		uint8_t ikm[PQ_KEM_SS_LEN+32];
+		memcpy(ikm, k_kem, PQ_KEM_SS_LEN);
+		memcpy(ikm+PQ_KEM_SS_LEN, ctx->th2, 32);
+		ret = sck_hyb_hkdf_extract(ss_eph, 32, ikm, PQ_KEM_SS_LEN+32, ctx->prk2e);
+		if (ret != 0) goto fail;
+	}
+
+	/* ECDH: Xb */
+	uint8_t ss_xb[32];
+	ret = sck_hyb_ecdh(ctx->static_sk, peer_eph_pk, ss_xb);
+	if (ret != 0) goto fail;
+
+	/* EK2/IV2 */
+	uint8_t ek2[PQ_AEAD_KEY_LEN], iv2[PQ_AEAD_NONCE_LEN];
+	{
+		uint8_t ec[64]; memcpy(ec, ss_xb, 32); memcpy(ec+32, ctx->th2, 32);
+		ret = sck_hyb_derive_key_iv(ctx->prk2e, SCK_HYB_EK2, sizeof(SCK_HYB_EK2)-1, ec, 64, ek2, iv2);
+		if (ret != 0) goto fail;
+	}
+
+	/* PRK3e2m */
+	ret = sck_hyb_hkdf_extract(ss_xb, 32, ctx->prk2e, 32, ctx->prk3e2m);
+	if (ret != 0) goto fail;
+
+	/* MAC2 */
+	uint8_t mac2[PQ_AEAD_TAG_LEN];
+	{
+		uint8_t mk2_info[32+64];
+		memcpy(mk2_info, ctx->th2, 32);
+		memcpy(mk2_info+32, SCK_HYB_IDR, sizeof(SCK_HYB_IDR)-1);
+		ret = sck_hyb_hkdf_expand(ctx->prk3e2m, mk2_info, 32+sizeof(SCK_HYB_IDR)-1, mac2, PQ_AEAD_TAG_LEN);
+		if (ret != 0) goto fail;
+	}
+
+	/* msg2 plaintext */
+	uint8_t pt2[256]; uint32_t pt2_len = 0;
+	pt2[pt2_len++] = 0x27;
+	memcpy(pt2+pt2_len, SCK_HYB_IDR, sizeof(SCK_HYB_IDR)-1);
+	pt2_len += sizeof(SCK_HYB_IDR)-1;
+	memcpy(pt2+pt2_len, mac2, PQ_AEAD_TAG_LEN);
+	pt2_len += PQ_AEAD_TAG_LEN;
+
+	uint8_t ct2_aead[512+PQ_AEAD_TAG_LEN]; size_t ct2_aead_len = 0;
+	ret = sck_hyb_aead_enc(ek2, iv2, NULL, 0, pt2, pt2_len, ct2_aead, &ct2_aead_len);
+	if (ret != 0) goto fail;
+
+	/* Build wire M2: Y[32], C_KEM, len16, AEAD_ct */
+	{
+		uint8_t *p = d->msg2_buf; uint32_t o = 0;
+		memcpy(p+o, ctx->eph_pk, 32); o += 32;
+		memcpy(p+o, c_kem, PQ_KEM_CT_LEN); o += PQ_KEM_CT_LEN;
+		p[o++] = (uint8_t)(ct2_aead_len >> 8);
+		p[o++] = (uint8_t)(ct2_aead_len & 0xFF);
+		memcpy(p+o, ct2_aead, ct2_aead_len); o += ct2_aead_len;
+		d->msg2_len = o;
+	}
+
+	/* Send M2 */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_send_msg(d->sock_fd, d->msg2_buf, d->msg2_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* Receive M3 */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = sock_recv_msg(d->sock_fd, d->msg3_buf, SCK_HYB_MSG_BUF_SIZE, &d->msg3_len);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	/* TH3 = H(TH2, msg2, B) */
+	{
+		uint8_t th3_in[SCK_HYB_MSG_BUF_SIZE]; uint32_t len = 0;
+		memcpy(th3_in, ctx->th2, 32); len += 32;
+		memcpy(th3_in+len, d->msg2_buf, d->msg2_len); len += d->msg2_len;
+		memcpy(th3_in+len, ctx->static_pk, 32); len += 32;
+		ret = sck_hyb_hash(th3_in, len, ctx->th3);
+		if (ret != 0) goto fail;
+	}
+
+	/* EK3/IV3 */
+	uint8_t ek3[PQ_AEAD_KEY_LEN], iv3[PQ_AEAD_NONCE_LEN];
+	ret = sck_hyb_derive_key_iv(ctx->prk3e2m, SCK_HYB_EK3, sizeof(SCK_HYB_EK3)-1, ctx->th3, 32, ek3, iv3);
+	if (ret != 0) goto fail;
+
+	/* Decrypt msg3 */
+	uint8_t pt3[128]; size_t pt3_len = 0;
+	ret = sck_hyb_aead_dec(ek3, iv3, NULL, 0, d->msg3_buf, d->msg3_len, pt3, &pt3_len);
+	if (ret != 0) goto fail;
+
+	/* PRK4e3m = Extract(Ay, PRK3e2m) */
+	uint8_t ss_ay[32];
+	ret = sck_hyb_ecdh(ctx->eph_sk, ctx->other_static_pk, ss_ay);
+	if (ret != 0) goto fail;
+	ret = sck_hyb_hkdf_extract(ss_ay, 32, ctx->prk3e2m, 32, ctx->prk4e3m);
+	if (ret != 0) goto fail;
+
+	/* Verify MAC3 */
+	uint8_t mac3_exp[PQ_AEAD_TAG_LEN];
+	{
+		uint8_t mk3_info[32+64];
+		memcpy(mk3_info, ctx->th3, 32);
+		memcpy(mk3_info+32, SCK_HYB_IDI, sizeof(SCK_HYB_IDI)-1);
+		ret = sck_hyb_hkdf_expand(ctx->prk4e3m, mk3_info, 32+sizeof(SCK_HYB_IDI)-1, mac3_exp, PQ_AEAD_TAG_LEN);
+		if (ret != 0) goto fail;
+	}
+	if (pt3_len < PQ_AEAD_TAG_LEN || memcmp(mac3_exp, pt3+pt3_len-PQ_AEAD_TAG_LEN, PQ_AEAD_TAG_LEN) != 0)
+		goto fail;
+
+	/* TH4 = H(TH3, msg3, A) */
+	{
+		uint8_t th4_in[256]; uint32_t len = 0;
+		memcpy(th4_in, ctx->th3, 32); len += 32;
+		memcpy(th4_in+len, d->msg3_buf, d->msg3_len); len += d->msg3_len;
+		memcpy(th4_in+len, ctx->other_static_pk, 32); len += 32;
+		ret = sck_hyb_hash(th4_in, len, ctx->th4);
+		if (ret != 0) goto fail;
+	}
+
+	/* PRK_out */
+	ret = sck_hyb_hkdf_expand(ctx->prk4e3m, ctx->th4, 32, ctx->prk_out, 32);
+	if (ret != 0) goto fail;
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* =============================================================================
+ * Handshake Benchmark Runners
+ * =============================================================================
+ */
+
+static int sck_run_classic_handshake(int type_num, int base_port,
+				     struct sck_ops_benchmark *ops_init,
+				     struct sck_ops_benchmark *ops_resp,
+				     struct sck_overhead_benchmark *oh_init,
+				     struct sck_overhead_benchmark *oh_resp,
+				     struct sck_handshake_benchmark *hs_init,
+				     struct sck_handshake_benchmark *hs_resp)
 {
 	char buf[128];
 	snprintf(buf, sizeof(buf),
-		 "Running PQ handshake benchmark for Type %d PQ (%d iterations)...",
-		 pq_type_num, BENCH_HANDSHAKE_ITERATIONS);
+		 "Socket: Classic Type %d handshake (%d iterations)...",
+		 type_num, SOCK_BENCH_HANDSHAKE_ITERATIONS);
 	print_info(buf);
-
-	/* Pre-generate long-term key pairs (done ONCE, outside timing loop).
-	 * These represent pre-provisioned keys. */
-	uint8_t init_lt_pk[PQ_KEM_PK_LEN], init_lt_sk[PQ_KEM_SK_LEN];
-	uint8_t resp_lt_pk[PQ_KEM_PK_LEN], resp_lt_sk[PQ_KEM_SK_LEN];
-	if (pq_kem_keygen(init_lt_pk, init_lt_sk) != 0 ||
-	    pq_kem_keygen(resp_lt_pk, resp_lt_sk) != 0) {
-		print_error("PQ keygen for benchmark setup failed");
-		return -1;
-	}
-
-	/* Pre-generate signature key pairs for Type 0 PQ (ML-DSA-65) */
-	uint8_t init_sig_pk[PQ_SIG_PK_LEN], init_sig_sk[PQ_SIG_SK_LEN];
-	uint8_t resp_sig_pk[PQ_SIG_PK_LEN], resp_sig_sk[PQ_SIG_SK_LEN];
-	if (pq_type_num == 0) {
-		if (pq_sig_keygen(init_sig_pk, init_sig_sk) != 0 ||
-		    pq_sig_keygen(resp_sig_pk, resp_sig_sk) != 0) {
-			print_error("PQ sig keygen for benchmark setup failed");
-			return -1;
-		}
-	}
 
 	double total_i_wall = 0, total_r_wall = 0;
 	double total_i_cpu  = 0, total_r_cpu  = 0;
 	double total_i_txrx = 0, total_r_txrx = 0;
 	int success_count = 0;
 
-	/* Function pointers for the selected PQ type */
-	void *(*init_fn)(void *);
-	void *(*resp_fn)(void *);
-	void (*exch_init_fn)(void);
-	void (*exch_destroy_fn)(void);
+	for (int iter = 0; iter < SOCK_BENCH_HANDSHAKE_ITERATIONS; iter++) {
+		int port = base_port + iter;
 
-	if (pq_type_num == 0) {
-		init_fn       = pq_type0_initiator_thread;
-		resp_fn       = pq_type0_responder_thread;
-		exch_init_fn  = pq_exchange_init;
-		exch_destroy_fn = pq_exchange_destroy;
-	} else {
-		init_fn       = pq3_initiator_thread;
-		resp_fn       = pq3_responder_thread;
-		exch_init_fn  = pq3_exchange_init;
-		exch_destroy_fn = pq3_exchange_destroy;
-	}
-
-	for (int iter = 0; iter < BENCH_HANDSHAKE_ITERATIONS; iter++) {
-		/* Set up party contexts with pre-generated keys */
-		union {
-			struct pq_party_ctx  t0;
-			struct pq3_party_ctx t3;
-		} init_ctx_u, resp_ctx_u;
-		memset(&init_ctx_u, 0, sizeof(init_ctx_u));
-		memset(&resp_ctx_u, 0, sizeof(resp_ctx_u));
-
-		/* Copy keys into the appropriate context struct.
-		 * Both pq_party_ctx and pq3_party_ctx have identical layout
-		 * for lt_pk, lt_sk, other_lt_pk at the same offsets. */
-		if (pq_type_num == 0) {
-			memcpy(init_ctx_u.t0.lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
-			memcpy(init_ctx_u.t0.lt_sk, init_lt_sk, PQ_KEM_SK_LEN);
-			memcpy(init_ctx_u.t0.other_lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
-			memcpy(init_ctx_u.t0.sig_pk, init_sig_pk, PQ_SIG_PK_LEN);
-			memcpy(init_ctx_u.t0.sig_sk, init_sig_sk, PQ_SIG_SK_LEN);
-			memcpy(init_ctx_u.t0.other_sig_pk, resp_sig_pk, PQ_SIG_PK_LEN);
-			memcpy(resp_ctx_u.t0.lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
-			memcpy(resp_ctx_u.t0.lt_sk, resp_lt_sk, PQ_KEM_SK_LEN);
-			memcpy(resp_ctx_u.t0.other_lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
-			memcpy(resp_ctx_u.t0.sig_pk, resp_sig_pk, PQ_SIG_PK_LEN);
-			memcpy(resp_ctx_u.t0.sig_sk, resp_sig_sk, PQ_SIG_SK_LEN);
-			memcpy(resp_ctx_u.t0.other_sig_pk, init_sig_pk, PQ_SIG_PK_LEN);
-		} else {
-			memcpy(init_ctx_u.t3.lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
-			memcpy(init_ctx_u.t3.lt_sk, init_lt_sk, PQ_KEM_SK_LEN);
-			memcpy(init_ctx_u.t3.other_lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
-			memcpy(resp_ctx_u.t3.lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
-			memcpy(resp_ctx_u.t3.lt_sk, resp_lt_sk, PQ_KEM_SK_LEN);
-			memcpy(resp_ctx_u.t3.other_lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
-		}
-
-		exch_init_fn();
-
-		struct pq_bench_thread_data i_data, r_data;
+		struct sck_classic_thread_data i_data, r_data;
 		memset(&i_data, 0, sizeof(i_data));
 		memset(&r_data, 0, sizeof(r_data));
-		i_data.protocol_fn = init_fn;
-		r_data.protocol_fn = resp_fn;
-		i_data.party_ctx = (pq_type_num == 0) ?
-			(void *)&init_ctx_u.t0 : (void *)&init_ctx_u.t3;
-		r_data.party_ctx = (pq_type_num == 0) ?
-			(void *)&resp_ctx_u.t0 : (void *)&resp_ctx_u.t3;
+		i_data.type_num = type_num;
+		i_data.port = port;
+		r_data.type_num = type_num;
+		r_data.port = port;
 
-		pthread_t tid_i, tid_r;
-		pthread_create(&tid_r, NULL, pq_bench_wrapper_thread, &r_data);
-		pthread_create(&tid_i, NULL, pq_bench_wrapper_thread, &i_data);
+		pthread_t tid_r, tid_i;
+		/* Start responder (server) first, then initiator (client) */
+		pthread_create(&tid_r, NULL, sck_classic_responder_thread, &r_data);
+		usleep(2000); /* 2ms to let server bind+listen */
+		pthread_create(&tid_i, NULL, sck_classic_initiator_thread, &i_data);
 
 		pthread_join(tid_i, NULL);
 		pthread_join(tid_r, NULL);
-
-		exch_destroy_fn();
-
-		/* Check success */
-		int ok;
-		if (pq_type_num == 0)
-			ok = init_ctx_u.t0.success && resp_ctx_u.t0.success;
-		else
-			ok = init_ctx_u.t3.success && resp_ctx_u.t3.success;
-
-		if (ok) {
-			double i_wall = elapsed_us(i_data.wall_start_ns,
-						   i_data.wall_end_ns);
-			double r_wall = elapsed_us(r_data.wall_start_ns,
-						   r_data.wall_end_ns);
-			double i_cpu  = elapsed_us(i_data.cpu_start_ns,
-						   i_data.cpu_end_ns);
-			double r_cpu  = elapsed_us(r_data.cpu_start_ns,
-						   r_data.cpu_end_ns);
-
-			/* Read instrumented txrx from party context */
-			double i_txrx, r_txrx;
-			if (pq_type_num == 0) {
-				i_txrx = (double)init_ctx_u.t0.txrx_ns / 1000.0;
-				r_txrx = (double)resp_ctx_u.t0.txrx_ns / 1000.0;
-			} else {
-				i_txrx = (double)init_ctx_u.t3.txrx_ns / 1000.0;
-				r_txrx = (double)resp_ctx_u.t3.txrx_ns / 1000.0;
-			}
-
-			total_i_wall += i_wall;
-			total_r_wall += r_wall;
-			total_i_cpu  += i_cpu;
-			total_r_cpu  += r_cpu;
-			total_i_txrx += i_txrx;
-			total_r_txrx += r_txrx;
-			success_count++;
-		}
-	}
-
-	if (success_count == 0) {
-		print_error("All PQ handshake iterations failed!");
-		return -1;
-	}
-
-	double n = (double)success_count;
-
-	/* Per-thread averages */
-	double avg_i_wall = total_i_wall / n;
-	double avg_r_wall = total_r_wall / n;
-	double avg_i_cpu  = total_i_cpu  / n;
-	double avg_r_cpu  = total_r_cpu  / n;
-
-	/* txrx from instrumented condvar/mutex timing (independent measurement).
-	 * This is analogous to Classic's instrumented tx/rx socket callbacks.
-	 * Because txrx is measured independently (not derived from wall − cpu),
-	 * overhead = wall − processing − txrx − precomp can be > 0. */
-	double txrx_i = total_i_txrx / n;
-	double txrx_r = total_r_txrx / n;
-
-	/* Calibrate PQ ops using measured per-thread CPU time,
-	 * same approach as Classic for full consistency. */
-	calibrate_pq_ops(ops_init, avg_i_cpu);
-	calibrate_pq_ops(ops_resp, avg_r_cpu);
-
-	/* Now derive ALL values from calibrated ops */
-	double ops_sum_i = compute_pq_ops_total(ops_init);
-	double ops_sum_r = compute_pq_ops_total(ops_resp);
-
-	/* Precomputation = calibrated keygen cost */
-	double precomp_i = ops_init->pq_keygen.avg_us *
-			   (double)ops_init->pq_keygen.calls;
-	double precomp_r = ops_resp->pq_keygen.avg_us *
-			   (double)ops_resp->pq_keygen.calls;
-
-	/* Processing = all crypto ops EXCLUDING keygen */
-	double proc_i = ops_sum_i - precomp_i;
-	double proc_r = ops_sum_r - precomp_r;
-
-	long mem = estimate_pq_memory(pq_type_num);
-
-	/* Overhead CSV: cpu_time = processing (crypto excluding keygen) */
-	overhead_init->cpu_us = proc_i;
-	overhead_init->memory_bytes = mem;
-	overhead_resp->cpu_us = proc_r;
-	overhead_resp->memory_bytes = mem;
-
-	/* Handshake CSV */
-	handshake_init->processing_us     = proc_i;
-	handshake_init->txrx_us           = txrx_i;
-	handshake_init->precomputation_us = precomp_i;
-	handshake_init->total_us          = avg_i_wall;
-	handshake_init->overhead_us       = handshake_init->total_us -
-					    handshake_init->processing_us -
-					    handshake_init->txrx_us -
-					    handshake_init->precomputation_us;
-	if (handshake_init->overhead_us < 0) {
-		handshake_init->overhead_us = 0;
-		handshake_init->total_us = handshake_init->processing_us +
-					   handshake_init->txrx_us +
-					   handshake_init->precomputation_us;
-	}
-
-	handshake_resp->processing_us     = proc_r;
-	handshake_resp->txrx_us           = txrx_r;
-	handshake_resp->precomputation_us = precomp_r;
-	handshake_resp->total_us          = avg_r_wall;
-	handshake_resp->overhead_us       = handshake_resp->total_us -
-					    handshake_resp->processing_us -
-					    handshake_resp->txrx_us -
-					    handshake_resp->precomputation_us;
-	if (handshake_resp->overhead_us < 0) {
-		handshake_resp->overhead_us = 0;
-		handshake_resp->total_us = handshake_resp->processing_us +
-					   handshake_resp->txrx_us +
-					   handshake_resp->precomputation_us;
-	}
-
-	snprintf(buf, sizeof(buf),
-		 "PQ handshake benchmark completed (%d/%d successful).",
-		 success_count, BENCH_HANDSHAKE_ITERATIONS);
-	print_success(buf);
-	return 0;
-}
-
-/* =============================================================================
- * Memory Estimation
- *
- * Karena benchmark berjalan di Linux native (bukan embedded/Zephyr),
- * getrusage(ru_maxrss) mengukur seluruh proses dan tidak representatif.
- *
- * Estimasi berdasarkan analisis buffer_sizes.h dan runtime_context:
- *   - runtime_context struct: msg_buf(700) + hash/prk buffers ≈ 1116 bytes
- *   - Stack buffers per message: g_y, g_xy, th, PRK, cred, plaintext, etc.
- *   - Crypto workspace: AES-CCM, SHA-256, X25519, EdDSA state
- * =============================================================================
- */
-static long estimate_edhoc_memory(int type_num)
-{
-	long runtime_ctx   = 1116;  /* runtime_context struct */
-	long msg_buffers   = 1536;  /* peak stack buffers during msg processing */
-	long msg3_buffers  = 640;   /* msg3 generation/processing buffers */
-	long crypto_aes    = 256;   /* AES-CCM state */
-	long crypto_sha    = 128;   /* SHA-256 hash state */
-	long crypto_x25519 = 256;   /* X25519 scalar multiplication workspace */
-	long crypto_eddsa  = (type_num == 0) ? 512 : 0; /* EdDSA workspace */
-	long edhoc_context = 384;   /* initiator/responder context struct */
-	long cred_data     = 512;   /* credential and ID_CRED buffers */
-	long overhead      = 256;   /* CBOR encoding, misc overhead */
-
-	return runtime_ctx + msg_buffers + msg3_buffers +
-	       crypto_aes + crypto_sha + crypto_x25519 + crypto_eddsa +
-	       edhoc_context + cred_data + overhead;
-}
-
-/* =============================================================================
- * Run full handshake benchmark
- * =============================================================================
- */
-
-static int run_handshake_benchmark(int type_num,
-				   struct ops_benchmark *ops_init,
-				   struct ops_benchmark *ops_resp,
-				   struct overhead_benchmark *overhead_i,
-				   struct overhead_benchmark *overhead_r,
-				   struct handshake_benchmark *handshake_i,
-				   struct handshake_benchmark *handshake_r)
-{
-	char buf[128];
-	snprintf(buf, sizeof(buf),
-		 "Running handshake benchmark for Type %d (%d iterations)...",
-		 type_num, BENCH_HANDSHAKE_ITERATIONS);
-	print_info(buf);
-
-	double total_i_wall = 0, total_r_wall = 0;
-	double total_i_cpu = 0, total_r_cpu = 0;
-	double total_i_txrx = 0, total_r_txrx = 0;
-	int success_count = 0;
-
-	for (int iter = 0; iter < BENCH_HANDSHAKE_ITERATIONS; iter++) {
-		msg_exchange_init();
-
-		struct bench_thread_data i_data, r_data;
-		memset(&i_data, 0, sizeof(i_data));
-		memset(&r_data, 0, sizeof(r_data));
-
-		pthread_t tid_i, tid_r;
-
-		void *(*init_fn)(void *) = (type_num == 0) ?
-			bench_type0_initiator_thread :
-			bench_type3_initiator_thread;
-		void *(*resp_fn)(void *) = (type_num == 0) ?
-			bench_type0_responder_thread :
-			bench_type3_responder_thread;
-
-		pthread_create(&tid_r, NULL, resp_fn, &r_data);
-		pthread_create(&tid_i, NULL, init_fn, &i_data);
-
-		void *i_txrx_ret, *r_txrx_ret;
-		pthread_join(tid_i, &i_txrx_ret);
-		pthread_join(tid_r, &r_txrx_ret);
-
-		msg_exchange_destroy();
 
 		if (i_data.error == ok && r_data.error == ok) {
-			double i_wall = elapsed_us(i_data.wall_start_ns,
-						   i_data.wall_end_ns);
-			double r_wall = elapsed_us(r_data.wall_start_ns,
-						   r_data.wall_end_ns);
-
-			double i_cpu = elapsed_us(i_data.cpu_start_ns,
-						  i_data.cpu_end_ns);
-			double r_cpu = elapsed_us(r_data.cpu_start_ns,
-						  r_data.cpu_end_ns);
-
-			double i_txrx = (double)(uintptr_t)i_txrx_ret / 1000.0;
-			double r_txrx = (double)(uintptr_t)r_txrx_ret / 1000.0;
-
-			total_i_wall += i_wall;
-			total_r_wall += r_wall;
-			total_i_cpu += i_cpu;
-			total_r_cpu += r_cpu;
-			total_i_txrx += i_txrx;
-			total_r_txrx += r_txrx;
+			total_i_wall += sck_elapsed_us(i_data.wall_start_ns, i_data.wall_end_ns);
+			total_r_wall += sck_elapsed_us(r_data.wall_start_ns, r_data.wall_end_ns);
+			total_i_cpu  += sck_elapsed_us(i_data.cpu_start_ns,  i_data.cpu_end_ns);
+			total_r_cpu  += sck_elapsed_us(r_data.cpu_start_ns,  r_data.cpu_end_ns);
+			total_i_txrx += (double)i_data.txrx_ns / 1000.0;
+			total_r_txrx += (double)r_data.txrx_ns / 1000.0;
 			success_count++;
 		}
 	}
 
 	if (success_count == 0) {
-		print_error("All handshake iterations failed!");
+		print_error("All Classic socket handshake iterations failed!");
 		return -1;
 	}
 
 	double n = (double)success_count;
-
-	/* Calibrate operations using measured per-thread CPU time.
-	 *
-	 * CLOCK_THREAD_CPUTIME_ID measures actual CPU cycles consumed by each
-	 * thread (excluding condvar/mutex wait = txrx). We use this as the
-	 * ground truth and scale isolated microbenchmark avg_us values so that
-	 * sum(avg_us × calls) == measured_cpu for each role.
-	 *
-	 * This ensures FULL cross-table consistency:
-	 *   operations CSV: sum(total_per_handshake_us) == cpu_time_us == processing_us + precomp_us
-	 *   overhead CSV:   cpu_time_us == processing_us (handshake CSV)
-	 *   handshake CSV:  total == processing + txrx + precomp + overhead
-	 *
-	 * The relative proportions between operations are preserved;
-	 * only the absolute scale is corrected for in-situ conditions. */
-	double cpu_i = total_i_cpu / n;
-	double cpu_r = total_r_cpu / n;
-
-	/* Calibrate ops: scale avg_us so sum(ops) matches measured CPU */
-	calibrate_classic_ops(ops_init, cpu_i);
-	calibrate_classic_ops(ops_resp, cpu_r);
-
-	/* Now derive ALL values from calibrated ops (= measured CPU) */
-	double ops_sum_i = compute_classic_ops_total(ops_init);
-	double ops_sum_r = compute_classic_ops_total(ops_resp);
-
-	/* Precomputation = calibrated keygen cost */
-	double precomp_cal_i = ops_init->keygen.avg_us * (double)ops_init->keygen.calls;
-	double precomp_cal_r = ops_resp->keygen.avg_us * (double)ops_resp->keygen.calls;
-
-	/* Processing = all crypto ops EXCLUDING keygen (avoid double-count) */
-	double proc_i = ops_sum_i - precomp_cal_i;
-	double proc_r = ops_sum_r - precomp_cal_r;
-
-	/* Overhead CSV: cpu_time = processing (crypto excluding keygen) */
-	overhead_i->cpu_us = proc_i;
-	overhead_i->memory_bytes = estimate_edhoc_memory(type_num);
-	overhead_r->cpu_us = proc_r;
-	overhead_r->memory_bytes = estimate_edhoc_memory(type_num);
-
-	/* Handshake timing */
-	handshake_i->total_us = total_i_wall / n;
-	handshake_i->txrx_us = total_i_txrx / n;
-	handshake_i->precomputation_us = precomp_cal_i;
-	handshake_i->processing_us = proc_i;
-	handshake_i->overhead_us = handshake_i->total_us -
-				   handshake_i->processing_us -
-				   handshake_i->txrx_us -
-				   handshake_i->precomputation_us;
-	/* Safety clamp: if overhead < 0 due to timing resolution overlap,
-	 * set to 0 and adjust total to maintain arithmetic identity:
-	 * total = processing + txrx + precomp + overhead */
-	if (handshake_i->overhead_us < 0) {
-		handshake_i->overhead_us = 0;
-		handshake_i->total_us = handshake_i->processing_us +
-					handshake_i->txrx_us +
-					handshake_i->precomputation_us;
-	}
-
-	handshake_r->total_us = total_r_wall / n;
-	handshake_r->txrx_us = total_r_txrx / n;
-	handshake_r->precomputation_us = precomp_cal_r;
-	handshake_r->processing_us = proc_r;
-	handshake_r->overhead_us = handshake_r->total_us -
-				   handshake_r->processing_us -
-				   handshake_r->txrx_us -
-				   handshake_r->precomputation_us;
-	if (handshake_r->overhead_us < 0) {
-		handshake_r->overhead_us = 0;
-		handshake_r->total_us = handshake_r->processing_us +
-					handshake_r->txrx_us +
-					handshake_r->precomputation_us;
-	}
-
-	snprintf(buf, sizeof(buf),
-		 "Handshake benchmark completed (%d/%d successful).",
-		 success_count, BENCH_HANDSHAKE_ITERATIONS);
-	print_success(buf);
-	return 0;
-}
-
-/* =============================================================================
- * CSV Output
- * =============================================================================
- */
-
-static int write_operations_csv(const char *filepath,
-				struct ops_benchmark *t0_init,
-				struct ops_benchmark *t0_resp,
-				struct ops_benchmark *t3_init,
-				struct ops_benchmark *t3_resp)
-{
-	FILE *fp = fopen(filepath, "w");
-	if (!fp) {
-		char buf[256];
-		snprintf(buf, sizeof(buf), "Cannot open %s: %s",
-			 filepath, strerror(errno));
-		print_error(buf);
-		return -1;
-	}
-
-	fprintf(fp, "type,role,operation,avg_time_us,calls_per_handshake,"
-		    "total_per_handshake_us,iterations\n");
-
-	#define WRITE_OP(TYPE, ROLE, OP_NAME, OP) \
-		fprintf(fp, "%s,%s,%s,%.3f,%d,%.3f,%d\n", \
-			TYPE, ROLE, OP_NAME, (OP).avg_us, (OP).calls, \
-			(OP).avg_us * (double)(OP).calls, (OP).count)
-
-	WRITE_OP("Type0_SigSig", "Initiator", "KeyGen",       t0_init->keygen);
-	WRITE_OP("Type0_SigSig", "Initiator", "Encap",        t0_init->encap);
-	WRITE_OP("Type0_SigSig", "Initiator", "Decap",        t0_init->decap);
-	WRITE_OP("Type0_SigSig", "Initiator", "Signature",    t0_init->signature);
-	WRITE_OP("Type0_SigSig", "Initiator", "Verification", t0_init->verification);
-	WRITE_OP("Type0_SigSig", "Initiator", "ECDH",         t0_init->ecdh);
-	WRITE_OP("Type0_SigSig", "Initiator", "HKDF",         t0_init->hkdf);
-	WRITE_OP("Type0_SigSig", "Initiator", "Hash",         t0_init->hash);
-
-	WRITE_OP("Type0_SigSig", "Responder", "KeyGen",       t0_resp->keygen);
-	WRITE_OP("Type0_SigSig", "Responder", "Encap",        t0_resp->encap);
-	WRITE_OP("Type0_SigSig", "Responder", "Decap",        t0_resp->decap);
-	WRITE_OP("Type0_SigSig", "Responder", "Signature",    t0_resp->signature);
-	WRITE_OP("Type0_SigSig", "Responder", "Verification", t0_resp->verification);
-	WRITE_OP("Type0_SigSig", "Responder", "ECDH",         t0_resp->ecdh);
-	WRITE_OP("Type0_SigSig", "Responder", "HKDF",         t0_resp->hkdf);
-	WRITE_OP("Type0_SigSig", "Responder", "Hash",         t0_resp->hash);
-
-	WRITE_OP("Type3_MACMAC", "Initiator", "KeyGen",       t3_init->keygen);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Encap",        t3_init->encap);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Decap",        t3_init->decap);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Signature",    t3_init->signature);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Verification", t3_init->verification);
-	WRITE_OP("Type3_MACMAC", "Initiator", "ECDH",         t3_init->ecdh);
-	WRITE_OP("Type3_MACMAC", "Initiator", "HKDF",         t3_init->hkdf);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Hash",         t3_init->hash);
-
-	WRITE_OP("Type3_MACMAC", "Responder", "KeyGen",       t3_resp->keygen);
-	WRITE_OP("Type3_MACMAC", "Responder", "Encap",        t3_resp->encap);
-	WRITE_OP("Type3_MACMAC", "Responder", "Decap",        t3_resp->decap);
-	WRITE_OP("Type3_MACMAC", "Responder", "Signature",    t3_resp->signature);
-	WRITE_OP("Type3_MACMAC", "Responder", "Verification", t3_resp->verification);
-	WRITE_OP("Type3_MACMAC", "Responder", "ECDH",         t3_resp->ecdh);
-	WRITE_OP("Type3_MACMAC", "Responder", "HKDF",         t3_resp->hkdf);
-	WRITE_OP("Type3_MACMAC", "Responder", "Hash",         t3_resp->hash);
-
-	#undef WRITE_OP
-	fclose(fp);
-	return 0;
-}
-
-static int write_overhead_csv(const char *filepath,
-			      struct overhead_benchmark *t0_init,
-			      struct overhead_benchmark *t0_resp,
-			      struct overhead_benchmark *t3_init,
-			      struct overhead_benchmark *t3_resp)
-{
-	FILE *fp = fopen(filepath, "w");
-	if (!fp) {
-		char buf[256];
-		snprintf(buf, sizeof(buf), "Cannot open %s: %s",
-			 filepath, strerror(errno));
-		print_error(buf);
-		return -1;
-	}
-
-	fprintf(fp, "type,role,cpu_time_us,memory_bytes,memory_note\n");
-	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%ld,estimated_stack_heap\n",
-		t0_init->cpu_us, t0_init->memory_bytes);
-	fprintf(fp, "Type0_SigSig,Responder,%.3f,%ld,estimated_stack_heap\n",
-		t0_resp->cpu_us, t0_resp->memory_bytes);
-	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%ld,estimated_stack_heap\n",
-		t3_init->cpu_us, t3_init->memory_bytes);
-	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%ld,estimated_stack_heap\n",
-		t3_resp->cpu_us, t3_resp->memory_bytes);
-
-	fclose(fp);
-	return 0;
-}
-
-static int write_handshake_csv(const char *filepath,
-			       struct handshake_benchmark *t0_init,
-			       struct handshake_benchmark *t0_resp,
-			       struct handshake_benchmark *t3_init,
-			       struct handshake_benchmark *t3_resp)
-{
-	FILE *fp = fopen(filepath, "w");
-	if (!fp) {
-		char buf[256];
-		snprintf(buf, sizeof(buf), "Cannot open %s: %s",
-			 filepath, strerror(errno));
-		print_error(buf);
-		return -1;
-	}
-
-	fprintf(fp, "type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us\n");
-	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t0_init->processing_us, t0_init->txrx_us,
-		t0_init->precomputation_us, t0_init->overhead_us,
-		t0_init->total_us);
-	fprintf(fp, "Type0_SigSig,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t0_resp->processing_us, t0_resp->txrx_us,
-		t0_resp->precomputation_us, t0_resp->overhead_us,
-		t0_resp->total_us);
-	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t3_init->processing_us, t3_init->txrx_us,
-		t3_init->precomputation_us, t3_init->overhead_us,
-		t3_init->total_us);
-	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t3_resp->processing_us, t3_resp->txrx_us,
-		t3_resp->precomputation_us, t3_resp->overhead_us,
-		t3_resp->total_us);
-
-	fclose(fp);
-	return 0;
-}
-
-/* =============================================================================
- * Print summary tables
- * =============================================================================
- */
-
-static void print_ops_summary(const char *type_name,
-			      struct ops_benchmark *init_ops,
-			      struct ops_benchmark *resp_ops)
-{
-	char buf[256];
-	printf("\n");
-	snprintf(buf, sizeof(buf), "%s — Operations (µs, avg over %d iterations)",
-		 type_name, BENCH_ITERATIONS);
-	print_header(buf);
-	printf("\n");
-
-	printf("  %-16s %12s %6s %12s %6s\n",
-	       "Operation", "Init(avg)", "×call", "Resp(avg)", "×call");
-	printf("  %-16s %12s %6s %12s %6s\n",
-	       "────────────────", "────────────", "──────",
-	       "────────────", "──────");
-
-	#define PRINT_ROW(NAME, FIELD) \
-		printf("  %-16s %12.3f %6d %12.3f %6d\n", \
-		       NAME, \
-		       init_ops->FIELD.avg_us, init_ops->FIELD.calls, \
-		       resp_ops->FIELD.avg_us, resp_ops->FIELD.calls)
-
-	PRINT_ROW("KeyGen",       keygen);
-	PRINT_ROW("Encap (AEAD)", encap);
-	PRINT_ROW("Decap (AEAD)", decap);
-	PRINT_ROW("Signature",    signature);
-	PRINT_ROW("Verification", verification);
-	PRINT_ROW("ECDH",         ecdh);
-	PRINT_ROW("HKDF",         hkdf);
-	PRINT_ROW("Hash",         hash);
-
-	#undef PRINT_ROW
-
-	/* Print estimated crypto cost per role */
-	#define COST(OP) ((OP).avg_us * (double)(OP).calls)
-	double init_total = COST(init_ops->keygen) + COST(init_ops->encap) +
-		COST(init_ops->decap) + COST(init_ops->signature) +
-		COST(init_ops->verification) + COST(init_ops->ecdh) +
-		COST(init_ops->hkdf) + COST(init_ops->hash);
-	double resp_total = COST(resp_ops->keygen) + COST(resp_ops->encap) +
-		COST(resp_ops->decap) + COST(resp_ops->signature) +
-		COST(resp_ops->verification) + COST(resp_ops->ecdh) +
-		COST(resp_ops->hkdf) + COST(resp_ops->hash);
-	#undef COST
-
-	printf("  %-16s %12s %6s %12s %6s\n",
-	       "────────────────", "────────────", "──────",
-	       "────────────", "──────");
-	printf("  %-16s %9.3f µs %6s %9.3f µs %6s\n",
-	       "Est. Total", init_total, "", resp_total, "");
-}
-
-static void print_overhead_summary(struct overhead_benchmark *t0_init,
-				   struct overhead_benchmark *t0_resp,
-				   struct overhead_benchmark *t3_init,
-				   struct overhead_benchmark *t3_resp)
-{
-	printf("\n");
-	print_header("Overhead Benchmark (calibrated ops, avg per handshake)");
-	printf("\n");
-
-	printf("  %-16s %-12s %14s %14s %s\n",
-	       "Type", "Role", "Crypto (µs)", "Memory (bytes)", "Note");
-	printf("  %-16s %-12s %14s %14s %s\n",
-	       "────────────────", "────────────", "──────────────",
-	       "──────────────", "────────────────────");
-	printf("  %-16s %-12s %14.3f %14ld %s\n",
-	       "Type0_SigSig", "Initiator", t0_init->cpu_us,
-	       t0_init->memory_bytes, "calibrated_ops");
-	printf("  %-16s %-12s %14.3f %14ld %s\n",
-	       "Type0_SigSig", "Responder", t0_resp->cpu_us,
-	       t0_resp->memory_bytes, "calibrated_ops");
-	printf("  %-16s %-12s %14.3f %14ld %s\n",
-	       "Type3_MACMAC", "Initiator", t3_init->cpu_us,
-	       t3_init->memory_bytes, "calibrated_ops");
-	printf("  %-16s %-12s %14.3f %14ld %s\n",
-	       "Type3_MACMAC", "Responder", t3_resp->cpu_us,
-	       t3_resp->memory_bytes, "calibrated_ops");
-}
-
-static void print_handshake_summary(struct handshake_benchmark *t0_init,
-				    struct handshake_benchmark *t0_resp,
-				    struct handshake_benchmark *t3_init,
-				    struct handshake_benchmark *t3_resp)
-{
-	printf("\n");
-	print_header("Handshake Timing Benchmark (µs, avg)");
-	printf("\n");
-
-	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n",
-	       "Type", "Role", "Processing", "TxRx", "Precompute", "Overhead", "Total");
-	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n",
-	       "────────────────", "────────────",
-	       "──────────────", "──────────────",
-	       "──────────────", "──────────────", "──────────────");
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
-	       "Type0_SigSig", "Initiator",
-	       t0_init->processing_us, t0_init->txrx_us,
-	       t0_init->precomputation_us, t0_init->overhead_us,
-	       t0_init->total_us);
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
-	       "Type0_SigSig", "Responder",
-	       t0_resp->processing_us, t0_resp->txrx_us,
-	       t0_resp->precomputation_us, t0_resp->overhead_us,
-	       t0_resp->total_us);
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
-	       "Type3_MACMAC", "Initiator",
-	       t3_init->processing_us, t3_init->txrx_us,
-	       t3_init->precomputation_us, t3_init->overhead_us,
-	       t3_init->total_us);
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
-	       "Type3_MACMAC", "Responder",
-	       t3_resp->processing_us, t3_resp->txrx_us,
-	       t3_resp->precomputation_us, t3_resp->overhead_us,
-	       t3_resp->total_us);
-}
-
-/* =============================================================================
- * Main Benchmark Entry Point
- * =============================================================================
- */
-
-int run_edhoc_benchmark(void)
-{
-	print_header("EDHOC-Hybrid Comprehensive Benchmark (Corrected)");
-	printf("\n");
-	print_info("Benchmark Configuration:");
-
-	char buf[256];
-	snprintf(buf, sizeof(buf),
-		 "  Operations iterations : %d", BENCH_ITERATIONS);
-	print_info(buf);
-	snprintf(buf, sizeof(buf),
-		 "  Handshake iterations  : %d", BENCH_HANDSHAKE_ITERATIONS);
-	print_info(buf);
-	print_info("  Types: Type 0 (Sig-Sig) + Type 3 (MAC-MAC)");
-	print_info("  Roles: Initiator + Responder");
-	print_info("  Suite: 0 (AES-CCM-16-64-128, SHA-256, X25519, EdDSA)");
-	printf("\n");
-
-	print_info("Protocol-accurate corrections:");
-	print_info("  ✓ KeyGen: Only X25519 ephemeral (long-term keys pre-provisioned)");
-	print_info("  ✓ ECDH: Type0=1×, Type3=3× (ephemeral + 2 static DH)");
-	print_info("  ✓ AEAD: CT2=XOR not AEAD (RFC 9528 §5.3.2), only CT3 uses AEAD");
-	print_info("  ✓ Memory: Estimated stack+heap footprint, not process RSS");
-	print_info("  ✓ CPU: Calibrated ops = measured CPU time (CLOCK_THREAD_CPUTIME_ID)");
-	print_info("  ✓ Processing: sum(calibrated ops) - keygen = cpu_time_us");
-	print_info("  ✓ Precomp: calibrated keygen cost (consistent with ops CSV)");
-	print_info("  ✓ Overhead: total - processing - txrx - precomp (≥ 0, clamped)");
-	print_info("  ✓ Hash: SHA-256 benchmark added (~4 calls/handshake)");
-	print_info("  ✓ Calls: Per-operation call count matches EDHOC protocol flow");
-	print_info("  ✓ Consistency: sum(ops) == cpu_time == processing + precomp");
-	printf("\n");
-
-	mkdir(BENCH_OUTPUT_DIR, 0755);
-
-	/* Phase 1: Operations Benchmark */
-	print_header("Phase 1: Operations Benchmark");
-	printf("\n");
-
-	struct ops_benchmark t0_ops_init, t0_ops_resp;
-	struct ops_benchmark t3_ops_init, t3_ops_resp;
-	memset(&t0_ops_init, 0, sizeof(t0_ops_init));
-	memset(&t0_ops_resp, 0, sizeof(t0_ops_resp));
-	memset(&t3_ops_init, 0, sizeof(t3_ops_init));
-	memset(&t3_ops_resp, 0, sizeof(t3_ops_resp));
-
-	bench_all_operations("Type 0 (Sig-Sig)", 0,
-			     &t0_ops_init, &t0_ops_resp);
-	bench_all_operations("Type 3 (MAC-MAC)", 3,
-			     &t3_ops_init, &t3_ops_resp);
-
-	print_ops_summary("Type 0 (Sig-Sig)", &t0_ops_init, &t0_ops_resp);
-	print_ops_summary("Type 3 (MAC-MAC)", &t3_ops_init, &t3_ops_resp);
-
-	/* Phase 2 & 3: Handshake + Overhead */
-	print_header("Phase 2 & 3: Handshake + Overhead Benchmark");
-	printf("\n");
-
-	struct overhead_benchmark  t0_oh_init, t0_oh_resp;
-	struct overhead_benchmark  t3_oh_init, t3_oh_resp;
-	struct handshake_benchmark t0_hs_init, t0_hs_resp;
-	struct handshake_benchmark t3_hs_init, t3_hs_resp;
-	memset(&t0_oh_init, 0, sizeof(t0_oh_init));
-	memset(&t0_oh_resp, 0, sizeof(t0_oh_resp));
-	memset(&t3_oh_init, 0, sizeof(t3_oh_init));
-	memset(&t3_oh_resp, 0, sizeof(t3_oh_resp));
-	memset(&t0_hs_init, 0, sizeof(t0_hs_init));
-	memset(&t0_hs_resp, 0, sizeof(t0_hs_resp));
-	memset(&t3_hs_init, 0, sizeof(t3_hs_init));
-	memset(&t3_hs_resp, 0, sizeof(t3_hs_resp));
-
-	int ret;
-	ret = run_handshake_benchmark(0,
-				      &t0_ops_init, &t0_ops_resp,
-				      &t0_oh_init, &t0_oh_resp,
-				      &t0_hs_init, &t0_hs_resp);
-	if (ret != 0) {
-		print_error("Type 0 handshake benchmark failed!");
-		return -1;
-	}
-
-	ret = run_handshake_benchmark(3,
-				      &t3_ops_init, &t3_ops_resp,
-				      &t3_oh_init, &t3_oh_resp,
-				      &t3_hs_init, &t3_hs_resp);
-	if (ret != 0) {
-		print_error("Type 3 handshake benchmark failed!");
-		return -1;
-	}
-
-	print_overhead_summary(&t0_oh_init, &t0_oh_resp,
-			       &t3_oh_init, &t3_oh_resp);
-	print_handshake_summary(&t0_hs_init, &t0_hs_resp,
-				&t3_hs_init, &t3_hs_resp);
-
-	/* Write CSV files */
-	printf("\n");
-	print_header("Writing CSV Output Files");
-	printf("\n");
-
-	ret = write_operations_csv(BENCH_CSV_OPERATIONS,
-				   &t0_ops_init, &t0_ops_resp,
-				   &t3_ops_init, &t3_ops_resp);
-	if (ret == 0) {
-		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_OPERATIONS);
-		print_success(buf);
-	}
-
-	ret = write_overhead_csv(BENCH_CSV_OVERHEAD,
-				 &t0_oh_init, &t0_oh_resp,
-				 &t3_oh_init, &t3_oh_resp);
-	if (ret == 0) {
-		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_OVERHEAD);
-		print_success(buf);
-	}
-
-	ret = write_handshake_csv(BENCH_CSV_HANDSHAKE,
-				  &t0_hs_init, &t0_hs_resp,
-				  &t3_hs_init, &t3_hs_resp);
-	if (ret == 0) {
-		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_HANDSHAKE);
-		print_success(buf);
-	}
-
-	printf("\n");
-	print_success("EDHOC-Hybrid Benchmark completed successfully!");
-	print_info("● CSV files saved in output/ directory.");
-	printf("\n");
-
-	return 0;
-}
-
-/* =============================================================================
- * Full Benchmark: Classic + PQ (4 variants)
- * =============================================================================
- */
-
-/* PQ-aware CSV writers */
-
-static int write_operations_csv_full(const char *filepath,
-				     struct ops_benchmark *t0_init,
-				     struct ops_benchmark *t0_resp,
-				     struct ops_benchmark *t3_init,
-				     struct ops_benchmark *t3_resp,
-				     struct ops_benchmark *t0pq_init,
-				     struct ops_benchmark *t0pq_resp,
-				     struct ops_benchmark *t3pq_init,
-				     struct ops_benchmark *t3pq_resp)
-{
-	FILE *fp = fopen(filepath, "w");
-	if (!fp) {
-		char buf[256];
-		snprintf(buf, sizeof(buf), "Cannot open %s: %s",
-			 filepath, strerror(errno));
-		print_error(buf);
-		return -1;
-	}
-
-	fprintf(fp, "type,role,operation,avg_time_us,calls_per_handshake,"
-		    "total_per_handshake_us,iterations\n");
-
-	#define WRITE_OP(TYPE, ROLE, OP_NAME, OP) \
-		fprintf(fp, "%s,%s,%s,%.3f,%d,%.3f,%d\n", \
-			TYPE, ROLE, OP_NAME, (OP).avg_us, (OP).calls, \
-			(OP).avg_us * (double)(OP).calls, (OP).count)
-
-	/* Classic Type 0 */
-	WRITE_OP("Type0_SigSig", "Initiator", "KeyGen",       t0_init->keygen);
-	WRITE_OP("Type0_SigSig", "Initiator", "Encap",        t0_init->encap);
-	WRITE_OP("Type0_SigSig", "Initiator", "Decap",        t0_init->decap);
-	WRITE_OP("Type0_SigSig", "Initiator", "Signature",    t0_init->signature);
-	WRITE_OP("Type0_SigSig", "Initiator", "Verification", t0_init->verification);
-	WRITE_OP("Type0_SigSig", "Initiator", "ECDH",         t0_init->ecdh);
-	WRITE_OP("Type0_SigSig", "Initiator", "HKDF",         t0_init->hkdf);
-	WRITE_OP("Type0_SigSig", "Initiator", "Hash",         t0_init->hash);
-	WRITE_OP("Type0_SigSig", "Responder", "KeyGen",       t0_resp->keygen);
-	WRITE_OP("Type0_SigSig", "Responder", "Encap",        t0_resp->encap);
-	WRITE_OP("Type0_SigSig", "Responder", "Decap",        t0_resp->decap);
-	WRITE_OP("Type0_SigSig", "Responder", "Signature",    t0_resp->signature);
-	WRITE_OP("Type0_SigSig", "Responder", "Verification", t0_resp->verification);
-	WRITE_OP("Type0_SigSig", "Responder", "ECDH",         t0_resp->ecdh);
-	WRITE_OP("Type0_SigSig", "Responder", "HKDF",         t0_resp->hkdf);
-	WRITE_OP("Type0_SigSig", "Responder", "Hash",         t0_resp->hash);
-
-	/* Classic Type 3 */
-	WRITE_OP("Type3_MACMAC", "Initiator", "KeyGen",       t3_init->keygen);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Encap",        t3_init->encap);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Decap",        t3_init->decap);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Signature",    t3_init->signature);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Verification", t3_init->verification);
-	WRITE_OP("Type3_MACMAC", "Initiator", "ECDH",         t3_init->ecdh);
-	WRITE_OP("Type3_MACMAC", "Initiator", "HKDF",         t3_init->hkdf);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Hash",         t3_init->hash);
-	WRITE_OP("Type3_MACMAC", "Responder", "KeyGen",       t3_resp->keygen);
-	WRITE_OP("Type3_MACMAC", "Responder", "Encap",        t3_resp->encap);
-	WRITE_OP("Type3_MACMAC", "Responder", "Decap",        t3_resp->decap);
-	WRITE_OP("Type3_MACMAC", "Responder", "Signature",    t3_resp->signature);
-	WRITE_OP("Type3_MACMAC", "Responder", "Verification", t3_resp->verification);
-	WRITE_OP("Type3_MACMAC", "Responder", "ECDH",         t3_resp->ecdh);
-	WRITE_OP("Type3_MACMAC", "Responder", "HKDF",         t3_resp->hkdf);
-	WRITE_OP("Type3_MACMAC", "Responder", "Hash",         t3_resp->hash);
-
-	/* PQ Type 0 */
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_KeyGen",       t0pq_init->pq_keygen);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Encaps",       t0pq_init->pq_encaps);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Decaps",       t0pq_init->pq_decaps);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Signature",    t0pq_init->pq_sig_sign);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Verification", t0pq_init->pq_sig_verify);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_AEAD_Enc",     t0pq_init->pq_aead_enc);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_AEAD_Dec",     t0pq_init->pq_aead_dec);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_HKDF",         t0pq_init->pq_hkdf);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Hash",         t0pq_init->pq_hash);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_KeyGen",       t0pq_resp->pq_keygen);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Encaps",       t0pq_resp->pq_encaps);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Decaps",       t0pq_resp->pq_decaps);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Signature",    t0pq_resp->pq_sig_sign);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Verification", t0pq_resp->pq_sig_verify);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_AEAD_Enc",     t0pq_resp->pq_aead_enc);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_AEAD_Dec",     t0pq_resp->pq_aead_dec);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_HKDF",         t0pq_resp->pq_hkdf);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Hash",         t0pq_resp->pq_hash);
-
-	/* PQ Type 3 */
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_KeyGen",       t3pq_init->pq_keygen);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Encaps",       t3pq_init->pq_encaps);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Decaps",       t3pq_init->pq_decaps);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Signature",    t3pq_init->pq_sig_sign);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Verification", t3pq_init->pq_sig_verify);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_AEAD_Enc",     t3pq_init->pq_aead_enc);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_AEAD_Dec",     t3pq_init->pq_aead_dec);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_HKDF",         t3pq_init->pq_hkdf);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Hash",         t3pq_init->pq_hash);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_KeyGen",       t3pq_resp->pq_keygen);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Encaps",       t3pq_resp->pq_encaps);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Decaps",       t3pq_resp->pq_decaps);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Signature",    t3pq_resp->pq_sig_sign);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Verification", t3pq_resp->pq_sig_verify);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_AEAD_Enc",     t3pq_resp->pq_aead_enc);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_AEAD_Dec",     t3pq_resp->pq_aead_dec);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_HKDF",         t3pq_resp->pq_hkdf);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Hash",         t3pq_resp->pq_hash);
-
-	#undef WRITE_OP
-	fclose(fp);
-	return 0;
-}
-
-static int write_overhead_csv_full(const char *filepath,
-				   struct overhead_benchmark *t0_init,
-				   struct overhead_benchmark *t0_resp,
-				   struct overhead_benchmark *t3_init,
-				   struct overhead_benchmark *t3_resp,
-				   struct overhead_benchmark *t0pq_init,
-				   struct overhead_benchmark *t0pq_resp,
-				   struct overhead_benchmark *t3pq_init,
-				   struct overhead_benchmark *t3pq_resp)
-{
-	FILE *fp = fopen(filepath, "w");
-	if (!fp) return -1;
-
-	fprintf(fp, "type,role,cpu_time_us,memory_bytes,memory_note\n");
-	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%ld,estimated_stack_heap\n",
-		t0_init->cpu_us, t0_init->memory_bytes);
-	fprintf(fp, "Type0_SigSig,Responder,%.3f,%ld,estimated_stack_heap\n",
-		t0_resp->cpu_us, t0_resp->memory_bytes);
-	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%ld,estimated_stack_heap\n",
-		t3_init->cpu_us, t3_init->memory_bytes);
-	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%ld,estimated_stack_heap\n",
-		t3_resp->cpu_us, t3_resp->memory_bytes);
-	fprintf(fp, "Type0_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n",
-		t0pq_init->cpu_us, t0pq_init->memory_bytes);
-	fprintf(fp, "Type0_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n",
-		t0pq_resp->cpu_us, t0pq_resp->memory_bytes);
-	fprintf(fp, "Type3_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n",
-		t3pq_init->cpu_us, t3pq_init->memory_bytes);
-	fprintf(fp, "Type3_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n",
-		t3pq_resp->cpu_us, t3pq_resp->memory_bytes);
-
-	fclose(fp);
-	return 0;
-}
-
-static int write_handshake_csv_full(const char *filepath,
-				    struct handshake_benchmark *t0_init,
-				    struct handshake_benchmark *t0_resp,
-				    struct handshake_benchmark *t3_init,
-				    struct handshake_benchmark *t3_resp,
-				    struct handshake_benchmark *t0pq_init,
-				    struct handshake_benchmark *t0pq_resp,
-				    struct handshake_benchmark *t3pq_init,
-				    struct handshake_benchmark *t3pq_resp)
-{
-	FILE *fp = fopen(filepath, "w");
-	if (!fp) return -1;
-
-	fprintf(fp, "type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us\n");
-	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t0_init->processing_us, t0_init->txrx_us,
-		t0_init->precomputation_us, t0_init->overhead_us,
-		t0_init->total_us);
-	fprintf(fp, "Type0_SigSig,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t0_resp->processing_us, t0_resp->txrx_us,
-		t0_resp->precomputation_us, t0_resp->overhead_us,
-		t0_resp->total_us);
-	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t3_init->processing_us, t3_init->txrx_us,
-		t3_init->precomputation_us, t3_init->overhead_us,
-		t3_init->total_us);
-	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t3_resp->processing_us, t3_resp->txrx_us,
-		t3_resp->precomputation_us, t3_resp->overhead_us,
-		t3_resp->total_us);
-	fprintf(fp, "Type0_PQ,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t0pq_init->processing_us, t0pq_init->txrx_us,
-		t0pq_init->precomputation_us, t0pq_init->overhead_us,
-		t0pq_init->total_us);
-	fprintf(fp, "Type0_PQ,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t0pq_resp->processing_us, t0pq_resp->txrx_us,
-		t0pq_resp->precomputation_us, t0pq_resp->overhead_us,
-		t0pq_resp->total_us);
-	fprintf(fp, "Type3_PQ,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t3pq_init->processing_us, t3pq_init->txrx_us,
-		t3pq_init->precomputation_us, t3pq_init->overhead_us,
-		t3pq_init->total_us);
-	fprintf(fp, "Type3_PQ,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t3pq_resp->processing_us, t3pq_resp->txrx_us,
-		t3pq_resp->precomputation_us, t3pq_resp->overhead_us,
-		t3pq_resp->total_us);
-
-	fclose(fp);
-	return 0;
-}
-
-/* PQ summary printers */
-
-static void print_pq_ops_summary(const char *type_name,
-				 struct ops_benchmark *init_ops,
-				 struct ops_benchmark *resp_ops)
-{
-	char buf[256];
-	printf("\n");
-	snprintf(buf, sizeof(buf), "%s — PQ Operations (µs, avg over %d iterations)",
-		 type_name, BENCH_ITERATIONS);
-	print_header(buf);
-	printf("\n");
-
-	printf("  %-16s %12s %6s %12s %6s\n",
-	       "Operation", "Init(avg)", "×call", "Resp(avg)", "×call");
-	printf("  %-16s %12s %6s %12s %6s\n",
-	       "────────────────", "────────────", "──────",
-	       "────────────", "──────");
-
-	#define PRINT_PQ(NAME, FIELD) \
-		printf("  %-16s %12.3f %6d %12.3f %6d\n", \
-		       NAME, \
-		       init_ops->FIELD.avg_us, init_ops->FIELD.calls, \
-		       resp_ops->FIELD.avg_us, resp_ops->FIELD.calls)
-
-	PRINT_PQ("PQ KeyGen",     pq_keygen);
-	PRINT_PQ("PQ Encaps",     pq_encaps);
-	PRINT_PQ("PQ Decaps",     pq_decaps);
-	PRINT_PQ("PQ Sig Sign",   pq_sig_sign);
-	PRINT_PQ("PQ Sig Verify", pq_sig_verify);
-	PRINT_PQ("PQ AEAD Enc",   pq_aead_enc);
-	PRINT_PQ("PQ AEAD Dec",   pq_aead_dec);
-	PRINT_PQ("PQ HKDF",       pq_hkdf);
-	PRINT_PQ("PQ Hash",       pq_hash);
-
-	#undef PRINT_PQ
-
-	#define COST(OP) ((OP).avg_us * (double)(OP).calls)
-	double init_total = COST(init_ops->pq_keygen) + COST(init_ops->pq_encaps) +
-		COST(init_ops->pq_decaps) + COST(init_ops->pq_sig_sign) +
-		COST(init_ops->pq_sig_verify) + COST(init_ops->pq_aead_enc) +
-		COST(init_ops->pq_aead_dec) + COST(init_ops->pq_hkdf) +
-		COST(init_ops->pq_hash);
-	double resp_total = COST(resp_ops->pq_keygen) + COST(resp_ops->pq_encaps) +
-		COST(resp_ops->pq_decaps) + COST(resp_ops->pq_sig_sign) +
-		COST(resp_ops->pq_sig_verify) + COST(resp_ops->pq_aead_enc) +
-		COST(resp_ops->pq_aead_dec) + COST(resp_ops->pq_hkdf) +
-		COST(resp_ops->pq_hash);
-	#undef COST
-
-	printf("  %-16s %12s %6s %12s %6s\n",
-	       "────────────────", "────────────", "──────",
-	       "────────────", "──────");
-	printf("  %-16s %9.3f µs %6s %9.3f µs %6s\n",
-	       "Est. Total", init_total, "", resp_total, "");
-}
-
-/* =============================================================================
- * run_edhoc_benchmark_full() — All 4 variants (Classic + PQ)
- * =============================================================================
- */
-
-int run_edhoc_benchmark_full(void)
-{
-	print_header("EDHOC-Hybrid Full Benchmark (Classic + PQ)");
-	printf("\n");
-	print_info("Benchmark Configuration:");
-
-	char buf[256];
-	snprintf(buf, sizeof(buf),
-		 "  Operations iterations : %d", BENCH_ITERATIONS);
-	print_info(buf);
-	snprintf(buf, sizeof(buf),
-		 "  Handshake iterations  : %d", BENCH_HANDSHAKE_ITERATIONS);
-	print_info(buf);
-	print_info("  Classic: Type 0 (Sig-Sig) + Type 3 (MAC-MAC)");
-	print_info("  PQ:      Type 0 PQ (KEM-based) + Type 3 PQ (KEM-based)");
-	print_info("  PQ Algorithm: ML-KEM-768 (NIST Level 3)");
-	printf("\n");
-
-	mkdir(BENCH_OUTPUT_DIR, 0755);
-
-	/* === Phase 1: Classic Operations Benchmark === */
-	print_header("Phase 1a: Classic Operations Benchmark");
-	printf("\n");
-
-	struct ops_benchmark t0_ops_init, t0_ops_resp;
-	struct ops_benchmark t3_ops_init, t3_ops_resp;
-	memset(&t0_ops_init, 0, sizeof(t0_ops_init));
-	memset(&t0_ops_resp, 0, sizeof(t0_ops_resp));
-	memset(&t3_ops_init, 0, sizeof(t3_ops_init));
-	memset(&t3_ops_resp, 0, sizeof(t3_ops_resp));
-
-	bench_all_operations("Type 0 (Sig-Sig)", 0,
-			     &t0_ops_init, &t0_ops_resp);
-	bench_all_operations("Type 3 (MAC-MAC)", 3,
-			     &t3_ops_init, &t3_ops_resp);
-
-	print_ops_summary("Type 0 (Sig-Sig)", &t0_ops_init, &t0_ops_resp);
-	print_ops_summary("Type 3 (MAC-MAC)", &t3_ops_init, &t3_ops_resp);
-
-	/* === Phase 1b: PQ Operations Benchmark === */
-	print_header("Phase 1b: PQ Operations Benchmark");
-	printf("\n");
-
-	struct ops_benchmark t0pq_ops_init, t0pq_ops_resp;
-	struct ops_benchmark t3pq_ops_init, t3pq_ops_resp;
-	memset(&t0pq_ops_init, 0, sizeof(t0pq_ops_init));
-	memset(&t0pq_ops_resp, 0, sizeof(t0pq_ops_resp));
-	memset(&t3pq_ops_init, 0, sizeof(t3pq_ops_init));
-	memset(&t3pq_ops_resp, 0, sizeof(t3pq_ops_resp));
-
-	bench_pq_all_operations("Type 0 PQ (ML-KEM-768 + ML-DSA-65)", 0,
-				&t0pq_ops_init, &t0pq_ops_resp);
-	bench_pq_all_operations("Type 3 PQ (ML-KEM-768)", 3,
-				&t3pq_ops_init, &t3pq_ops_resp);
-
-	print_pq_ops_summary("Type 0 PQ (ML-KEM-768 + ML-DSA-65)", &t0pq_ops_init, &t0pq_ops_resp);
-	print_pq_ops_summary("Type 3 PQ (ML-KEM-768)", &t3pq_ops_init, &t3pq_ops_resp);
-
-	/* === Phase 2: Classic Handshake + Overhead === */
-	print_header("Phase 2a: Classic Handshake + Overhead Benchmark");
-	printf("\n");
-
-	struct overhead_benchmark  t0_oh_init, t0_oh_resp;
-	struct overhead_benchmark  t3_oh_init, t3_oh_resp;
-	struct handshake_benchmark t0_hs_init, t0_hs_resp;
-	struct handshake_benchmark t3_hs_init, t3_hs_resp;
-	memset(&t0_oh_init, 0, sizeof(t0_oh_init));
-	memset(&t0_oh_resp, 0, sizeof(t0_oh_resp));
-	memset(&t3_oh_init, 0, sizeof(t3_oh_init));
-	memset(&t3_oh_resp, 0, sizeof(t3_oh_resp));
-	memset(&t0_hs_init, 0, sizeof(t0_hs_init));
-	memset(&t0_hs_resp, 0, sizeof(t0_hs_resp));
-	memset(&t3_hs_init, 0, sizeof(t3_hs_init));
-	memset(&t3_hs_resp, 0, sizeof(t3_hs_resp));
-
-	int ret;
-	ret = run_handshake_benchmark(0,
-				      &t0_ops_init, &t0_ops_resp,
-				      &t0_oh_init, &t0_oh_resp,
-				      &t0_hs_init, &t0_hs_resp);
-	if (ret != 0) {
-		print_error("Type 0 classic handshake benchmark failed!");
-		return -1;
-	}
-
-	ret = run_handshake_benchmark(3,
-				      &t3_ops_init, &t3_ops_resp,
-				      &t3_oh_init, &t3_oh_resp,
-				      &t3_hs_init, &t3_hs_resp);
-	if (ret != 0) {
-		print_error("Type 3 classic handshake benchmark failed!");
-		return -1;
-	}
-
-	/* === Phase 2b: PQ Handshake + Overhead === */
-	print_header("Phase 2b: PQ Handshake + Overhead Benchmark");
-	printf("\n");
-
-	struct overhead_benchmark  t0pq_oh_init, t0pq_oh_resp;
-	struct overhead_benchmark  t3pq_oh_init, t3pq_oh_resp;
-	struct handshake_benchmark t0pq_hs_init, t0pq_hs_resp;
-	struct handshake_benchmark t3pq_hs_init, t3pq_hs_resp;
-	memset(&t0pq_oh_init, 0, sizeof(t0pq_oh_init));
-	memset(&t0pq_oh_resp, 0, sizeof(t0pq_oh_resp));
-	memset(&t3pq_oh_init, 0, sizeof(t3pq_oh_init));
-	memset(&t3pq_oh_resp, 0, sizeof(t3pq_oh_resp));
-	memset(&t0pq_hs_init, 0, sizeof(t0pq_hs_init));
-	memset(&t0pq_hs_resp, 0, sizeof(t0pq_hs_resp));
-	memset(&t3pq_hs_init, 0, sizeof(t3pq_hs_init));
-	memset(&t3pq_hs_resp, 0, sizeof(t3pq_hs_resp));
-
-	ret = run_pq_handshake_benchmark(0,
-					 &t0pq_ops_init, &t0pq_ops_resp,
-					 &t0pq_oh_init, &t0pq_oh_resp,
-					 &t0pq_hs_init, &t0pq_hs_resp);
-	if (ret != 0) {
-		print_error("Type 0 PQ handshake benchmark failed!");
-		return -1;
-	}
-
-	ret = run_pq_handshake_benchmark(3,
-					 &t3pq_ops_init, &t3pq_ops_resp,
-					 &t3pq_oh_init, &t3pq_oh_resp,
-					 &t3pq_hs_init, &t3pq_hs_resp);
-	if (ret != 0) {
-		print_error("Type 3 PQ handshake benchmark failed!");
-		return -1;
-	}
-
-	/* Print summaries */
-	print_overhead_summary(&t0_oh_init, &t0_oh_resp,
-			       &t3_oh_init, &t3_oh_resp);
-
-	printf("\n");
-	print_header("PQ Overhead Benchmark (avg per handshake)");
-	printf("\n");
-	printf("  %-16s %-12s %14s %14s %s\n",
-	       "Type", "Role", "CPU (µs)", "Memory (bytes)", "Note");
-	printf("  %-16s %-12s %14s %14s %s\n",
-	       "────────────────", "────────────", "──────────────",
-	       "──────────────", "────────────────────");
-	printf("  %-16s %-12s %14.3f %14ld %s\n",
-	       "Type0_PQ", "Initiator", t0pq_oh_init.cpu_us,
-	       t0pq_oh_init.memory_bytes, "computed from ops (ML-KEM-768)");
-	printf("  %-16s %-12s %14.3f %14ld %s\n",
-	       "Type0_PQ", "Responder", t0pq_oh_resp.cpu_us,
-	       t0pq_oh_resp.memory_bytes, "computed from ops (ML-KEM-768)");
-	printf("  %-16s %-12s %14.3f %14ld %s\n",
-	       "Type3_PQ", "Initiator", t3pq_oh_init.cpu_us,
-	       t3pq_oh_init.memory_bytes, "computed from ops (ML-KEM-768)");
-	printf("  %-16s %-12s %14.3f %14ld %s\n",
-	       "Type3_PQ", "Responder", t3pq_oh_resp.cpu_us,
-	       t3pq_oh_resp.memory_bytes, "computed from ops (ML-KEM-768)");
-
-	print_handshake_summary(&t0_hs_init, &t0_hs_resp,
-				&t3_hs_init, &t3_hs_resp);
-
-	printf("\n");
-	print_header("PQ Handshake Timing Benchmark (µs, avg)");
-	printf("\n");
-	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n",
-	       "Type", "Role", "Processing", "TxRx", "Precompute", "Overhead", "Total");
-	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n",
-	       "────────────────", "────────────",
-	       "──────────────", "──────────────",
-	       "──────────────", "──────────────", "──────────────");
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
-	       "Type0_PQ", "Initiator",
-	       t0pq_hs_init.processing_us, t0pq_hs_init.txrx_us,
-	       t0pq_hs_init.precomputation_us, t0pq_hs_init.overhead_us,
-	       t0pq_hs_init.total_us);
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
-	       "Type0_PQ", "Responder",
-	       t0pq_hs_resp.processing_us, t0pq_hs_resp.txrx_us,
-	       t0pq_hs_resp.precomputation_us, t0pq_hs_resp.overhead_us,
-	       t0pq_hs_resp.total_us);
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
-	       "Type3_PQ", "Initiator",
-	       t3pq_hs_init.processing_us, t3pq_hs_init.txrx_us,
-	       t3pq_hs_init.precomputation_us, t3pq_hs_init.overhead_us,
-	       t3pq_hs_init.total_us);
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n",
-	       "Type3_PQ", "Responder",
-	       t3pq_hs_resp.processing_us, t3pq_hs_resp.txrx_us,
-	       t3pq_hs_resp.precomputation_us, t3pq_hs_resp.overhead_us,
-	       t3pq_hs_resp.total_us);
-
-	/* Write CSV files */
-	printf("\n");
-	print_header("Writing CSV Output Files (Full: Classic + PQ)");
-	printf("\n");
-
-	ret = write_operations_csv_full(BENCH_CSV_OPERATIONS,
-					&t0_ops_init, &t0_ops_resp,
-					&t3_ops_init, &t3_ops_resp,
-					&t0pq_ops_init, &t0pq_ops_resp,
-					&t3pq_ops_init, &t3pq_ops_resp);
-	if (ret == 0) {
-		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_OPERATIONS);
-		print_success(buf);
-	}
-
-	ret = write_overhead_csv_full(BENCH_CSV_OVERHEAD,
-				      &t0_oh_init, &t0_oh_resp,
-				      &t3_oh_init, &t3_oh_resp,
-				      &t0pq_oh_init, &t0pq_oh_resp,
-				      &t3pq_oh_init, &t3pq_oh_resp);
-	if (ret == 0) {
-		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_OVERHEAD);
-		print_success(buf);
-	}
-
-	ret = write_handshake_csv_full(BENCH_CSV_HANDSHAKE,
-				       &t0_hs_init, &t0_hs_resp,
-				       &t3_hs_init, &t3_hs_resp,
-				       &t0pq_hs_init, &t0pq_hs_resp,
-				       &t3pq_hs_init, &t3pq_hs_resp);
-	if (ret == 0) {
-		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_HANDSHAKE);
-		print_success(buf);
-	}
-
-	printf("\n");
-	print_success("EDHOC-Hybrid Full Benchmark (Classic + PQ) completed!");
-	print_info("● CSV files saved in output/ directory.");
-	print_info("● 4 variants: Type0 Classic, Type3 Classic, Type0 PQ, Type3 PQ");
-	printf("\n");
-
-	return 0;
-}
-
-/* =============================================================================
- * Hybrid Benchmark (Type 3 Hybrid: X25519 ECDHE + ML-KEM-768)
- * =============================================================================
- */
-
-static void bench_hybrid_operations_for_role(bool is_initiator,
-					 struct ops_benchmark *ops)
-{
-	/* Classic side */
-	ops->keygen = bench_keygen_x25519(BENCH_ITERATIONS);
-	ops->keygen.calls = 1; /* ephemeral ECDHE */
-
-	ops->encap = bench_encap(BENCH_ITERATIONS);
-	ops->encap.calls = 1; /* both roles AEAD encrypt once */
-
-	ops->decap = bench_decap(BENCH_ITERATIONS);
-	ops->decap.calls = 1; /* both roles AEAD decrypt once */
-
-	ops->signature.avg_us = 0; ops->signature.count = 0; ops->signature.calls = 0;
-	ops->verification = ops->signature;
-
-	ops->ecdh = bench_ecdh(BENCH_ITERATIONS);
-	ops->ecdh.calls = 2; /* ephemeral + static DH */
-
-	ops->hkdf = bench_hkdf(BENCH_ITERATIONS);
-	ops->hkdf.calls = 10; /* approx chain Extract/Expand */
-
-	ops->hash = bench_hash(BENCH_ITERATIONS);
-	ops->hash.calls = 3; /* TH2, TH3, TH4 */
-
-	/* PQ side (only KEM ops) */
-	ops->pq_keygen = bench_pq_keygen(BENCH_ITERATIONS);
-	ops->pq_keygen.calls = is_initiator ? 1 : 0; /* initiator precomputes KEM key */
-
-	ops->pq_encaps = bench_pq_encaps(BENCH_ITERATIONS);
-	ops->pq_encaps.calls = is_initiator ? 0 : 1; /* responder encapsulates */
-
-	ops->pq_decaps = bench_pq_decaps(BENCH_ITERATIONS);
-	ops->pq_decaps.calls = is_initiator ? 1 : 0; /* initiator decaps */
-
-	/* Unused PQ ops */
-	ops->pq_sig_sign.avg_us = 0; ops->pq_sig_sign.count = 0; ops->pq_sig_sign.calls = 0;
-	ops->pq_sig_verify = ops->pq_sig_sign;
-	ops->pq_aead_enc.avg_us = 0; ops->pq_aead_enc.count = 0; ops->pq_aead_enc.calls = 0;
-	ops->pq_aead_dec = ops->pq_aead_enc;
-	ops->pq_hkdf.avg_us = 0; ops->pq_hkdf.count = 0; ops->pq_hkdf.calls = 0;
-	ops->pq_hash.avg_us = 0; ops->pq_hash.count = 0; ops->pq_hash.calls = 0;
-}
-
-static void bench_hybrid_all_operations(struct ops_benchmark *init_ops,
-				      struct ops_benchmark *resp_ops)
-{
-	print_info("Running Hybrid operations benchmark...");
-	bench_hybrid_operations_for_role(true, init_ops);
-	bench_hybrid_operations_for_role(false, resp_ops);
-	print_success("Hybrid operations benchmark completed.");
-}
-
-static double compute_hybrid_ops_total(const struct ops_benchmark *ops)
-{
-	return compute_classic_ops_total(ops) + compute_pq_ops_total(ops);
-}
-
-static void calibrate_hybrid_ops(struct ops_benchmark *ops,
-				 double measured_cpu_us)
-{
-	double isolated = compute_hybrid_ops_total(ops);
-	if (isolated <= 0) return;
-	double factor = measured_cpu_us / isolated;
-
-	/* scale classic */
-	ops->keygen.avg_us       *= factor;
-	ops->encap.avg_us        *= factor;
-	ops->decap.avg_us        *= factor;
-	ops->signature.avg_us    *= factor;
-	ops->verification.avg_us *= factor;
-	ops->ecdh.avg_us         *= factor;
-	ops->hkdf.avg_us         *= factor;
-	ops->hash.avg_us         *= factor;
-
-	/* scale PQ */
-	ops->pq_keygen.avg_us     *= factor;
-	ops->pq_encaps.avg_us     *= factor;
-	ops->pq_decaps.avg_us     *= factor;
-	ops->pq_sig_sign.avg_us   *= factor;
-	ops->pq_sig_verify.avg_us *= factor;
-	ops->pq_aead_enc.avg_us   *= factor;
-	ops->pq_aead_dec.avg_us   *= factor;
-	ops->pq_hkdf.avg_us       *= factor;
-	ops->pq_hash.avg_us       *= factor;
-}
-
-static long estimate_hybrid_memory(void)
-{
-	/* Classic EDHOC footprint + KEM buffers (pk, sk, ct, ss) + workspace */
-	long classic = estimate_edhoc_memory(3);
-	long kem_keys = PQ_KEM_PK_LEN + PQ_KEM_SK_LEN;      /* initiator keypair */
-	long kem_buffers = PQ_KEM_CT_LEN + PQ_KEM_SS_LEN;   /* encaps/decaps buffers */
-	long msg_buffers = 3 * 8192;                        /* shared msg buffers */
-	long workspace = 4096;                              /* crypto workspace */
-	return classic + kem_keys + kem_buffers + msg_buffers + workspace;
-}
-
-static int run_hybrid_handshake_benchmark(struct ops_benchmark *ops_init,
-				    struct ops_benchmark *ops_resp,
-				    struct overhead_benchmark *oh_init,
-				    struct overhead_benchmark *oh_resp,
-				    struct handshake_benchmark *hs_init,
-				    struct handshake_benchmark *hs_resp)
-{
-	print_info("Running Hybrid handshake benchmark (Type 3 Hybrid)...");
-
-	/* Pre-generate long-term static keys (outside timing) */
-	uint8_t init_static_sk[32], init_static_pk[32];
-	uint8_t resp_static_sk[32], resp_static_pk[32];
-	{
-		struct byte_array sk = { .len = 32, .ptr = init_static_sk };
-		struct byte_array pk = { .len = 32, .ptr = init_static_pk };
-		if (ephemeral_dh_key_gen(X25519, 100, &sk, &pk) != ok)
-			return -1;
-	}
-	{
-		struct byte_array sk = { .len = 32, .ptr = resp_static_sk };
-		struct byte_array pk = { .len = 32, .ptr = resp_static_pk };
-		if (ephemeral_dh_key_gen(X25519, 200, &sk, &pk) != ok)
-			return -1;
-	}
-
-	double total_i_wall = 0, total_r_wall = 0;
-	double total_i_cpu  = 0, total_r_cpu  = 0;
-	double total_i_txrx = 0, total_r_txrx = 0;
-	int success_count = 0;
-
-	for (int iter = 0; iter < BENCH_HANDSHAKE_ITERATIONS; iter++) {
-		struct hybrid_party_ctx init_ctx, resp_ctx;
-		memset(&init_ctx, 0, sizeof(init_ctx));
-		memset(&resp_ctx, 0, sizeof(resp_ctx));
-
-		/* Copy static keys */
-		memcpy(init_ctx.static_sk, init_static_sk, 32);
-		memcpy(init_ctx.static_pk, init_static_pk, 32);
-		memcpy(resp_ctx.static_sk, resp_static_sk, 32);
-		memcpy(resp_ctx.static_pk, resp_static_pk, 32);
-		memcpy(init_ctx.other_static_pk, resp_static_pk, 32);
-		memcpy(resp_ctx.other_static_pk, init_static_pk, 32);
-
-		/* Generate ephemeral ECDHE keys (precomputation) */
-		{
-			struct byte_array sk = { .len = 32, .ptr = init_ctx.eph_sk };
-			struct byte_array pk = { .len = 32, .ptr = init_ctx.eph_pk };
-			ephemeral_dh_key_gen(X25519, 300 + iter, &sk, &pk);
-		}
-		{
-			struct byte_array sk = { .len = 32, .ptr = resp_ctx.eph_sk };
-			struct byte_array pk = { .len = 32, .ptr = resp_ctx.eph_pk };
-			ephemeral_dh_key_gen(X25519, 400 + iter, &sk, &pk);
-		}
-
-		/* Initiator KEM key pair (precomputation) */
-		pq_kem_keygen(init_ctx.kem_pk, init_ctx.kem_sk);
-
-		hybrid_exchange_init();
-
-		struct pq_bench_thread_data i_data, r_data;
-		memset(&i_data, 0, sizeof(i_data));
-		memset(&r_data, 0, sizeof(r_data));
-		i_data.protocol_fn = hybrid_initiator_thread;
-		r_data.protocol_fn = hybrid_responder_thread;
-		i_data.party_ctx = &init_ctx;
-		r_data.party_ctx = &resp_ctx;
-
-		pthread_t tid_i, tid_r;
-		pthread_create(&tid_r, NULL, pq_bench_wrapper_thread, &r_data);
-		pthread_create(&tid_i, NULL, pq_bench_wrapper_thread, &i_data);
-		pthread_join(tid_i, NULL);
-		pthread_join(tid_r, NULL);
-
-		hybrid_exchange_destroy();
-
-		if (init_ctx.success && resp_ctx.success) {
-			double i_wall = elapsed_us(i_data.wall_start_ns, i_data.wall_end_ns);
-			double r_wall = elapsed_us(r_data.wall_start_ns, r_data.wall_end_ns);
-			double i_cpu  = elapsed_us(i_data.cpu_start_ns,  i_data.cpu_end_ns);
-			double r_cpu  = elapsed_us(r_data.cpu_start_ns,  r_data.cpu_end_ns);
-			double i_txrx = (double)init_ctx.txrx_ns / 1000.0;
-			double r_txrx = (double)resp_ctx.txrx_ns / 1000.0;
-
-			total_i_wall += i_wall; total_r_wall += r_wall;
-			total_i_cpu  += i_cpu;  total_r_cpu  += r_cpu;
-			total_i_txrx += i_txrx; total_r_txrx += r_txrx;
-			success_count++;
-		}
-	}
-
-	if (success_count == 0) {
-		print_error("All Hybrid handshake iterations failed!");
-		return -1;
-	}
-
-	double n = (double)success_count;
-	double cpu_i = total_i_cpu / n;
-	double cpu_r = total_r_cpu / n;
-
-	/* Calibrate ops to measured CPU */
-	calibrate_hybrid_ops(ops_init, cpu_i);
-	calibrate_hybrid_ops(ops_resp, cpu_r);
-
-	double ops_sum_i = compute_hybrid_ops_total(ops_init);
-	double ops_sum_r = compute_hybrid_ops_total(ops_resp);
-
-	/* Precomputation = calibrated keygen costs (classic + PQ) */
-	double pre_i = ops_init->keygen.avg_us * ops_init->keygen.calls +
-		      ops_init->pq_keygen.avg_us * ops_init->pq_keygen.calls;
-	double pre_r = ops_resp->keygen.avg_us * ops_resp->keygen.calls +
-		      ops_resp->pq_keygen.avg_us * ops_resp->pq_keygen.calls;
-
-	double proc_i = ops_sum_i - pre_i;
-	double proc_r = ops_sum_r - pre_r;
-
-	long mem = estimate_hybrid_memory();
-	oh_init->cpu_us = proc_i; oh_init->memory_bytes = mem;
-	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = mem;
-
-	double txrx_i = total_i_txrx / n;
-	double txrx_r = total_r_txrx / n;
-	double wall_i = total_i_wall / n;
-	double wall_r = total_r_wall / n;
+	double cpu_i = total_i_cpu / n, cpu_r = total_r_cpu / n;
+
+	/* No calibration — keep raw operation benchmarks.
+	 * Derive processing_us directly from measured CPU time. */
+	double pre_i = SCOST(ops_init->keygen);
+	double pre_r = SCOST(ops_resp->keygen);
+	double proc_i = cpu_i - pre_i;
+	double proc_r = cpu_r - pre_r;
+	if (proc_i < 0) proc_i = 0;
+	if (proc_r < 0) proc_r = 0;
+
+	oh_init->cpu_us = proc_i;
+	oh_init->memory_bytes = sck_estimate_classic_memory(type_num);
+	oh_resp->cpu_us = proc_r;
+	oh_resp->memory_bytes = sck_estimate_classic_memory(type_num);
 
 	hs_init->processing_us     = proc_i;
-	hs_init->txrx_us           = txrx_i;
+	hs_init->txrx_us           = total_i_txrx / n;
 	hs_init->precomputation_us = pre_i;
-	hs_init->total_us          = wall_i;
+	hs_init->total_us          = total_i_wall / n;
 	hs_init->overhead_us       = hs_init->total_us - hs_init->processing_us -
-				    hs_init->txrx_us - hs_init->precomputation_us;
+				     hs_init->txrx_us - hs_init->precomputation_us;
 	if (hs_init->overhead_us < 0) {
 		hs_init->overhead_us = 0;
 		hs_init->total_us = hs_init->processing_us + hs_init->txrx_us + hs_init->precomputation_us;
 	}
 
 	hs_resp->processing_us     = proc_r;
-	hs_resp->txrx_us           = txrx_r;
+	hs_resp->txrx_us           = total_r_txrx / n;
 	hs_resp->precomputation_us = pre_r;
-	hs_resp->total_us          = wall_r;
+	hs_resp->total_us          = total_r_wall / n;
 	hs_resp->overhead_us       = hs_resp->total_us - hs_resp->processing_us -
-				    hs_resp->txrx_us - hs_resp->precomputation_us;
+				     hs_resp->txrx_us - hs_resp->precomputation_us;
 	if (hs_resp->overhead_us < 0) {
 		hs_resp->overhead_us = 0;
 		hs_resp->total_us = hs_resp->processing_us + hs_resp->txrx_us + hs_resp->precomputation_us;
 	}
 
-	char buf[128];
-	snprintf(buf, sizeof(buf),
-		 "Hybrid handshake benchmark completed (%d/%d successful).",
-		 success_count, BENCH_HANDSHAKE_ITERATIONS);
+	snprintf(buf, sizeof(buf), "Classic Type %d socket handshake: %d/%d successful.",
+		 type_num, success_count, SOCK_BENCH_HANDSHAKE_ITERATIONS);
 	print_success(buf);
 	return 0;
 }
 
-/* Hybrid CSV writers (5 variants total) */
-
-static int write_operations_csv_full_hybrid(const char *filepath,
-					 struct ops_benchmark *t0_init,
-					 struct ops_benchmark *t0_resp,
-					 struct ops_benchmark *t3_init,
-					 struct ops_benchmark *t3_resp,
-					 struct ops_benchmark *t0pq_init,
-					 struct ops_benchmark *t0pq_resp,
-					 struct ops_benchmark *t3pq_init,
-					 struct ops_benchmark *t3pq_resp,
-					 struct ops_benchmark *thyb_init,
-					 struct ops_benchmark *thyb_resp)
+static int sck_run_pq_handshake(int pq_type_num, int base_port,
+				struct sck_ops_benchmark *ops_init,
+				struct sck_ops_benchmark *ops_resp,
+				struct sck_overhead_benchmark *oh_init,
+				struct sck_overhead_benchmark *oh_resp,
+				struct sck_handshake_benchmark *hs_init,
+				struct sck_handshake_benchmark *hs_resp)
 {
-	FILE *fp = fopen(filepath, "w");
-	if (!fp) return -1;
+	char buf[128];
+	snprintf(buf, sizeof(buf),
+		 "Socket: PQ Type %d handshake (%d iterations, TCP)...",
+		 pq_type_num, SOCK_BENCH_HANDSHAKE_ITERATIONS);
+	print_info(buf);
 
+	uint8_t init_lt_pk[PQ_KEM_PK_LEN], init_lt_sk[PQ_KEM_SK_LEN];
+	uint8_t resp_lt_pk[PQ_KEM_PK_LEN], resp_lt_sk[PQ_KEM_SK_LEN];
+	if (pq_kem_keygen(init_lt_pk, init_lt_sk) != 0 ||
+	    pq_kem_keygen(resp_lt_pk, resp_lt_sk) != 0) {
+		print_error("PQ keygen setup failed"); return -1;
+	}
+
+	uint8_t init_sig_pk[PQ_SIG_PK_LEN], init_sig_sk[PQ_SIG_SK_LEN];
+	uint8_t resp_sig_pk[PQ_SIG_PK_LEN], resp_sig_sk[PQ_SIG_SK_LEN];
+	if (pq_type_num == 0) {
+		if (pq_sig_keygen(init_sig_pk, init_sig_sk) != 0 ||
+		    pq_sig_keygen(resp_sig_pk, resp_sig_sk) != 0) {
+			print_error("PQ sig keygen setup failed"); return -1;
+		}
+	}
+
+	double total_i_wall = 0, total_r_wall = 0;
+	double total_i_cpu  = 0, total_r_cpu  = 0;
+	double total_i_txrx = 0, total_r_txrx = 0;
+	int success_count = 0;
+
+	for (int iter = 0; iter < SOCK_BENCH_HANDSHAKE_ITERATIONS; iter++) {
+		int port = base_port + iter;
+
+		if (pq_type_num == 0) {
+			/* ── PQ Type 0 ── */
+			struct pq_party_ctx init_ctx, resp_ctx;
+			memset(&init_ctx, 0, sizeof(init_ctx));
+			memset(&resp_ctx, 0, sizeof(resp_ctx));
+			memcpy(init_ctx.lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(init_ctx.lt_sk, init_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(init_ctx.other_lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(init_ctx.sig_pk, init_sig_pk, PQ_SIG_PK_LEN);
+			memcpy(init_ctx.sig_sk, init_sig_sk, PQ_SIG_SK_LEN);
+			memcpy(init_ctx.other_sig_pk, resp_sig_pk, PQ_SIG_PK_LEN);
+			memcpy(resp_ctx.lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx.lt_sk, resp_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(resp_ctx.other_lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx.sig_pk, resp_sig_pk, PQ_SIG_PK_LEN);
+			memcpy(resp_ctx.sig_sk, resp_sig_sk, PQ_SIG_SK_LEN);
+			memcpy(resp_ctx.other_sig_pk, init_sig_pk, PQ_SIG_PK_LEN);
+
+			struct sck_pq_thread_data id, rd;
+			memset(&id, 0, sizeof(id)); memset(&rd, 0, sizeof(rd));
+			id.ctx = &init_ctx; id.port = port;
+			rd.ctx = &resp_ctx; rd.port = port;
+
+			pthread_t tid_r, tid_i;
+			pthread_create(&tid_r, NULL, sck_pq0_responder_thread, &rd);
+			usleep(2000);
+			pthread_create(&tid_i, NULL, sck_pq0_initiator_thread, &id);
+			pthread_join(tid_i, NULL);
+			pthread_join(tid_r, NULL);
+
+			if (id.error == 0 && rd.error == 0) {
+				total_i_wall += sck_elapsed_us(id.wall_start_ns, id.wall_end_ns);
+				total_r_wall += sck_elapsed_us(rd.wall_start_ns, rd.wall_end_ns);
+				total_i_cpu  += sck_elapsed_us(id.cpu_start_ns,  id.cpu_end_ns);
+				total_r_cpu  += sck_elapsed_us(rd.cpu_start_ns,  rd.cpu_end_ns);
+				total_i_txrx += (double)id.txrx_ns / 1000.0;
+				total_r_txrx += (double)rd.txrx_ns / 1000.0;
+				success_count++;
+			}
+		} else {
+			/* ── PQ Type 3 ── */
+			struct pq3_party_ctx init_ctx, resp_ctx;
+			memset(&init_ctx, 0, sizeof(init_ctx));
+			memset(&resp_ctx, 0, sizeof(resp_ctx));
+			memcpy(init_ctx.lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(init_ctx.lt_sk, init_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(init_ctx.other_lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx.lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx.lt_sk, resp_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(resp_ctx.other_lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+
+			struct sck_pq3_thread_data id, rd;
+			memset(&id, 0, sizeof(id)); memset(&rd, 0, sizeof(rd));
+			id.ctx = &init_ctx; id.port = port;
+			rd.ctx = &resp_ctx; rd.port = port;
+
+			pthread_t tid_r, tid_i;
+			pthread_create(&tid_r, NULL, sck_pq3_responder_thread, &rd);
+			usleep(2000);
+			pthread_create(&tid_i, NULL, sck_pq3_initiator_thread, &id);
+			pthread_join(tid_i, NULL);
+			pthread_join(tid_r, NULL);
+
+			if (id.error == 0 && rd.error == 0) {
+				total_i_wall += sck_elapsed_us(id.wall_start_ns, id.wall_end_ns);
+				total_r_wall += sck_elapsed_us(rd.wall_start_ns, rd.wall_end_ns);
+				total_i_cpu  += sck_elapsed_us(id.cpu_start_ns,  id.cpu_end_ns);
+				total_r_cpu  += sck_elapsed_us(rd.cpu_start_ns,  rd.cpu_end_ns);
+				total_i_txrx += (double)id.txrx_ns / 1000.0;
+				total_r_txrx += (double)rd.txrx_ns / 1000.0;
+				success_count++;
+			}
+		}
+	}
+
+	if (success_count == 0) { print_error("All PQ socket handshake failed!"); return -1; }
+
+	double n = (double)success_count;
+	double cpu_i = total_i_cpu / n, cpu_r = total_r_cpu / n;
+
+	/* No calibration — keep raw operation benchmarks. */
+	double pre_i = SCOST(ops_init->pq_keygen);
+	double pre_r = SCOST(ops_resp->pq_keygen);
+	double proc_i = cpu_i - pre_i;
+	double proc_r = cpu_r - pre_r;
+	if (proc_i < 0) proc_i = 0;
+	if (proc_r < 0) proc_r = 0;
+
+	oh_init->cpu_us = proc_i; oh_init->memory_bytes = sck_estimate_pq_memory(pq_type_num);
+	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = sck_estimate_pq_memory(pq_type_num);
+
+	hs_init->processing_us = proc_i; hs_init->txrx_us = total_i_txrx / n;
+	hs_init->precomputation_us = pre_i; hs_init->total_us = total_i_wall / n;
+	hs_init->overhead_us = hs_init->total_us - proc_i - hs_init->txrx_us - pre_i;
+	if (hs_init->overhead_us < 0) { hs_init->overhead_us = 0; hs_init->total_us = proc_i + hs_init->txrx_us + pre_i; }
+
+	hs_resp->processing_us = proc_r; hs_resp->txrx_us = total_r_txrx / n;
+	hs_resp->precomputation_us = pre_r; hs_resp->total_us = total_r_wall / n;
+	hs_resp->overhead_us = hs_resp->total_us - proc_r - hs_resp->txrx_us - pre_r;
+	if (hs_resp->overhead_us < 0) { hs_resp->overhead_us = 0; hs_resp->total_us = proc_r + hs_resp->txrx_us + pre_r; }
+
+	snprintf(buf, sizeof(buf), "PQ Type %d socket handshake: %d/%d successful.",
+		 pq_type_num, success_count, SOCK_BENCH_HANDSHAKE_ITERATIONS);
+	print_success(buf);
+	return 0;
+}
+
+static int sck_run_hybrid_handshake(int base_port,
+				    struct sck_ops_benchmark *ops_init,
+				    struct sck_ops_benchmark *ops_resp,
+				    struct sck_overhead_benchmark *oh_init,
+				    struct sck_overhead_benchmark *oh_resp,
+				    struct sck_handshake_benchmark *hs_init,
+				    struct sck_handshake_benchmark *hs_resp)
+{
+	print_info("Socket: Hybrid Type 3 handshake (TCP)...");
+
+	uint8_t init_static_sk[32], init_static_pk[32];
+	uint8_t resp_static_sk[32], resp_static_pk[32];
+	{
+		struct byte_array sk = {.len=32,.ptr=init_static_sk};
+		struct byte_array pk = {.len=32,.ptr=init_static_pk};
+		if (ephemeral_dh_key_gen(X25519, 100, &sk, &pk) != ok) return -1;
+	}
+	{
+		struct byte_array sk = {.len=32,.ptr=resp_static_sk};
+		struct byte_array pk = {.len=32,.ptr=resp_static_pk};
+		if (ephemeral_dh_key_gen(X25519, 200, &sk, &pk) != ok) return -1;
+	}
+
+	double total_i_wall = 0, total_r_wall = 0;
+	double total_i_cpu  = 0, total_r_cpu  = 0;
+	double total_i_txrx = 0, total_r_txrx = 0;
+	int success_count = 0;
+
+	for (int iter = 0; iter < SOCK_BENCH_HANDSHAKE_ITERATIONS; iter++) {
+		int port = base_port + iter;
+
+		struct hybrid_party_ctx init_ctx, resp_ctx;
+		memset(&init_ctx, 0, sizeof(init_ctx));
+		memset(&resp_ctx, 0, sizeof(resp_ctx));
+		memcpy(init_ctx.static_sk, init_static_sk, 32);
+		memcpy(init_ctx.static_pk, init_static_pk, 32);
+		memcpy(resp_ctx.static_sk, resp_static_sk, 32);
+		memcpy(resp_ctx.static_pk, resp_static_pk, 32);
+		memcpy(init_ctx.other_static_pk, resp_static_pk, 32);
+		memcpy(resp_ctx.other_static_pk, init_static_pk, 32);
+		{
+			struct byte_array sk = {.len=32,.ptr=init_ctx.eph_sk};
+			struct byte_array pk = {.len=32,.ptr=init_ctx.eph_pk};
+			ephemeral_dh_key_gen(X25519, 300+iter, &sk, &pk);
+		}
+		{
+			struct byte_array sk = {.len=32,.ptr=resp_ctx.eph_sk};
+			struct byte_array pk = {.len=32,.ptr=resp_ctx.eph_pk};
+			ephemeral_dh_key_gen(X25519, 400+iter, &sk, &pk);
+		}
+		pq_kem_keygen(init_ctx.kem_pk, init_ctx.kem_sk);
+
+		struct sck_hyb_thread_data id, rd;
+		memset(&id, 0, sizeof(id)); memset(&rd, 0, sizeof(rd));
+		id.ctx = &init_ctx; id.port = port;
+		rd.ctx = &resp_ctx; rd.port = port;
+
+		pthread_t tid_r, tid_i;
+		pthread_create(&tid_r, NULL, sck_hyb_responder_thread, &rd);
+		usleep(2000);
+		pthread_create(&tid_i, NULL, sck_hyb_initiator_thread, &id);
+		pthread_join(tid_i, NULL);
+		pthread_join(tid_r, NULL);
+
+		if (id.error == 0 && rd.error == 0) {
+			total_i_wall += sck_elapsed_us(id.wall_start_ns, id.wall_end_ns);
+			total_r_wall += sck_elapsed_us(rd.wall_start_ns, rd.wall_end_ns);
+			total_i_cpu  += sck_elapsed_us(id.cpu_start_ns,  id.cpu_end_ns);
+			total_r_cpu  += sck_elapsed_us(rd.cpu_start_ns,  rd.cpu_end_ns);
+			total_i_txrx += (double)id.txrx_ns / 1000.0;
+			total_r_txrx += (double)rd.txrx_ns / 1000.0;
+			success_count++;
+		}
+	}
+
+	if (success_count == 0) { print_error("All Hybrid socket handshake failed!"); return -1; }
+
+	double n = (double)success_count;
+	double cpu_i = total_i_cpu / n, cpu_r = total_r_cpu / n;
+
+	/* No calibration — keep raw operation benchmarks.
+	 * Hybrid precomp = X25519 keygen + PQ keygen. */
+	double pre_i = SCOST(ops_init->keygen) + SCOST(ops_init->pq_keygen);
+	double pre_r = SCOST(ops_resp->keygen) + SCOST(ops_resp->pq_keygen);
+	double proc_i = cpu_i - pre_i;
+	double proc_r = cpu_r - pre_r;
+	if (proc_i < 0) proc_i = 0;
+	if (proc_r < 0) proc_r = 0;
+
+	oh_init->cpu_us = proc_i; oh_init->memory_bytes = sck_estimate_hybrid_memory();
+	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = sck_estimate_hybrid_memory();
+
+	hs_init->processing_us = proc_i; hs_init->txrx_us = total_i_txrx / n;
+	hs_init->precomputation_us = pre_i; hs_init->total_us = total_i_wall / n;
+	hs_init->overhead_us = hs_init->total_us - proc_i - hs_init->txrx_us - pre_i;
+	if (hs_init->overhead_us < 0) { hs_init->overhead_us = 0; hs_init->total_us = proc_i + hs_init->txrx_us + pre_i; }
+
+	hs_resp->processing_us = proc_r; hs_resp->txrx_us = total_r_txrx / n;
+	hs_resp->precomputation_us = pre_r; hs_resp->total_us = total_r_wall / n;
+	hs_resp->overhead_us = hs_resp->total_us - proc_r - hs_resp->txrx_us - pre_r;
+	if (hs_resp->overhead_us < 0) { hs_resp->overhead_us = 0; hs_resp->total_us = proc_r + hs_resp->txrx_us + pre_r; }
+
+	char buf[128];
+	snprintf(buf, sizeof(buf), "Hybrid socket handshake: %d/%d successful.",
+		 success_count, SOCK_BENCH_HANDSHAKE_ITERATIONS);
+	print_success(buf);
+	return 0;
+}
+
+/* =============================================================================
+ * CSV Writers (identical format to edhoc_benchmark.c)
+ * =============================================================================
+ */
+
+#define SWRITE_OP(TYPE, ROLE, OP_NAME, OP) \
+	fprintf(fp, "%s,%s,%s,%.3f,%d,%.3f,%d\n", \
+		TYPE, ROLE, OP_NAME, (OP).avg_us, (OP).calls, \
+		(OP).avg_us * (double)(OP).calls, (OP).count)
+
+static int sck_write_operations_csv(const char *path,
+	struct sck_ops_benchmark *t0i, struct sck_ops_benchmark *t0r,
+	struct sck_ops_benchmark *t3i, struct sck_ops_benchmark *t3r,
+	struct sck_ops_benchmark *t0pi, struct sck_ops_benchmark *t0pr,
+	struct sck_ops_benchmark *t3pi, struct sck_ops_benchmark *t3pr,
+	struct sck_ops_benchmark *thi, struct sck_ops_benchmark *thr)
+{
+	FILE *fp = fopen(path, "w");
+	if (!fp) return -1;
 	fprintf(fp, "type,role,operation,avg_time_us,calls_per_handshake,total_per_handshake_us,iterations\n");
 
-	#define WRITE_OP(TYPE, ROLE, OP_NAME, OP) \
-		fprintf(fp, "%s,%s,%s,%.3f,%d,%.3f,%d\n", \
-			TYPE, ROLE, OP_NAME, (OP).avg_us, (OP).calls, \
-			(OP).avg_us * (double)(OP).calls, (OP).count)
-
 	/* Classic Type 0 */
-	WRITE_OP("Type0_SigSig", "Initiator", "KeyGen",       t0_init->keygen);
-	WRITE_OP("Type0_SigSig", "Initiator", "Encap",        t0_init->encap);
-	WRITE_OP("Type0_SigSig", "Initiator", "Decap",        t0_init->decap);
-	WRITE_OP("Type0_SigSig", "Initiator", "Signature",    t0_init->signature);
-	WRITE_OP("Type0_SigSig", "Initiator", "Verification", t0_init->verification);
-	WRITE_OP("Type0_SigSig", "Initiator", "ECDH",         t0_init->ecdh);
-	WRITE_OP("Type0_SigSig", "Initiator", "HKDF",         t0_init->hkdf);
-	WRITE_OP("Type0_SigSig", "Initiator", "Hash",         t0_init->hash);
-	WRITE_OP("Type0_SigSig", "Responder", "KeyGen",       t0_resp->keygen);
-	WRITE_OP("Type0_SigSig", "Responder", "Encap",        t0_resp->encap);
-	WRITE_OP("Type0_SigSig", "Responder", "Decap",        t0_resp->decap);
-	WRITE_OP("Type0_SigSig", "Responder", "Signature",    t0_resp->signature);
-	WRITE_OP("Type0_SigSig", "Responder", "Verification", t0_resp->verification);
-	WRITE_OP("Type0_SigSig", "Responder", "ECDH",         t0_resp->ecdh);
-	WRITE_OP("Type0_SigSig", "Responder", "HKDF",         t0_resp->hkdf);
-	WRITE_OP("Type0_SigSig", "Responder", "Hash",         t0_resp->hash);
+	SWRITE_OP("Type0_SigSig","Initiator","KeyGen",t0i->keygen);
+	SWRITE_OP("Type0_SigSig","Initiator","Encap",t0i->encap);
+	SWRITE_OP("Type0_SigSig","Initiator","Decap",t0i->decap);
+	SWRITE_OP("Type0_SigSig","Initiator","Signature",t0i->signature);
+	SWRITE_OP("Type0_SigSig","Initiator","Verification",t0i->verification);
+	SWRITE_OP("Type0_SigSig","Initiator","ECDH",t0i->ecdh);
+	SWRITE_OP("Type0_SigSig","Initiator","HKDF",t0i->hkdf);
+	SWRITE_OP("Type0_SigSig","Initiator","Hash",t0i->hash);
+	SWRITE_OP("Type0_SigSig","Responder","KeyGen",t0r->keygen);
+	SWRITE_OP("Type0_SigSig","Responder","Encap",t0r->encap);
+	SWRITE_OP("Type0_SigSig","Responder","Decap",t0r->decap);
+	SWRITE_OP("Type0_SigSig","Responder","Signature",t0r->signature);
+	SWRITE_OP("Type0_SigSig","Responder","Verification",t0r->verification);
+	SWRITE_OP("Type0_SigSig","Responder","ECDH",t0r->ecdh);
+	SWRITE_OP("Type0_SigSig","Responder","HKDF",t0r->hkdf);
+	SWRITE_OP("Type0_SigSig","Responder","Hash",t0r->hash);
 
 	/* Classic Type 3 */
-	WRITE_OP("Type3_MACMAC", "Initiator", "KeyGen",       t3_init->keygen);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Encap",        t3_init->encap);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Decap",        t3_init->decap);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Signature",    t3_init->signature);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Verification", t3_init->verification);
-	WRITE_OP("Type3_MACMAC", "Initiator", "ECDH",         t3_init->ecdh);
-	WRITE_OP("Type3_MACMAC", "Initiator", "HKDF",         t3_init->hkdf);
-	WRITE_OP("Type3_MACMAC", "Initiator", "Hash",         t3_init->hash);
-	WRITE_OP("Type3_MACMAC", "Responder", "KeyGen",       t3_resp->keygen);
-	WRITE_OP("Type3_MACMAC", "Responder", "Encap",        t3_resp->encap);
-	WRITE_OP("Type3_MACMAC", "Responder", "Decap",        t3_resp->decap);
-	WRITE_OP("Type3_MACMAC", "Responder", "Signature",    t3_resp->signature);
-	WRITE_OP("Type3_MACMAC", "Responder", "Verification", t3_resp->verification);
-	WRITE_OP("Type3_MACMAC", "Responder", "ECDH",         t3_resp->ecdh);
-	WRITE_OP("Type3_MACMAC", "Responder", "HKDF",         t3_resp->hkdf);
-	WRITE_OP("Type3_MACMAC", "Responder", "Hash",         t3_resp->hash);
+	SWRITE_OP("Type3_MACMAC","Initiator","KeyGen",t3i->keygen);
+	SWRITE_OP("Type3_MACMAC","Initiator","Encap",t3i->encap);
+	SWRITE_OP("Type3_MACMAC","Initiator","Decap",t3i->decap);
+	SWRITE_OP("Type3_MACMAC","Initiator","Signature",t3i->signature);
+	SWRITE_OP("Type3_MACMAC","Initiator","Verification",t3i->verification);
+	SWRITE_OP("Type3_MACMAC","Initiator","ECDH",t3i->ecdh);
+	SWRITE_OP("Type3_MACMAC","Initiator","HKDF",t3i->hkdf);
+	SWRITE_OP("Type3_MACMAC","Initiator","Hash",t3i->hash);
+	SWRITE_OP("Type3_MACMAC","Responder","KeyGen",t3r->keygen);
+	SWRITE_OP("Type3_MACMAC","Responder","Encap",t3r->encap);
+	SWRITE_OP("Type3_MACMAC","Responder","Decap",t3r->decap);
+	SWRITE_OP("Type3_MACMAC","Responder","Signature",t3r->signature);
+	SWRITE_OP("Type3_MACMAC","Responder","Verification",t3r->verification);
+	SWRITE_OP("Type3_MACMAC","Responder","ECDH",t3r->ecdh);
+	SWRITE_OP("Type3_MACMAC","Responder","HKDF",t3r->hkdf);
+	SWRITE_OP("Type3_MACMAC","Responder","Hash",t3r->hash);
 
 	/* PQ Type 0 */
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_KeyGen",       t0pq_init->pq_keygen);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Encaps",       t0pq_init->pq_encaps);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Decaps",       t0pq_init->pq_decaps);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Signature",    t0pq_init->pq_sig_sign);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Verification", t0pq_init->pq_sig_verify);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_AEAD_Enc",     t0pq_init->pq_aead_enc);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_AEAD_Dec",     t0pq_init->pq_aead_dec);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_HKDF",         t0pq_init->pq_hkdf);
-	WRITE_OP("Type0_PQ", "Initiator", "PQ_Hash",         t0pq_init->pq_hash);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_KeyGen",       t0pq_resp->pq_keygen);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Encaps",       t0pq_resp->pq_encaps);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Decaps",       t0pq_resp->pq_decaps);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Signature",    t0pq_resp->pq_sig_sign);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Verification", t0pq_resp->pq_sig_verify);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_AEAD_Enc",     t0pq_resp->pq_aead_enc);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_AEAD_Dec",     t0pq_resp->pq_aead_dec);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_HKDF",         t0pq_resp->pq_hkdf);
-	WRITE_OP("Type0_PQ", "Responder", "PQ_Hash",         t0pq_resp->pq_hash);
+	SWRITE_OP("Type0_PQ","Initiator","PQ_KeyGen",t0pi->pq_keygen);
+	SWRITE_OP("Type0_PQ","Initiator","PQ_Encaps",t0pi->pq_encaps);
+	SWRITE_OP("Type0_PQ","Initiator","PQ_Decaps",t0pi->pq_decaps);
+	SWRITE_OP("Type0_PQ","Initiator","PQ_Signature",t0pi->pq_sig_sign);
+	SWRITE_OP("Type0_PQ","Initiator","PQ_Verification",t0pi->pq_sig_verify);
+	SWRITE_OP("Type0_PQ","Initiator","PQ_AEAD_Enc",t0pi->pq_aead_enc);
+	SWRITE_OP("Type0_PQ","Initiator","PQ_AEAD_Dec",t0pi->pq_aead_dec);
+	SWRITE_OP("Type0_PQ","Initiator","PQ_HKDF",t0pi->pq_hkdf);
+	SWRITE_OP("Type0_PQ","Initiator","PQ_Hash",t0pi->pq_hash);
+	SWRITE_OP("Type0_PQ","Responder","PQ_KeyGen",t0pr->pq_keygen);
+	SWRITE_OP("Type0_PQ","Responder","PQ_Encaps",t0pr->pq_encaps);
+	SWRITE_OP("Type0_PQ","Responder","PQ_Decaps",t0pr->pq_decaps);
+	SWRITE_OP("Type0_PQ","Responder","PQ_Signature",t0pr->pq_sig_sign);
+	SWRITE_OP("Type0_PQ","Responder","PQ_Verification",t0pr->pq_sig_verify);
+	SWRITE_OP("Type0_PQ","Responder","PQ_AEAD_Enc",t0pr->pq_aead_enc);
+	SWRITE_OP("Type0_PQ","Responder","PQ_AEAD_Dec",t0pr->pq_aead_dec);
+	SWRITE_OP("Type0_PQ","Responder","PQ_HKDF",t0pr->pq_hkdf);
+	SWRITE_OP("Type0_PQ","Responder","PQ_Hash",t0pr->pq_hash);
 
 	/* PQ Type 3 */
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_KeyGen",       t3pq_init->pq_keygen);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Encaps",       t3pq_init->pq_encaps);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Decaps",       t3pq_init->pq_decaps);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Signature",    t3pq_init->pq_sig_sign);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Verification", t3pq_init->pq_sig_verify);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_AEAD_Enc",     t3pq_init->pq_aead_enc);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_AEAD_Dec",     t3pq_init->pq_aead_dec);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_HKDF",         t3pq_init->pq_hkdf);
-	WRITE_OP("Type3_PQ", "Initiator", "PQ_Hash",         t3pq_init->pq_hash);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_KeyGen",       t3pq_resp->pq_keygen);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Encaps",       t3pq_resp->pq_encaps);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Decaps",       t3pq_resp->pq_decaps);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Signature",    t3pq_resp->pq_sig_sign);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Verification", t3pq_resp->pq_sig_verify);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_AEAD_Enc",     t3pq_resp->pq_aead_enc);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_AEAD_Dec",     t3pq_resp->pq_aead_dec);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_HKDF",         t3pq_resp->pq_hkdf);
-	WRITE_OP("Type3_PQ", "Responder", "PQ_Hash",         t3pq_resp->pq_hash);
+	SWRITE_OP("Type3_PQ","Initiator","PQ_KeyGen",t3pi->pq_keygen);
+	SWRITE_OP("Type3_PQ","Initiator","PQ_Encaps",t3pi->pq_encaps);
+	SWRITE_OP("Type3_PQ","Initiator","PQ_Decaps",t3pi->pq_decaps);
+	SWRITE_OP("Type3_PQ","Initiator","PQ_Signature",t3pi->pq_sig_sign);
+	SWRITE_OP("Type3_PQ","Initiator","PQ_Verification",t3pi->pq_sig_verify);
+	SWRITE_OP("Type3_PQ","Initiator","PQ_AEAD_Enc",t3pi->pq_aead_enc);
+	SWRITE_OP("Type3_PQ","Initiator","PQ_AEAD_Dec",t3pi->pq_aead_dec);
+	SWRITE_OP("Type3_PQ","Initiator","PQ_HKDF",t3pi->pq_hkdf);
+	SWRITE_OP("Type3_PQ","Initiator","PQ_Hash",t3pi->pq_hash);
+	SWRITE_OP("Type3_PQ","Responder","PQ_KeyGen",t3pr->pq_keygen);
+	SWRITE_OP("Type3_PQ","Responder","PQ_Encaps",t3pr->pq_encaps);
+	SWRITE_OP("Type3_PQ","Responder","PQ_Decaps",t3pr->pq_decaps);
+	SWRITE_OP("Type3_PQ","Responder","PQ_Signature",t3pr->pq_sig_sign);
+	SWRITE_OP("Type3_PQ","Responder","PQ_Verification",t3pr->pq_sig_verify);
+	SWRITE_OP("Type3_PQ","Responder","PQ_AEAD_Enc",t3pr->pq_aead_enc);
+	SWRITE_OP("Type3_PQ","Responder","PQ_AEAD_Dec",t3pr->pq_aead_dec);
+	SWRITE_OP("Type3_PQ","Responder","PQ_HKDF",t3pr->pq_hkdf);
+	SWRITE_OP("Type3_PQ","Responder","PQ_Hash",t3pr->pq_hash);
 
 	/* Hybrid Type 3 */
-	WRITE_OP("Type3_Hybrid", "Initiator", "KeyGen",    thyb_init->keygen);
-	WRITE_OP("Type3_Hybrid", "Initiator", "Encap",     thyb_init->encap);
-	WRITE_OP("Type3_Hybrid", "Initiator", "Decap",     thyb_init->decap);
-	WRITE_OP("Type3_Hybrid", "Initiator", "ECDH",      thyb_init->ecdh);
-	WRITE_OP("Type3_Hybrid", "Initiator", "HKDF",      thyb_init->hkdf);
-	WRITE_OP("Type3_Hybrid", "Initiator", "Hash",      thyb_init->hash);
-	WRITE_OP("Type3_Hybrid", "Initiator", "PQ_KeyGen", thyb_init->pq_keygen);
-	WRITE_OP("Type3_Hybrid", "Initiator", "PQ_Encaps", thyb_init->pq_encaps);
-	WRITE_OP("Type3_Hybrid", "Initiator", "PQ_Decaps", thyb_init->pq_decaps);
+	SWRITE_OP("Type3_Hybrid","Initiator","KeyGen",thi->keygen);
+	SWRITE_OP("Type3_Hybrid","Initiator","Encap",thi->encap);
+	SWRITE_OP("Type3_Hybrid","Initiator","Decap",thi->decap);
+	SWRITE_OP("Type3_Hybrid","Initiator","ECDH",thi->ecdh);
+	SWRITE_OP("Type3_Hybrid","Initiator","HKDF",thi->hkdf);
+	SWRITE_OP("Type3_Hybrid","Initiator","Hash",thi->hash);
+	SWRITE_OP("Type3_Hybrid","Initiator","PQ_KeyGen",thi->pq_keygen);
+	SWRITE_OP("Type3_Hybrid","Initiator","PQ_Encaps",thi->pq_encaps);
+	SWRITE_OP("Type3_Hybrid","Initiator","PQ_Decaps",thi->pq_decaps);
+	SWRITE_OP("Type3_Hybrid","Responder","KeyGen",thr->keygen);
+	SWRITE_OP("Type3_Hybrid","Responder","Encap",thr->encap);
+	SWRITE_OP("Type3_Hybrid","Responder","Decap",thr->decap);
+	SWRITE_OP("Type3_Hybrid","Responder","ECDH",thr->ecdh);
+	SWRITE_OP("Type3_Hybrid","Responder","HKDF",thr->hkdf);
+	SWRITE_OP("Type3_Hybrid","Responder","Hash",thr->hash);
+	SWRITE_OP("Type3_Hybrid","Responder","PQ_KeyGen",thr->pq_keygen);
+	SWRITE_OP("Type3_Hybrid","Responder","PQ_Encaps",thr->pq_encaps);
+	SWRITE_OP("Type3_Hybrid","Responder","PQ_Decaps",thr->pq_decaps);
 
-	WRITE_OP("Type3_Hybrid", "Responder", "KeyGen",    thyb_resp->keygen);
-	WRITE_OP("Type3_Hybrid", "Responder", "Encap",     thyb_resp->encap);
-	WRITE_OP("Type3_Hybrid", "Responder", "Decap",     thyb_resp->decap);
-	WRITE_OP("Type3_Hybrid", "Responder", "ECDH",      thyb_resp->ecdh);
-	WRITE_OP("Type3_Hybrid", "Responder", "HKDF",      thyb_resp->hkdf);
-	WRITE_OP("Type3_Hybrid", "Responder", "Hash",      thyb_resp->hash);
-	WRITE_OP("Type3_Hybrid", "Responder", "PQ_KeyGen", thyb_resp->pq_keygen);
-	WRITE_OP("Type3_Hybrid", "Responder", "PQ_Encaps", thyb_resp->pq_encaps);
-	WRITE_OP("Type3_Hybrid", "Responder", "PQ_Decaps", thyb_resp->pq_decaps);
-
-	#undef WRITE_OP
 	fclose(fp);
 	return 0;
 }
 
-static int write_overhead_csv_full_hybrid(const char *filepath,
-					struct overhead_benchmark *t0_init,
-					struct overhead_benchmark *t0_resp,
-					struct overhead_benchmark *t3_init,
-					struct overhead_benchmark *t3_resp,
-					struct overhead_benchmark *t0pq_init,
-					struct overhead_benchmark *t0pq_resp,
-					struct overhead_benchmark *t3pq_init,
-					struct overhead_benchmark *t3pq_resp,
-					struct overhead_benchmark *thyb_init,
-					struct overhead_benchmark *thyb_resp)
+static int sck_write_overhead_csv(const char *path,
+	struct sck_overhead_benchmark *t0i, struct sck_overhead_benchmark *t0r,
+	struct sck_overhead_benchmark *t3i, struct sck_overhead_benchmark *t3r,
+	struct sck_overhead_benchmark *t0pi, struct sck_overhead_benchmark *t0pr,
+	struct sck_overhead_benchmark *t3pi, struct sck_overhead_benchmark *t3pr,
+	struct sck_overhead_benchmark *thi, struct sck_overhead_benchmark *thr)
 {
-	FILE *fp = fopen(filepath, "w");
+	FILE *fp = fopen(path, "w");
 	if (!fp) return -1;
-
 	fprintf(fp, "type,role,cpu_time_us,memory_bytes,memory_note\n");
-	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%ld,estimated_stack_heap\n",
-		t0_init->cpu_us, t0_init->memory_bytes);
-	fprintf(fp, "Type0_SigSig,Responder,%.3f,%ld,estimated_stack_heap\n",
-		t0_resp->cpu_us, t0_resp->memory_bytes);
-	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%ld,estimated_stack_heap\n",
-		t3_init->cpu_us, t3_init->memory_bytes);
-	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%ld,estimated_stack_heap\n",
-		t3_resp->cpu_us, t3_resp->memory_bytes);
-	fprintf(fp, "Type0_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n",
-		t0pq_init->cpu_us, t0pq_init->memory_bytes);
-	fprintf(fp, "Type0_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n",
-		t0pq_resp->cpu_us, t0pq_resp->memory_bytes);
-	fprintf(fp, "Type3_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n",
-		t3pq_init->cpu_us, t3pq_init->memory_bytes);
-	fprintf(fp, "Type3_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n",
-		t3pq_resp->cpu_us, t3pq_resp->memory_bytes);
-	fprintf(fp, "Type3_Hybrid,Initiator,%.3f,%ld,estimated_stack_heap_hybrid\n",
-		thyb_init->cpu_us, thyb_init->memory_bytes);
-	fprintf(fp, "Type3_Hybrid,Responder,%.3f,%ld,estimated_stack_heap_hybrid\n",
-		thyb_resp->cpu_us, thyb_resp->memory_bytes);
-
+	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%ld,estimated_stack_heap\n", t0i->cpu_us, t0i->memory_bytes);
+	fprintf(fp, "Type0_SigSig,Responder,%.3f,%ld,estimated_stack_heap\n", t0r->cpu_us, t0r->memory_bytes);
+	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%ld,estimated_stack_heap\n", t3i->cpu_us, t3i->memory_bytes);
+	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%ld,estimated_stack_heap\n", t3r->cpu_us, t3r->memory_bytes);
+	fprintf(fp, "Type0_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n", t0pi->cpu_us, t0pi->memory_bytes);
+	fprintf(fp, "Type0_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n", t0pr->cpu_us, t0pr->memory_bytes);
+	fprintf(fp, "Type3_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n", t3pi->cpu_us, t3pi->memory_bytes);
+	fprintf(fp, "Type3_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n", t3pr->cpu_us, t3pr->memory_bytes);
+	fprintf(fp, "Type3_Hybrid,Initiator,%.3f,%ld,estimated_stack_heap_hybrid\n", thi->cpu_us, thi->memory_bytes);
+	fprintf(fp, "Type3_Hybrid,Responder,%.3f,%ld,estimated_stack_heap_hybrid\n", thr->cpu_us, thr->memory_bytes);
 	fclose(fp);
 	return 0;
 }
 
-static int write_handshake_csv_full_hybrid(const char *filepath,
-					struct handshake_benchmark *t0_init,
-					struct handshake_benchmark *t0_resp,
-					struct handshake_benchmark *t3_init,
-					struct handshake_benchmark *t3_resp,
-					struct handshake_benchmark *t0pq_init,
-					struct handshake_benchmark *t0pq_resp,
-					struct handshake_benchmark *t3pq_init,
-					struct handshake_benchmark *t3pq_resp,
-					struct handshake_benchmark *thyb_init,
-					struct handshake_benchmark *thyb_resp)
+static int sck_write_handshake_csv(const char *path,
+	struct sck_handshake_benchmark *t0i, struct sck_handshake_benchmark *t0r,
+	struct sck_handshake_benchmark *t3i, struct sck_handshake_benchmark *t3r,
+	struct sck_handshake_benchmark *t0pi, struct sck_handshake_benchmark *t0pr,
+	struct sck_handshake_benchmark *t3pi, struct sck_handshake_benchmark *t3pr,
+	struct sck_handshake_benchmark *thi, struct sck_handshake_benchmark *thr)
 {
-	FILE *fp = fopen(filepath, "w");
+	FILE *fp = fopen(path, "w");
 	if (!fp) return -1;
-
 	fprintf(fp, "type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us\n");
-	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t0_init->processing_us, t0_init->txrx_us,
-		t0_init->precomputation_us, t0_init->overhead_us,
-		t0_init->total_us);
-	fprintf(fp, "Type0_SigSig,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t0_resp->processing_us, t0_resp->txrx_us,
-		t0_resp->precomputation_us, t0_resp->overhead_us,
-		t0_resp->total_us);
-	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t3_init->processing_us, t3_init->txrx_us,
-		t3_init->precomputation_us, t3_init->overhead_us,
-		t3_init->total_us);
-	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t3_resp->processing_us, t3_resp->txrx_us,
-		t3_resp->precomputation_us, t3_resp->overhead_us,
-		t3_resp->total_us);
-	fprintf(fp, "Type0_PQ,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t0pq_init->processing_us, t0pq_init->txrx_us,
-		t0pq_init->precomputation_us, t0pq_init->overhead_us,
-		t0pq_init->total_us);
-	fprintf(fp, "Type0_PQ,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t0pq_resp->processing_us, t0pq_resp->txrx_us,
-		t0pq_resp->precomputation_us, t0pq_resp->overhead_us,
-		t0pq_resp->total_us);
-	fprintf(fp, "Type3_PQ,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t3pq_init->processing_us, t3pq_init->txrx_us,
-		t3pq_init->precomputation_us, t3pq_init->overhead_us,
-		t3pq_init->total_us);
-	fprintf(fp, "Type3_PQ,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		t3pq_resp->processing_us, t3pq_resp->txrx_us,
-		t3pq_resp->precomputation_us, t3pq_resp->overhead_us,
-		t3pq_resp->total_us);
-	fprintf(fp, "Type3_Hybrid,Initiator,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		thyb_init->processing_us, thyb_init->txrx_us,
-		thyb_init->precomputation_us, thyb_init->overhead_us,
-		thyb_init->total_us);
-	fprintf(fp, "Type3_Hybrid,Responder,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-		thyb_resp->processing_us, thyb_resp->txrx_us,
-		thyb_resp->precomputation_us, thyb_resp->overhead_us,
-		thyb_resp->total_us);
-
+	#define WHS(T,R,D) fprintf(fp, "%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f\n", T, R, \
+		(D)->processing_us, (D)->txrx_us, (D)->precomputation_us, (D)->overhead_us, (D)->total_us)
+	WHS("Type0_SigSig","Initiator",t0i); WHS("Type0_SigSig","Responder",t0r);
+	WHS("Type3_MACMAC","Initiator",t3i); WHS("Type3_MACMAC","Responder",t3r);
+	WHS("Type0_PQ","Initiator",t0pi);     WHS("Type0_PQ","Responder",t0pr);
+	WHS("Type3_PQ","Initiator",t3pi);     WHS("Type3_PQ","Responder",t3pr);
+	WHS("Type3_Hybrid","Initiator",thi);  WHS("Type3_Hybrid","Responder",thr);
+	#undef WHS
 	fclose(fp);
 	return 0;
 }
 
 /* =============================================================================
- * run_edhoc_benchmark_full_hybrid() — 5 variants (Classic + PQ + Hybrid)
+ * Main Entry: run_edhoc_benchmark_socket()
  * =============================================================================
  */
 
-int run_edhoc_benchmark_full_hybrid(void)
+int run_edhoc_benchmark_socket(void)
 {
-	print_header("EDHOC-Hybrid Full Benchmark (Classic + PQ + Hybrid)");
+	print_header("EDHOC Socket-based Benchmark (TCP localhost, All 5 Variants)");
 	printf("\n");
-	print_info("Benchmark Configuration:");
 	char buf[256];
-	snprintf(buf, sizeof(buf),
-		 "  Operations iterations : %d", BENCH_ITERATIONS);
+	snprintf(buf, sizeof(buf), "  Operations iterations : %d", SOCK_BENCH_ITERATIONS);
 	print_info(buf);
-	snprintf(buf, sizeof(buf),
-		 "  Handshake iterations  : %d", BENCH_HANDSHAKE_ITERATIONS);
+	snprintf(buf, sizeof(buf), "  Handshake iterations  : %d", SOCK_BENCH_HANDSHAKE_ITERATIONS);
 	print_info(buf);
+	print_info("  Transport: TCP localhost (127.0.0.1)");
 	print_info("  Variants: Type0, Type3, Type0_PQ, Type3_PQ, Type3_Hybrid");
 	printf("\n");
 
-	mkdir(BENCH_OUTPUT_DIR, 0755);
+	mkdir(SOCK_BENCH_OUTPUT_DIR, 0755);
 
-	/* Phase 1a: Classic ops */
-	print_header("Phase 1a: Classic Operations Benchmark");
+	/* === Phase 1: Benchmark each crypto primitive exactly once === */
+	print_header("Phase 1: Crypto Primitive Benchmarks");
 	printf("\n");
-	struct ops_benchmark t0_ops_init, t0_ops_resp;
-	struct ops_benchmark t3_ops_init, t3_ops_resp;
-	memset(&t0_ops_init, 0, sizeof(t0_ops_init));
-	memset(&t0_ops_resp, 0, sizeof(t0_ops_resp));
-	memset(&t3_ops_init, 0, sizeof(t3_ops_init));
-	memset(&t3_ops_resp, 0, sizeof(t3_ops_resp));
-	bench_all_operations("Type 0 (Sig-Sig)", 0, &t0_ops_init, &t0_ops_resp);
-	bench_all_operations("Type 3 (MAC-MAC)", 3, &t3_ops_init, &t3_ops_resp);
-	print_ops_summary("Type 0 (Sig-Sig)", &t0_ops_init, &t0_ops_resp);
-	print_ops_summary("Type 3 (MAC-MAC)", &t3_ops_init, &t3_ops_resp);
+	print_info("Benchmarking all primitives (each measured once, shared across variants)...");
+	struct sck_prim_cache pcache;
+	memset(&pcache, 0, sizeof(pcache));
+	sck_bench_all_primitives(&pcache);
+	print_success("Primitive benchmarks done.");
 
-	/* Phase 1b: PQ ops */
-	print_header("Phase 1b: PQ Operations Benchmark");
-	printf("\n");
-	struct ops_benchmark t0pq_ops_init, t0pq_ops_resp;
-	struct ops_benchmark t3pq_ops_init, t3pq_ops_resp;
-	memset(&t0pq_ops_init, 0, sizeof(t0pq_ops_init));
-	memset(&t0pq_ops_resp, 0, sizeof(t0pq_ops_resp));
-	memset(&t3pq_ops_init, 0, sizeof(t3pq_ops_init));
-	memset(&t3pq_ops_resp, 0, sizeof(t3pq_ops_resp));
-	bench_pq_all_operations("Type 0 PQ (ML-KEM-768 + ML-DSA-65)", 0,
-				&t0pq_ops_init, &t0pq_ops_resp);
-	bench_pq_all_operations("Type 3 PQ (ML-KEM-768)", 3,
-				&t3pq_ops_init, &t3pq_ops_resp);
-	print_pq_ops_summary("Type 0 PQ (ML-KEM-768 + ML-DSA-65)", &t0pq_ops_init, &t0pq_ops_resp);
-	print_pq_ops_summary("Type 3 PQ (ML-KEM-768)", &t3pq_ops_init, &t3pq_ops_resp);
+	/* Assemble per-variant ops from shared cache */
+	struct sck_ops_benchmark t0_oi, t0_or, t3_oi, t3_or;
+	memset(&t0_oi, 0, sizeof(t0_oi)); memset(&t0_or, 0, sizeof(t0_or));
+	memset(&t3_oi, 0, sizeof(t3_oi)); memset(&t3_or, 0, sizeof(t3_or));
+	sck_assemble_classic_ops(&pcache, 0, true, &t0_oi);
+	sck_assemble_classic_ops(&pcache, 0, false, &t0_or);
+	sck_assemble_classic_ops(&pcache, 3, true, &t3_oi);
+	sck_assemble_classic_ops(&pcache, 3, false, &t3_or);
 
-	/* Phase 1c: Hybrid ops */
-	print_header("Phase 1c: Hybrid Operations Benchmark");
-	printf("\n");
-	struct ops_benchmark th_ops_init, th_ops_resp;
-	memset(&th_ops_init, 0, sizeof(th_ops_init));
-	memset(&th_ops_resp, 0, sizeof(th_ops_resp));
-	bench_hybrid_all_operations(&th_ops_init, &th_ops_resp);
+	struct sck_ops_benchmark t0p_oi, t0p_or, t3p_oi, t3p_or;
+	memset(&t0p_oi, 0, sizeof(t0p_oi)); memset(&t0p_or, 0, sizeof(t0p_or));
+	memset(&t3p_oi, 0, sizeof(t3p_oi)); memset(&t3p_or, 0, sizeof(t3p_or));
+	sck_assemble_pq_ops(&pcache, 0, true, &t0p_oi);
+	sck_assemble_pq_ops(&pcache, 0, false, &t0p_or);
+	sck_assemble_pq_ops(&pcache, 3, true, &t3p_oi);
+	sck_assemble_pq_ops(&pcache, 3, false, &t3p_or);
 
-	/* Phase 2a: Classic handshake */
-	print_header("Phase 2a: Classic Handshake + Overhead Benchmark");
-	printf("\n");
-	struct overhead_benchmark t0_oh_init, t0_oh_resp, t3_oh_init, t3_oh_resp;
-	struct handshake_benchmark t0_hs_init, t0_hs_resp, t3_hs_init, t3_hs_resp;
-	memset(&t0_oh_init, 0, sizeof(t0_oh_init));
-	memset(&t0_oh_resp, 0, sizeof(t0_oh_resp));
-	memset(&t3_oh_init, 0, sizeof(t3_oh_init));
-	memset(&t3_oh_resp, 0, sizeof(t3_oh_resp));
-	memset(&t0_hs_init, 0, sizeof(t0_hs_init));
-	memset(&t0_hs_resp, 0, sizeof(t0_hs_resp));
-	memset(&t3_hs_init, 0, sizeof(t3_hs_init));
-	memset(&t3_hs_resp, 0, sizeof(t3_hs_resp));
-	if (run_handshake_benchmark(0, &t0_ops_init, &t0_ops_resp,
-		&t0_oh_init, &t0_oh_resp, &t0_hs_init, &t0_hs_resp) != 0) return -1;
-	if (run_handshake_benchmark(3, &t3_ops_init, &t3_ops_resp,
-		&t3_oh_init, &t3_oh_resp, &t3_hs_init, &t3_hs_resp) != 0) return -1;
+	struct sck_ops_benchmark th_oi, th_or;
+	memset(&th_oi, 0, sizeof(th_oi)); memset(&th_or, 0, sizeof(th_or));
+	sck_assemble_hybrid_ops(&pcache, true, &th_oi);
+	sck_assemble_hybrid_ops(&pcache, false, &th_or);
+	print_success("All variant ops assembled.");
 
-	/* Phase 2b: PQ handshake */
-	print_header("Phase 2b: PQ Handshake + Overhead Benchmark");
+	/* === Phase 2: Socket-based Handshakes === */
+	print_header("Phase 2a: Classic Handshake (TCP Socket)");
 	printf("\n");
-	struct overhead_benchmark t0pq_oh_init, t0pq_oh_resp, t3pq_oh_init, t3pq_oh_resp;
-	struct handshake_benchmark t0pq_hs_init, t0pq_hs_resp, t3pq_hs_init, t3pq_hs_resp;
-	memset(&t0pq_oh_init, 0, sizeof(t0pq_oh_init));
-	memset(&t0pq_oh_resp, 0, sizeof(t0pq_oh_resp));
-	memset(&t3pq_oh_init, 0, sizeof(t3pq_oh_init));
-	memset(&t3pq_oh_resp, 0, sizeof(t3pq_oh_resp));
-	memset(&t0pq_hs_init, 0, sizeof(t0pq_hs_init));
-	memset(&t0pq_hs_resp, 0, sizeof(t0pq_hs_resp));
-	memset(&t3pq_hs_init, 0, sizeof(t3pq_hs_init));
-	memset(&t3pq_hs_resp, 0, sizeof(t3pq_hs_resp));
-	if (run_pq_handshake_benchmark(0, &t0pq_ops_init, &t0pq_ops_resp,
-		&t0pq_oh_init, &t0pq_oh_resp, &t0pq_hs_init, &t0pq_hs_resp) != 0) return -1;
-	if (run_pq_handshake_benchmark(3, &t3pq_ops_init, &t3pq_ops_resp,
-		&t3pq_oh_init, &t3pq_oh_resp, &t3pq_hs_init, &t3pq_hs_resp) != 0) return -1;
+	struct sck_overhead_benchmark t0_ohi, t0_ohr, t3_ohi, t3_ohr;
+	struct sck_handshake_benchmark t0_hi, t0_hr, t3_hi, t3_hr;
+	memset(&t0_ohi, 0, sizeof(t0_ohi)); memset(&t0_ohr, 0, sizeof(t0_ohr));
+	memset(&t3_ohi, 0, sizeof(t3_ohi)); memset(&t3_ohr, 0, sizeof(t3_ohr));
+	memset(&t0_hi, 0, sizeof(t0_hi)); memset(&t0_hr, 0, sizeof(t0_hr));
+	memset(&t3_hi, 0, sizeof(t3_hi)); memset(&t3_hr, 0, sizeof(t3_hr));
 
-	/* Phase 2c: Hybrid handshake */
-	print_header("Phase 2c: Hybrid Handshake + Overhead Benchmark");
-	printf("\n");
-	struct overhead_benchmark th_oh_init, th_oh_resp;
-	struct handshake_benchmark th_hs_init, th_hs_resp;
-	memset(&th_oh_init, 0, sizeof(th_oh_init));
-	memset(&th_oh_resp, 0, sizeof(th_oh_resp));
-	memset(&th_hs_init, 0, sizeof(th_hs_init));
-	memset(&th_hs_resp, 0, sizeof(th_hs_resp));
-	if (run_hybrid_handshake_benchmark(&th_ops_init, &th_ops_resp,
-		&th_oh_init, &th_oh_resp, &th_hs_init, &th_hs_resp) != 0) return -1;
+	if (sck_run_classic_handshake(0, SOCK_BENCH_BASE_PORT,
+		&t0_oi, &t0_or, &t0_ohi, &t0_ohr, &t0_hi, &t0_hr) != 0)
+		return -1;
+	if (sck_run_classic_handshake(3, SOCK_BENCH_BASE_PORT + 100,
+		&t3_oi, &t3_or, &t3_ohi, &t3_ohr, &t3_hi, &t3_hr) != 0)
+		return -1;
 
-	/* Print summaries */
-	print_overhead_summary(&t0_oh_init, &t0_oh_resp, &t3_oh_init, &t3_oh_resp);
-	print_handshake_summary(&t0_hs_init, &t0_hs_resp, &t3_hs_init, &t3_hs_resp);
+	print_header("Phase 2b: PQ Handshake");
+	printf("\n");
+	struct sck_overhead_benchmark t0p_ohi, t0p_ohr, t3p_ohi, t3p_ohr;
+	struct sck_handshake_benchmark t0p_hi, t0p_hr, t3p_hi, t3p_hr;
+	memset(&t0p_ohi, 0, sizeof(t0p_ohi)); memset(&t0p_ohr, 0, sizeof(t0p_ohr));
+	memset(&t3p_ohi, 0, sizeof(t3p_ohi)); memset(&t3p_ohr, 0, sizeof(t3p_ohr));
+	memset(&t0p_hi, 0, sizeof(t0p_hi)); memset(&t0p_hr, 0, sizeof(t0p_hr));
+	memset(&t3p_hi, 0, sizeof(t3p_hi)); memset(&t3p_hr, 0, sizeof(t3p_hr));
 
-	printf("\n");
-	print_header("Hybrid Overhead Benchmark (avg per handshake)");
-	printf("\n");
-	printf("  %-16s %-12s %14s %14s %s\n", "Type", "Role", "CPU (µs)", "Memory (bytes)", "Note");
-	printf("  %-16s %-12s %14s %14s %s\n", "────────────────", "────────────", "──────────────", "──────────────", "────────────────────");
-	printf("  %-16s %-12s %14.3f %14ld %s\n", "Type3_Hybrid", "Initiator", th_oh_init.cpu_us, th_oh_init.memory_bytes, "computed from ops");
-	printf("  %-16s %-12s %14.3f %14ld %s\n", "Type3_Hybrid", "Responder", th_oh_resp.cpu_us, th_oh_resp.memory_bytes, "computed from ops");
+	if (sck_run_pq_handshake(0, SOCK_BENCH_BASE_PORT + 200,
+		&t0p_oi, &t0p_or, &t0p_ohi, &t0p_ohr, &t0p_hi, &t0p_hr) != 0)
+		return -1;
+	if (sck_run_pq_handshake(3, SOCK_BENCH_BASE_PORT + 300,
+		&t3p_oi, &t3p_or, &t3p_ohi, &t3p_ohr, &t3p_hi, &t3p_hr) != 0)
+		return -1;
 
+	print_header("Phase 2c: Hybrid Handshake");
 	printf("\n");
-	print_header("Hybrid Handshake Timing Benchmark (µs, avg)");
+	struct sck_overhead_benchmark th_ohi, th_ohr;
+	struct sck_handshake_benchmark th_hi, th_hr;
+	memset(&th_ohi, 0, sizeof(th_ohi)); memset(&th_ohr, 0, sizeof(th_ohr));
+	memset(&th_hi, 0, sizeof(th_hi)); memset(&th_hr, 0, sizeof(th_hr));
+
+	if (sck_run_hybrid_handshake(SOCK_BENCH_BASE_PORT + 400,
+		&th_oi, &th_or, &th_ohi, &th_ohr, &th_hi, &th_hr) != 0)
+		return -1;
+
+	/* === Phase 3: Write CSV === */
+	print_header("Writing Socket Benchmark CSV Files");
+	printf("\n");
+
+	int ret;
+	ret = sck_write_operations_csv(SOCK_CSV_OPERATIONS,
+		&t0_oi, &t0_or, &t3_oi, &t3_or,
+		&t0p_oi, &t0p_or, &t3p_oi, &t3p_or,
+		&th_oi, &th_or);
+	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", SOCK_CSV_OPERATIONS); print_success(buf); }
+
+	ret = sck_write_overhead_csv(SOCK_CSV_OVERHEAD,
+		&t0_ohi, &t0_ohr, &t3_ohi, &t3_ohr,
+		&t0p_ohi, &t0p_ohr, &t3p_ohi, &t3p_ohr,
+		&th_ohi, &th_ohr);
+	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", SOCK_CSV_OVERHEAD); print_success(buf); }
+
+	ret = sck_write_handshake_csv(SOCK_CSV_HANDSHAKE,
+		&t0_hi, &t0_hr, &t3_hi, &t3_hr,
+		&t0p_hi, &t0p_hr, &t3p_hi, &t3p_hr,
+		&th_hi, &th_hr);
+	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", SOCK_CSV_HANDSHAKE); print_success(buf); }
+
+	/* === Summary === */
+	printf("\n");
+	print_header("Socket Benchmark — Handshake Summary (µs, avg)");
 	printf("\n");
 	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n", "Type", "Role", "Processing", "TxRx", "Precompute", "Overhead", "Total");
 	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n", "────────────────", "────────────", "──────────────", "──────────────", "──────────────", "──────────────", "──────────────");
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n", "Type3_Hybrid", "Initiator", th_hs_init.processing_us, th_hs_init.txrx_us, th_hs_init.precomputation_us, th_hs_init.overhead_us, th_hs_init.total_us);
-	printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n", "Type3_Hybrid", "Responder", th_hs_resp.processing_us, th_hs_resp.txrx_us, th_hs_resp.precomputation_us, th_hs_resp.overhead_us, th_hs_resp.total_us);
 
-	/* Write CSV files */
-	printf("\n");
-	print_header("Writing CSV Output Files (Full: Classic + PQ + Hybrid)");
-	printf("\n");
-	int ret;
-	ret = write_operations_csv_full_hybrid(BENCH_CSV_OPERATIONS,
-		&t0_ops_init, &t0_ops_resp, &t3_ops_init, &t3_ops_resp,
-		&t0pq_ops_init, &t0pq_ops_resp, &t3pq_ops_init, &t3pq_ops_resp,
-		&th_ops_init, &th_ops_resp);
-	if (ret == 0) {
-		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_OPERATIONS);
-		print_success(buf);
-	}
-	ret = write_overhead_csv_full_hybrid(BENCH_CSV_OVERHEAD,
-		&t0_oh_init, &t0_oh_resp, &t3_oh_init, &t3_oh_resp,
-		&t0pq_oh_init, &t0pq_oh_resp, &t3pq_oh_init, &t3pq_oh_resp,
-		&th_oh_init, &th_oh_resp);
-	if (ret == 0) {
-		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_OVERHEAD);
-		print_success(buf);
-	}
-	ret = write_handshake_csv_full_hybrid(BENCH_CSV_HANDSHAKE,
-		&t0_hs_init, &t0_hs_resp, &t3_hs_init, &t3_hs_resp,
-		&t0pq_hs_init, &t0pq_hs_resp, &t3pq_hs_init, &t3pq_hs_resp,
-		&th_hs_init, &th_hs_resp);
-	if (ret == 0) {
-		snprintf(buf, sizeof(buf), "Written: %s", BENCH_CSV_HANDSHAKE);
-		print_success(buf);
-	}
+	#define PROW(T,R,D) printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n", T, R, \
+		(D).processing_us, (D).txrx_us, (D).precomputation_us, (D).overhead_us, (D).total_us)
 
+	PROW("Type0_SigSig","Initiator",t0_hi); PROW("Type0_SigSig","Responder",t0_hr);
+	PROW("Type3_MACMAC","Initiator",t3_hi); PROW("Type3_MACMAC","Responder",t3_hr);
+	PROW("Type0_PQ","Initiator",t0p_hi); PROW("Type0_PQ","Responder",t0p_hr);
+	PROW("Type3_PQ","Initiator",t3p_hi); PROW("Type3_PQ","Responder",t3p_hr);
+	PROW("Type3_Hybrid","Initiator",th_hi); PROW("Type3_Hybrid","Responder",th_hr);
+
+	#undef PROW
 	printf("\n");
-	print_success("EDHOC-Hybrid Full Benchmark (Classic + PQ + Hybrid) completed!");
+	print_success("Socket-based benchmark completed!");
 	print_info("● CSV files saved in output/ directory.");
-	print_info("● 5 variants: Type0, Type3, Type0_PQ, Type3_PQ, Type3_Hybrid");
+	print_info("● Verify with: python3 verify_benchmark.py  (after pointing to output/)");
 	printf("\n");
 	return 0;
 }
