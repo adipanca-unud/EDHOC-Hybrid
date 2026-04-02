@@ -605,13 +605,6 @@ static void x25519_bench_secret_derive(void *ctx)
  * ========================================================================== */
 static ed25519_ctx_t ed_ctx;
 
-static void ed25519_bench_keygen(void *ctx)
-{
-    (void)ctx;
-    ed25519_ctx_t *c = &ed_ctx;
-    crypto_sign_ed25519_keypair(c->pk, c->sk);
-}
-
 static void ed25519_bench_sign(void *ctx)
 {
     (void)ctx;
@@ -772,13 +765,6 @@ static void mlkem_bench_secret_derive(void *ctx)
  * ML-DSA-65 benchmark functions
  * ========================================================================== */
 static mldsa_ctx_t ds_ctx;
-
-static void mldsa_bench_keygen(void *ctx)
-{
-    (void)ctx;
-    mldsa_ctx_t *c = &ds_ctx;
-    PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(c->pk, c->sk);
-}
 
 static void mldsa_bench_sign(void *ctx)
 {
@@ -1164,6 +1150,9 @@ static void write_csv(void)
 
     for (int r = 0; r < NUM_ROWS; r++) {
         for (int c = 0; c < NUM_COLS; c++) {
+            if (r == ROW_KEYGEN && (c == COL_ED25519 || c == COL_MLDSA65)) {
+                continue;
+            }
             int kl = key_length_bytes[r][c];
             if (avg_us[r][c] < 0.0) {
                 if (kl >= 0)
@@ -1271,8 +1260,7 @@ static void write_simple_csv(void)
     ROW("",                  "Shared Secret", ROW_ENCAP,   COL_X25519);
 
     /* ── Ed25519 ────────────────────────────────────────────────────── */
-    ROW("Ed25519",           "Keygen",        ROW_KEYGEN,       COL_ED25519);
-    ROW("",                  "Signature",     ROW_SIGNATURE,    COL_ED25519);
+    ROW("Ed25519",           "Signature",     ROW_SIGNATURE,    COL_ED25519);
     ROW("",                  "Verification",  ROW_VERIFICATION, COL_ED25519);
 
     /* ── ML-KEM-768 ─────────────────────────────────────────────────── */
@@ -1281,8 +1269,7 @@ static void write_simple_csv(void)
     ROW("",                  "Decap",         ROW_DECAP,   COL_MLKEM768);
 
     /* ── ML-DSA-65 ──────────────────────────────────────────────────── */
-    ROW("ML-DSA-65",         "Keygen",        ROW_KEYGEN,       COL_MLDSA65);
-    ROW("",                  "Signature",     ROW_SIGNATURE,    COL_MLDSA65);
+    ROW("ML-DSA-65",         "Signature",     ROW_SIGNATURE,    COL_MLDSA65);
     ROW("",                  "Verification",  ROW_VERIFICATION, COL_MLDSA65);
 
     /* ── X25519+ML-KEM-768 (Hybrid) ─────────────────────────────────── */
@@ -1325,8 +1312,8 @@ int main(void)
     init_key_lengths();
 
     /* Count total bench operations for progress display */
-    /* X25519: 10, Ed25519: 8, ML-KEM: 10, ML-DSA: 8, Hybrid: 10 = 46 */
-    bench_op_total = 46;
+    /* X25519: 10, Ed25519: 7, ML-KEM: 10, ML-DSA: 7, Hybrid: 10 = 44 */
+    bench_op_total = 44;
 
     /* Initialize contexts */
     printf("  Initializing cryptographic contexts...\n");
@@ -1353,7 +1340,7 @@ int main(void)
      * Ed25519 column
      * ==================================================================== */
     printf("  [2/5] Benchmarking Ed25519 (libsodium)...\n");
-    run_bench(ed25519_bench_keygen,       NULL, ROW_KEYGEN,         COL_ED25519);
+    /* Keygen skipped: generated during certificate provisioning */
     /* Encap/Decap: N/A for signature scheme */
     run_bench(ed25519_bench_sign,         NULL, ROW_SIGNATURE,      COL_ED25519);
     run_bench(ed25519_bench_verify,       NULL, ROW_VERIFICATION,   COL_ED25519);
@@ -1383,7 +1370,7 @@ int main(void)
      * ML-DSA-65 column
      * ==================================================================== */
     printf("  [4/5] Benchmarking ML-DSA-65 (PQClean)...\n");
-    run_bench(mldsa_bench_keygen,        NULL, ROW_KEYGEN,          COL_MLDSA65);
+    /* Keygen skipped: generated during certificate provisioning */
     /* Encap/Decap: N/A for signature scheme */
     run_bench(mldsa_bench_sign,          NULL, ROW_SIGNATURE,       COL_MLDSA65);
     run_bench(mldsa_bench_verify,        NULL, ROW_VERIFICATION,    COL_MLDSA65);
