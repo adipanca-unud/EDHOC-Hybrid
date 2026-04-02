@@ -80,9 +80,9 @@ static void print_menu(void)
 	printf("      %sHybrid | ECDHE + KEM | MAC-MAC (static DH auth)%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
-	printf("  %s[6]%s Socket Benchmark (TCP Client-Server, All 5 Variants)\n",
+	printf("  %s[6]%s Socket Benchmark (TCP Client-Server, All 10 Variants)\n",
 	       CLR_GREEN, CLR_RESET);
-	printf("      %sTCP localhost | All 5 variants → 3 CSV files (output/)%s\n",
+	printf("      %sTCP localhost | 5 EDHOC + 5 EAP-EDHOC → 3 CSV files (output/)%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
 	printf("  %s[0]%s Exit\n", CLR_RED, CLR_RESET);

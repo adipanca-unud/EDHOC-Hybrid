@@ -38,6 +38,7 @@
 #include "edhoc_type3_pq.h"
 #include "edhoc_type3_hybrid.h"
 #include "edhoc_pq_kem.h"
+#include "eap_edhoc.h"
 #include "edhoc_test_vectors_rfc9529.h"
 #include "edhoc_type3_x25519_testvec.h"
 
@@ -2342,6 +2343,1555 @@ fail:
 }
 
 /* =============================================================================
+ * EAP-EDHOC Socket Transport Helpers
+ * =============================================================================
+ *
+ * These functions wrap the raw TCP socket transport with EAP framing.
+ * The full EAP-EDHOC exchange adds:
+ *   - EAP-Request/Identity + EAP-Response/Identity (1 round-trip)
+ *   - EAP-EDHOC Start (1/2 round-trip, server → peer)
+ *   - EAP headers on each EDHOC message (6 bytes per message)
+ *   - message_4 exchange (1 round-trip, protected success)
+ *   - EAP-Success (1/2 round-trip, server → peer)
+ */
+
+/* Send an EAP packet over TCP (serializes then sends with length prefix) */
+static int eap_sock_send(int fd, const struct eap_packet *pkt)
+{
+	uint8_t wire[EAP_MAX_PACKET_SIZE + 16];
+	int n = eap_serialize(pkt, wire, sizeof(wire));
+	if (n <= 0) return -1;
+	return sock_send_msg(fd, wire, (uint32_t)n);
+}
+
+/* Receive an EAP packet over TCP (receives with length prefix then parses) */
+static int eap_sock_recv(int fd, struct eap_packet *pkt)
+{
+	uint8_t wire[EAP_MAX_PACKET_SIZE + 16];
+	uint32_t wire_len = 0;
+	int r = sock_recv_msg(fd, wire, sizeof(wire), &wire_len);
+	if (r != 0) return -1;
+	return eap_parse(wire, wire_len, pkt);
+}
+
+/* Perform the EAP-EDHOC pre-handshake: Identity exchange + Start
+ * Called by the EAP Server (Responder) side.
+ * Returns 0 on success.
+ */
+static int eap_server_pre_handshake(int fd, uint8_t *id_counter)
+{
+	struct eap_packet pkt;
+
+	/* (1) Server → Peer: EAP-Request/Identity */
+	eap_build_request_identity(&pkt, (*id_counter)++);
+	if (eap_sock_send(fd, &pkt) != 0) return -1;
+
+	/* (2) Peer → Server: EAP-Response/Identity */
+	if (eap_sock_recv(fd, &pkt) != 0) return -1;
+	if (pkt.code != EAP_CODE_RESPONSE || pkt.type != EAP_TYPE_IDENTITY)
+		return -1;
+
+	/* (3) Server → Peer: EAP-Request(EAP-EDHOC Start) */
+	eap_build_edhoc_start(&pkt, (*id_counter)++);
+	if (eap_sock_send(fd, &pkt) != 0) return -1;
+
+	return 0;
+}
+
+/* Perform the EAP-EDHOC pre-handshake from Peer (Initiator) side.
+ * Returns 0 on success.
+ */
+static int eap_peer_pre_handshake(int fd)
+{
+	struct eap_packet pkt;
+
+	/* (1) Server → Peer: EAP-Request/Identity */
+	if (eap_sock_recv(fd, &pkt) != 0) return -1;
+	if (pkt.code != EAP_CODE_REQUEST || pkt.type != EAP_TYPE_IDENTITY)
+		return -1;
+
+	/* (2) Peer → Server: EAP-Response/Identity */
+	eap_build_response_identity(&pkt, pkt.identifier);
+	if (eap_sock_send(fd, &pkt) != 0) return -1;
+
+	/* (3) Server → Peer: EAP-Request(EAP-EDHOC Start) */
+	if (eap_sock_recv(fd, &pkt) != 0) return -1;
+	if (pkt.code != EAP_CODE_REQUEST || pkt.type != EAP_TYPE_EDHOC ||
+	    !(pkt.flags & EAP_EDHOC_FLAG_S))
+		return -1;
+
+	return 0;
+}
+
+/* Perform the EAP-EDHOC post-handshake (message_4 + ACK + Success)
+ * Called by the EAP Server (Responder) after successful EDHOC handshake.
+ * Returns 0 on success.
+ */
+static int eap_server_post_handshake(int fd, uint8_t *id_counter,
+				     const uint8_t *prk_out, uint32_t prk_len)
+{
+	struct eap_packet pkt;
+
+	/* (7) Server → Peer: EAP-Request(message_4) - protected success indication */
+	/* message_4 uses first 32 bytes of PRK_out as protected payload */
+	uint8_t msg4_data[EAP_EDHOC_MSG4_SIZE];
+	uint32_t copy_len = prk_len < EAP_EDHOC_MSG4_SIZE ? prk_len : EAP_EDHOC_MSG4_SIZE;
+	memcpy(msg4_data, prk_out, copy_len);
+	eap_build_edhoc_message(&pkt, EAP_CODE_REQUEST, (*id_counter)++,
+				msg4_data, EAP_EDHOC_MSG4_SIZE);
+	if (eap_sock_send(fd, &pkt) != 0) return -1;
+
+	/* (8) Peer → Server: EAP-Response(empty ACK) */
+	if (eap_sock_recv(fd, &pkt) != 0) return -1;
+	if (pkt.code != EAP_CODE_RESPONSE || pkt.type != EAP_TYPE_EDHOC)
+		return -1;
+
+	/* (9) Server → Peer: EAP-Success */
+	eap_build_success(&pkt, (*id_counter)++);
+	if (eap_sock_send(fd, &pkt) != 0) return -1;
+
+	return 0;
+}
+
+/* Perform the EAP-EDHOC post-handshake from Peer (Initiator) side.
+ * Returns 0 on success.
+ */
+static int eap_peer_post_handshake(int fd, const uint8_t *prk_out,
+				   uint32_t prk_len)
+{
+	struct eap_packet pkt;
+
+	/* (7) Server → Peer: EAP-Request(message_4) */
+	if (eap_sock_recv(fd, &pkt) != 0) return -1;
+	if (pkt.code != EAP_CODE_REQUEST || pkt.type != EAP_TYPE_EDHOC)
+		return -1;
+	/* Verify message_4 matches our PRK_out (protected success) */
+	if (pkt.data_len >= EAP_EDHOC_MSG4_SIZE) {
+		uint32_t cmp_len = prk_len < EAP_EDHOC_MSG4_SIZE ? prk_len : EAP_EDHOC_MSG4_SIZE;
+		if (memcmp(pkt.data, prk_out, cmp_len) != 0)
+			return -1;
+	}
+
+	/* (8) Peer → Server: EAP-Response(empty ACK) */
+	eap_build_edhoc_ack(&pkt, pkt.identifier);
+	if (eap_sock_send(fd, &pkt) != 0) return -1;
+
+	/* (9) Server → Peer: EAP-Success */
+	if (eap_sock_recv(fd, &pkt) != 0) return -1;
+	if (pkt.code != EAP_CODE_SUCCESS)
+		return -1;
+
+	return 0;
+}
+
+/* ---------- EAP-wrapped Classic EDHOC tx/rx callbacks ---------- */
+
+/* Per-thread EAP state for classic EDHOC callbacks */
+static __thread uint8_t tl_eap_id_counter = 0;
+static __thread int     tl_eap_msg_num = 0;  /* tracks which EDHOC message */
+
+/* EAP Initiator (Peer) tx: wrap EDHOC message in EAP-Response */
+static enum err eap_sock_tx_initiator(void *sock, struct byte_array *data)
+{
+	struct eap_packet pkt;
+	uint64_t start = sck_get_time_ns();
+
+	eap_build_edhoc_message(&pkt, EAP_CODE_RESPONSE, tl_eap_id_counter,
+				data->ptr, data->len);
+	int r = eap_sock_send(tl_sock_fd, &pkt);
+
+	uint64_t end = sck_get_time_ns();
+	tl_sock_txrx_ns += (end - start);
+	tl_eap_msg_num++;
+	return (r == 0) ? ok : buffer_to_small;
+}
+
+/* EAP Initiator (Peer) rx: unwrap EDHOC message from EAP-Request */
+static enum err eap_sock_rx_initiator(void *sock, struct byte_array *data)
+{
+	struct eap_packet pkt;
+	uint64_t start = sck_get_time_ns();
+
+	int r = eap_sock_recv(tl_sock_fd, &pkt);
+
+	uint64_t end = sck_get_time_ns();
+	tl_sock_txrx_ns += (end - start);
+
+	if (r != 0 || pkt.code != EAP_CODE_REQUEST || pkt.type != EAP_TYPE_EDHOC)
+		return buffer_to_small;
+	if (pkt.data_len > data->len)
+		return buffer_to_small;
+
+	memcpy(data->ptr, pkt.data, pkt.data_len);
+	data->len = pkt.data_len;
+	tl_eap_id_counter = pkt.identifier;
+	return ok;
+}
+
+/* EAP Responder (Server) tx: wrap EDHOC message in EAP-Request */
+static enum err eap_sock_tx_responder(void *sock, struct byte_array *data)
+{
+	struct eap_packet pkt;
+	uint64_t start = sck_get_time_ns();
+
+	eap_build_edhoc_message(&pkt, EAP_CODE_REQUEST, tl_eap_id_counter++,
+				data->ptr, data->len);
+	int r = eap_sock_send(tl_sock_fd, &pkt);
+
+	uint64_t end = sck_get_time_ns();
+	tl_sock_txrx_ns += (end - start);
+	tl_eap_msg_num++;
+	return (r == 0) ? ok : buffer_to_small;
+}
+
+/* EAP Responder (Server) rx: unwrap EDHOC message from EAP-Response */
+static enum err eap_sock_rx_responder(void *sock, struct byte_array *data)
+{
+	struct eap_packet pkt;
+	uint64_t start = sck_get_time_ns();
+
+	int r = eap_sock_recv(tl_sock_fd, &pkt);
+
+	uint64_t end = sck_get_time_ns();
+	tl_sock_txrx_ns += (end - start);
+
+	if (r != 0 || pkt.code != EAP_CODE_RESPONSE || pkt.type != EAP_TYPE_EDHOC)
+		return buffer_to_small;
+	if (pkt.data_len > data->len)
+		return buffer_to_small;
+
+	memcpy(data->ptr, pkt.data, pkt.data_len);
+	data->len = pkt.data_len;
+	return ok;
+}
+
+/* ---------- EAP-wrapped send/recv for PQ & Hybrid (manual msg exchange) ---------- */
+
+/* Send an EDHOC message wrapped in EAP framing over TCP socket.
+ * code: EAP_CODE_REQUEST (server) or EAP_CODE_RESPONSE (peer)
+ * id: pointer to EAP identifier counter (incremented for requests)
+ */
+static int eap_send_edhoc_msg(int fd, uint8_t code, uint8_t *id,
+			      const uint8_t *data, uint32_t len, uint64_t *txrx_ns)
+{
+	struct eap_packet pkt;
+	uint8_t cur_id = *id;
+	if (code == EAP_CODE_REQUEST) cur_id = (*id)++;
+	eap_build_edhoc_message(&pkt, code, cur_id, data, len);
+	uint64_t t0 = sck_get_time_ns();
+	int r = eap_sock_send(fd, &pkt);
+	*txrx_ns += (sck_get_time_ns() - t0);
+	return r;
+}
+
+/* Receive an EDHOC message from EAP framing over TCP socket.
+ * expected_code: EAP_CODE_REQUEST or EAP_CODE_RESPONSE
+ * id: pointer to store the received EAP identifier
+ */
+static int eap_recv_edhoc_msg(int fd, uint8_t expected_code, uint8_t *id,
+			      uint8_t *data, uint32_t buf_size, uint32_t *out_len,
+			      uint64_t *txrx_ns)
+{
+	struct eap_packet pkt;
+	uint64_t t0 = sck_get_time_ns();
+	int r = eap_sock_recv(fd, &pkt);
+	*txrx_ns += (sck_get_time_ns() - t0);
+	if (r != 0) return -1;
+	if (pkt.code != expected_code || pkt.type != EAP_TYPE_EDHOC) return -1;
+	if (pkt.data_len > buf_size) return -1;
+	memcpy(data, pkt.data, pkt.data_len);
+	*out_len = pkt.data_len;
+	if (id) *id = pkt.identifier;
+	return 0;
+}
+
+/* =============================================================================
+ * EAP-EDHOC Classic Handshake Threads (Type 0 / Type 3)
+ *
+ * These are the EAP-wrapped versions of the classic handshake threads.
+ * The EDHOC crypto is identical; only the transport has EAP framing.
+ * =============================================================================
+ */
+
+/* EAP Classic Initiator thread (EAP Peer = client) */
+static void *eap_classic_initiator_thread(void *arg)
+{
+	struct sck_classic_thread_data *d = (struct sck_classic_thread_data *)arg;
+	d->prk_out.ptr = d->prk_out_buf;
+	d->prk_out.len = sizeof(d->prk_out_buf);
+
+	uint8_t err_msg_buf[64];
+	struct byte_array err_msg = {.ptr = err_msg_buf, .len = sizeof(err_msg_buf)};
+
+	/* Connect to EAP server (responder) */
+	tl_sock_fd = sock_connect_client(d->port);
+	if (tl_sock_fd < 0) { d->error = buffer_to_small; return NULL; }
+	int opt = 1;
+	setsockopt(tl_sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+	tl_sock_txrx_ns = 0;
+	tl_eap_id_counter = 0;
+	tl_eap_msg_num = 0;
+
+	/* EAP pre-handshake: Identity + Start (timed as txrx) */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		int r = eap_peer_pre_handshake(tl_sock_fd);
+		tl_sock_txrx_ns += (sck_get_time_ns() - t0);
+		if (r != 0) { d->error = buffer_to_small; close(tl_sock_fd); tl_sock_fd = -1; return NULL; }
+	}
+
+	/* Run EDHOC with EAP-wrapped callbacks */
+	if (d->type_num == 0) {
+		struct edhoc_initiator_context c_i;
+		memset(&c_i, 0, sizeof(c_i));
+		c_i.sock = NULL;
+		c_i.method = (enum method_type)T1_RFC9529__METHOD;
+		c_i.c_i.len = T1_RFC9529__C_I_LEN; c_i.c_i.ptr = (uint8_t*)T1_RFC9529__C_I;
+		c_i.suites_i.len = T1_RFC9529__SUITES_I_LEN; c_i.suites_i.ptr = (uint8_t*)T1_RFC9529__SUITES_I;
+		c_i.ead_1.len = 0; c_i.ead_1.ptr = NULL;
+		c_i.ead_3.len = 0; c_i.ead_3.ptr = NULL;
+		c_i.id_cred_i.len = T1_RFC9529__ID_CRED_I_LEN; c_i.id_cred_i.ptr = (uint8_t*)T1_RFC9529__ID_CRED_I;
+		c_i.cred_i.len = T1_RFC9529__CRED_I_LEN; c_i.cred_i.ptr = (uint8_t*)T1_RFC9529__CRED_I;
+		c_i.g_x.len = T1_RFC9529__G_X_LEN; c_i.g_x.ptr = (uint8_t*)T1_RFC9529__G_X;
+		c_i.x.len = T1_RFC9529__X_LEN; c_i.x.ptr = (uint8_t*)T1_RFC9529__X;
+		c_i.sk_i.len = T1_RFC9529__SK_I_LEN; c_i.sk_i.ptr = (uint8_t*)T1_RFC9529__SK_I;
+		c_i.pk_i.len = T1_RFC9529__PK_I_LEN; c_i.pk_i.ptr = (uint8_t*)T1_RFC9529__PK_I;
+		c_i.g_i.len = 0; c_i.g_i.ptr = NULL;
+		c_i.i.len = 0; c_i.i.ptr = NULL;
+		struct other_party_cred cred_r;
+		memset(&cred_r, 0, sizeof(cred_r));
+		cred_r.id_cred.len = T1_RFC9529__ID_CRED_R_LEN; cred_r.id_cred.ptr = (uint8_t*)T1_RFC9529__ID_CRED_R;
+		cred_r.cred.len = T1_RFC9529__CRED_R_LEN; cred_r.cred.ptr = (uint8_t*)T1_RFC9529__CRED_R;
+		cred_r.pk.len = T1_RFC9529__PK_R_LEN; cred_r.pk.ptr = (uint8_t*)T1_RFC9529__PK_R;
+		cred_r.g.len = 0; cred_r.g.ptr = NULL;
+		cred_r.ca.len = 0; cred_r.ca.ptr = NULL; cred_r.ca_pk.len = 0; cred_r.ca_pk.ptr = NULL;
+		struct cred_array ca = {.len = 1, .ptr = &cred_r};
+
+		d->cpu_start_ns = sck_get_thread_cpu_ns();
+		d->wall_start_ns = sck_get_time_ns();
+		d->error = edhoc_initiator_run(&c_i, &ca, &err_msg, &d->prk_out,
+					       eap_sock_tx_initiator, eap_sock_rx_initiator, ead_process);
+		d->wall_end_ns = sck_get_time_ns();
+		d->cpu_end_ns = sck_get_thread_cpu_ns();
+	} else {
+		/* Type 3 */
+		struct edhoc_initiator_context c_i;
+		memset(&c_i, 0, sizeof(c_i));
+		c_i.sock = NULL;
+		c_i.method = (enum method_type)T3_X25519_METHOD;
+		c_i.c_i.len = T3_X25519_C_I_LEN; c_i.c_i.ptr = (uint8_t*)T3_X25519_C_I;
+		c_i.suites_i.len = T3_X25519_SUITES_I_LEN; c_i.suites_i.ptr = (uint8_t*)T3_X25519_SUITES_I;
+		c_i.ead_1.len = 0; c_i.ead_1.ptr = NULL;
+		c_i.ead_3.len = 0; c_i.ead_3.ptr = NULL;
+		c_i.id_cred_i.len = T1_RFC9529__ID_CRED_I_LEN; c_i.id_cred_i.ptr = (uint8_t*)T1_RFC9529__ID_CRED_I;
+		c_i.cred_i.len = T1_RFC9529__CRED_I_LEN; c_i.cred_i.ptr = (uint8_t*)T1_RFC9529__CRED_I;
+		c_i.g_x.len = T3_X25519_G_X_LEN; c_i.g_x.ptr = (uint8_t*)T3_X25519_G_X;
+		c_i.x.len = T3_X25519_X_LEN; c_i.x.ptr = (uint8_t*)T3_X25519_X;
+		c_i.g_i.len = T3_X25519_G_I_LEN; c_i.g_i.ptr = (uint8_t*)T3_X25519_G_I;
+		c_i.i.len = T3_X25519_I_LEN; c_i.i.ptr = (uint8_t*)T3_X25519_I;
+		c_i.sk_i.len = 0; c_i.sk_i.ptr = NULL;
+		c_i.pk_i.len = 0; c_i.pk_i.ptr = NULL;
+		struct other_party_cred cred_r;
+		memset(&cred_r, 0, sizeof(cred_r));
+		cred_r.id_cred.len = T1_RFC9529__ID_CRED_R_LEN; cred_r.id_cred.ptr = (uint8_t*)T1_RFC9529__ID_CRED_R;
+		cred_r.cred.len = T1_RFC9529__CRED_R_LEN; cred_r.cred.ptr = (uint8_t*)T1_RFC9529__CRED_R;
+		cred_r.g.len = T3_X25519_G_R_LEN; cred_r.g.ptr = (uint8_t*)T3_X25519_G_R;
+		cred_r.pk.len = 0; cred_r.pk.ptr = NULL;
+		cred_r.ca.len = 0; cred_r.ca.ptr = NULL; cred_r.ca_pk.len = 0; cred_r.ca_pk.ptr = NULL;
+		struct cred_array ca = {.len = 1, .ptr = &cred_r};
+
+		d->cpu_start_ns = sck_get_thread_cpu_ns();
+		d->wall_start_ns = sck_get_time_ns();
+		d->error = edhoc_initiator_run(&c_i, &ca, &err_msg, &d->prk_out,
+					       eap_sock_tx_initiator, eap_sock_rx_initiator, ead_process);
+		d->wall_end_ns = sck_get_time_ns();
+		d->cpu_end_ns = sck_get_thread_cpu_ns();
+	}
+
+	/* EAP post-handshake: message_4 + ACK + Success */
+	if (d->error == ok) {
+		uint64_t t0 = sck_get_time_ns();
+		int r = eap_peer_post_handshake(tl_sock_fd, d->prk_out_buf, d->prk_out.len);
+		tl_sock_txrx_ns += (sck_get_time_ns() - t0);
+		if (r != 0) d->error = buffer_to_small;
+	}
+
+	d->txrx_ns = tl_sock_txrx_ns;
+	close(tl_sock_fd);
+	tl_sock_fd = -1;
+	return NULL;
+}
+
+/* EAP Classic Responder thread (EAP Server) */
+static void *eap_classic_responder_thread(void *arg)
+{
+	struct sck_classic_thread_data *d = (struct sck_classic_thread_data *)arg;
+	d->prk_out.ptr = d->prk_out_buf;
+	d->prk_out.len = sizeof(d->prk_out_buf);
+
+	uint8_t err_msg_buf[64];
+	struct byte_array err_msg = {.ptr = err_msg_buf, .len = sizeof(err_msg_buf)};
+
+	/* Create server socket and accept connection */
+	int listen_fd = sock_create_server(d->port);
+	if (listen_fd < 0) { d->error = buffer_to_small; return NULL; }
+	tl_sock_fd = accept(listen_fd, NULL, NULL);
+	close(listen_fd);
+	if (tl_sock_fd < 0) { d->error = buffer_to_small; return NULL; }
+	int opt = 1;
+	setsockopt(tl_sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+	tl_sock_txrx_ns = 0;
+	tl_eap_id_counter = 1;  /* Server starts with id=1 */
+	tl_eap_msg_num = 0;
+
+	/* EAP pre-handshake: Identity + Start */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		int r = eap_server_pre_handshake(tl_sock_fd, &tl_eap_id_counter);
+		tl_sock_txrx_ns += (sck_get_time_ns() - t0);
+		if (r != 0) { d->error = buffer_to_small; close(tl_sock_fd); tl_sock_fd = -1; return NULL; }
+	}
+
+	/* Run EDHOC with EAP-wrapped callbacks */
+	if (d->type_num == 0) {
+		struct edhoc_responder_context c_r;
+		memset(&c_r, 0, sizeof(c_r));
+		c_r.sock = NULL;
+		c_r.c_r.len = T1_RFC9529__C_R_LEN; c_r.c_r.ptr = (uint8_t*)T1_RFC9529__C_R;
+		c_r.suites_r.len = T1_RFC9529__SUITES_R_LEN; c_r.suites_r.ptr = (uint8_t*)T1_RFC9529__SUITES_R;
+		c_r.ead_2.len = 0; c_r.ead_2.ptr = NULL;
+		c_r.ead_4.len = 0; c_r.ead_4.ptr = NULL;
+		c_r.id_cred_r.len = T1_RFC9529__ID_CRED_R_LEN; c_r.id_cred_r.ptr = (uint8_t*)T1_RFC9529__ID_CRED_R;
+		c_r.cred_r.len = T1_RFC9529__CRED_R_LEN; c_r.cred_r.ptr = (uint8_t*)T1_RFC9529__CRED_R;
+		c_r.g_y.len = T1_RFC9529__G_Y_LEN; c_r.g_y.ptr = (uint8_t*)T1_RFC9529__G_Y;
+		c_r.y.len = T1_RFC9529__Y_LEN; c_r.y.ptr = (uint8_t*)T1_RFC9529__Y;
+		c_r.sk_r.len = T1_RFC9529__SK_R_LEN; c_r.sk_r.ptr = (uint8_t*)T1_RFC9529__SK_R;
+		c_r.pk_r.len = T1_RFC9529__PK_R_LEN; c_r.pk_r.ptr = (uint8_t*)T1_RFC9529__PK_R;
+		c_r.g_r.len = 0; c_r.g_r.ptr = NULL;
+		c_r.r.len = 0; c_r.r.ptr = NULL;
+		struct other_party_cred cred_i;
+		memset(&cred_i, 0, sizeof(cred_i));
+		cred_i.id_cred.len = T1_RFC9529__ID_CRED_I_LEN; cred_i.id_cred.ptr = (uint8_t*)T1_RFC9529__ID_CRED_I;
+		cred_i.cred.len = T1_RFC9529__CRED_I_LEN; cred_i.cred.ptr = (uint8_t*)T1_RFC9529__CRED_I;
+		cred_i.pk.len = T1_RFC9529__PK_I_LEN; cred_i.pk.ptr = (uint8_t*)T1_RFC9529__PK_I;
+		cred_i.g.len = 0; cred_i.g.ptr = NULL;
+		cred_i.ca.len = 0; cred_i.ca.ptr = NULL; cred_i.ca_pk.len = 0; cred_i.ca_pk.ptr = NULL;
+		struct cred_array ca = {.len = 1, .ptr = &cred_i};
+
+		d->cpu_start_ns = sck_get_thread_cpu_ns();
+		d->wall_start_ns = sck_get_time_ns();
+		d->error = edhoc_responder_run(&c_r, &ca, &err_msg, &d->prk_out,
+					       eap_sock_tx_responder, eap_sock_rx_responder, ead_process);
+		d->wall_end_ns = sck_get_time_ns();
+		d->cpu_end_ns = sck_get_thread_cpu_ns();
+	} else {
+		/* Type 3 */
+		struct edhoc_responder_context c_r;
+		memset(&c_r, 0, sizeof(c_r));
+		c_r.sock = NULL;
+		c_r.c_r.len = T3_X25519_C_R_LEN; c_r.c_r.ptr = (uint8_t*)T3_X25519_C_R;
+		c_r.suites_r.len = T3_X25519_SUITES_R_LEN; c_r.suites_r.ptr = (uint8_t*)T3_X25519_SUITES_R;
+		c_r.ead_2.len = 0; c_r.ead_2.ptr = NULL;
+		c_r.ead_4.len = 0; c_r.ead_4.ptr = NULL;
+		c_r.id_cred_r.len = T1_RFC9529__ID_CRED_R_LEN; c_r.id_cred_r.ptr = (uint8_t*)T1_RFC9529__ID_CRED_R;
+		c_r.cred_r.len = T1_RFC9529__CRED_R_LEN; c_r.cred_r.ptr = (uint8_t*)T1_RFC9529__CRED_R;
+		c_r.g_y.len = T3_X25519_G_Y_LEN; c_r.g_y.ptr = (uint8_t*)T3_X25519_G_Y;
+		c_r.y.len = T3_X25519_Y_LEN; c_r.y.ptr = (uint8_t*)T3_X25519_Y;
+		c_r.g_r.len = T3_X25519_G_R_LEN; c_r.g_r.ptr = (uint8_t*)T3_X25519_G_R;
+		c_r.r.len = T3_X25519_R_LEN; c_r.r.ptr = (uint8_t*)T3_X25519_R;
+		c_r.sk_r.len = 0; c_r.sk_r.ptr = NULL;
+		c_r.pk_r.len = 0; c_r.pk_r.ptr = NULL;
+		struct other_party_cred cred_i;
+		memset(&cred_i, 0, sizeof(cred_i));
+		cred_i.id_cred.len = T1_RFC9529__ID_CRED_I_LEN; cred_i.id_cred.ptr = (uint8_t*)T1_RFC9529__ID_CRED_I;
+		cred_i.cred.len = T1_RFC9529__CRED_I_LEN; cred_i.cred.ptr = (uint8_t*)T1_RFC9529__CRED_I;
+		cred_i.g.len = T3_X25519_G_I_LEN; cred_i.g.ptr = (uint8_t*)T3_X25519_G_I;
+		cred_i.pk.len = 0; cred_i.pk.ptr = NULL;
+		cred_i.ca.len = 0; cred_i.ca.ptr = NULL; cred_i.ca_pk.len = 0; cred_i.ca_pk.ptr = NULL;
+		struct cred_array ca = {.len = 1, .ptr = &cred_i};
+
+		d->cpu_start_ns = sck_get_thread_cpu_ns();
+		d->wall_start_ns = sck_get_time_ns();
+		d->error = edhoc_responder_run(&c_r, &ca, &err_msg, &d->prk_out,
+					       eap_sock_tx_responder, eap_sock_rx_responder, ead_process);
+		d->wall_end_ns = sck_get_time_ns();
+		d->cpu_end_ns = sck_get_thread_cpu_ns();
+	}
+
+	/* EAP post-handshake: message_4 + ACK + Success */
+	if (d->error == ok) {
+		uint64_t t0 = sck_get_time_ns();
+		int r = eap_server_post_handshake(tl_sock_fd, &tl_eap_id_counter,
+						  d->prk_out_buf, d->prk_out.len);
+		tl_sock_txrx_ns += (sck_get_time_ns() - t0);
+		if (r != 0) d->error = buffer_to_small;
+	}
+
+	d->txrx_ns = tl_sock_txrx_ns;
+	close(tl_sock_fd);
+	tl_sock_fd = -1;
+	return NULL;
+}
+
+/* =============================================================================
+ * EAP-EDHOC PQ Handshake Threads (Type 0 / Type 3)
+ *
+ * These reuse the same PQ crypto as sck_pq0/pq3 threads but wrap each
+ * message exchange with EAP framing.
+ * =============================================================================
+ */
+
+/* EAP PQ Type 0 Initiator (Peer, client) */
+static void *eap_pq0_initiator_thread(void *arg)
+{
+	struct sck_pq_thread_data *d = (struct sck_pq_thread_data *)arg;
+	struct pq_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+	uint8_t eap_id = 0;
+
+	/* Connect */
+	d->sock_fd = sock_connect_client(d->port);
+	if (d->sock_fd < 0) return NULL;
+	int opt = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	/* EAP pre-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_peer_pre_handshake(d->sock_fd);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Same crypto as sck_pq0_initiator_thread — build msg1 */
+	ret = pq_kem_keygen(ctx->eph_pk, ctx->eph_sk);
+	if (ret != 0) goto fail;
+	uint8_t ct_R[PQ_KEM_CT_LEN], ss_R[PQ_KEM_SS_LEN];
+	ret = pq_kem_encaps(ct_R, ss_R, ctx->other_lt_pk);
+	if (ret != 0) goto fail;
+	ret = pq_hkdf_extract(NULL, 0, ss_R, PQ_KEM_SS_LEN, ctx->prk1);
+	if (ret != 0) goto fail;
+	uint8_t k1[PQ_AEAD_KEY_LEN], iv1[PQ_AEAD_NONCE_LEN];
+	ret = sck_pq0_derive_key_iv(ctx->prk1, SCK_PQ0_K1, sizeof(SCK_PQ0_K1)-1, k1, iv1);
+	if (ret != 0) goto fail;
+	uint8_t pt1[256]; uint32_t pt1_len = 0;
+	pt1[pt1_len++] = 0x00; pt1[pt1_len++] = 0x00; pt1[pt1_len++] = 0x37;
+	uint8_t ct1_aead[256+PQ_AEAD_TAG_LEN]; size_t ct1_aead_len = 0;
+	ret = pq_aead_encrypt(k1, iv1, NULL, 0, pt1, pt1_len, ct1_aead, &ct1_aead_len);
+	if (ret != 0) goto fail;
+	{
+		uint8_t *p = d->msg1_buf; uint32_t off = 0;
+		memcpy(p+off, ctx->eph_pk, PQ_KEM_PK_LEN); off += PQ_KEM_PK_LEN;
+		memcpy(p+off, ct_R, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		p[off++] = (uint8_t)(ct1_aead_len >> 8);
+		p[off++] = (uint8_t)(ct1_aead_len & 0xFF);
+		memcpy(p+off, ct1_aead, ct1_aead_len); off += ct1_aead_len;
+		d->msg1_len = off;
+	}
+
+	/* Send msg1 via EAP */
+	ret = eap_send_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &eap_id,
+				 d->msg1_buf, d->msg1_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	/* Receive msg2 via EAP */
+	ret = eap_recv_edhoc_msg(d->sock_fd, EAP_CODE_REQUEST, &eap_id,
+				 d->msg2_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg2_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	/* Process msg2 — same crypto as sck_pq0_initiator_thread */
+	{
+		uint8_t *m2 = d->msg2_buf; uint32_t m2_len = d->msg2_len;
+		uint32_t off = 0;
+		uint8_t ct_eph2[PQ_KEM_CT_LEN];
+		memcpy(ct_eph2, m2+off, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		uint8_t ss_eph2[PQ_KEM_SS_LEN];
+		ret = pq_kem_decaps(ss_eph2, ct_eph2, ctx->eph_sk);
+		if (ret != 0) goto fail;
+		uint8_t ct_I[PQ_KEM_CT_LEN];
+		memcpy(ct_I, m2+off, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		uint8_t ss_I[PQ_KEM_SS_LEN];
+		ret = pq_kem_decaps(ss_I, ct_I, ctx->lt_sk);
+		if (ret != 0) goto fail;
+		uint16_t sig2_len_field = ((uint16_t)m2[off] << 8) | m2[off+1]; off += 2;
+		uint8_t sig2[PQ_SIG_MAX_LEN];
+		memcpy(sig2, m2+off, sig2_len_field); off += sig2_len_field;
+		uint16_t aead2_len_field = ((uint16_t)m2[off] << 8) | m2[off+1]; off += 2;
+		uint8_t ct2_aead[512+PQ_AEAD_TAG_LEN];
+		memcpy(ct2_aead, m2+off, aead2_len_field);
+		/* TH2, PRK2, verify sig, decrypt AEAD2 ... */
+		{
+			uint8_t th2_in[16384]; uint32_t tl = 0;
+			memcpy(th2_in, d->msg1_buf, d->msg1_len); tl += d->msg1_len;
+			memcpy(th2_in+tl, ct_eph2, PQ_KEM_CT_LEN); tl += PQ_KEM_CT_LEN;
+			ret = pq_hash_sha256(th2_in, tl, ctx->th2);
+			if (ret != 0) goto fail;
+		}
+		uint8_t prk2_input[PQ_KEM_SS_LEN*3]; uint32_t pi_len = 0;
+		memcpy(prk2_input+pi_len, ss_R, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		memcpy(prk2_input+pi_len, ss_eph2, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		memcpy(prk2_input+pi_len, ss_I, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		ret = pq_hkdf_extract(ctx->th2, PQ_HASH_LEN, prk2_input, pi_len, ctx->prk2);
+		if (ret != 0) goto fail;
+		/* Verify signature */
+		uint8_t sig2_msg[256]; uint32_t sig2_msg_len = 0;
+		memcpy(sig2_msg+sig2_msg_len, ctx->th2, PQ_HASH_LEN); sig2_msg_len += PQ_HASH_LEN;
+		memcpy(sig2_msg+sig2_msg_len, SCK_PQ0_IDR, sizeof(SCK_PQ0_IDR)-1); sig2_msg_len += sizeof(SCK_PQ0_IDR)-1;
+		ret = pq_sig_verify(sig2_msg, sig2_msg_len, sig2, sig2_len_field, ctx->other_sig_pk);
+		if (ret != 0) goto fail;
+		/* Decrypt AEAD2 */
+		uint8_t k2[PQ_AEAD_KEY_LEN], iv2[PQ_AEAD_NONCE_LEN];
+		ret = sck_pq0_derive_key_iv(ctx->prk2, SCK_PQ0_K2, sizeof(SCK_PQ0_K2)-1, k2, iv2);
+		if (ret != 0) goto fail;
+		uint8_t pt2[512]; size_t pt2_len = 0;
+		ret = pq_aead_decrypt(k2, iv2, NULL, 0, ct2_aead, aead2_len_field, pt2, &pt2_len);
+		if (ret != 0) goto fail;
+	}
+
+	/* Build & send msg3 */
+	{
+		uint8_t th3_in[PQ_HASH_LEN + SCK_PQ_MSG_BUF_SIZE]; uint32_t tl = 0;
+		memcpy(th3_in, ctx->th2, PQ_HASH_LEN); tl += PQ_HASH_LEN;
+		memcpy(th3_in+tl, d->msg2_buf, d->msg2_len); tl += d->msg2_len;
+		ret = pq_hash_sha256(th3_in, tl, ctx->th3);
+		if (ret != 0) goto fail;
+		uint8_t mac3_input[PQ_HASH_LEN + 32]; uint32_t mi_len = 0;
+		memcpy(mac3_input+mi_len, ctx->th3, PQ_HASH_LEN); mi_len += PQ_HASH_LEN;
+		memcpy(mac3_input+mi_len, SCK_PQ0_IDI, sizeof(SCK_PQ0_IDI)-1); mi_len += sizeof(SCK_PQ0_IDI)-1;
+		uint8_t mac3[PQ_HASH_LEN];
+		ret = pq_hkdf_expand(ctx->prk2, mac3_input, mi_len, mac3, PQ_HASH_LEN);
+		if (ret != 0) goto fail;
+		/* Sign */
+		uint8_t sig3_msg[256]; uint32_t sig3_msg_len = 0;
+		memcpy(sig3_msg+sig3_msg_len, ctx->th3, PQ_HASH_LEN); sig3_msg_len += PQ_HASH_LEN;
+		memcpy(sig3_msg+sig3_msg_len, SCK_PQ0_IDI, sizeof(SCK_PQ0_IDI)-1); sig3_msg_len += sizeof(SCK_PQ0_IDI)-1;
+		uint8_t sig3[PQ_SIG_MAX_LEN]; size_t sig3_len = 0;
+		ret = pq_sig_sign(sig3_msg, sig3_msg_len, ctx->sig_sk, sig3, &sig3_len);
+		if (ret != 0) goto fail;
+		/* Encrypt */
+		uint8_t k3[PQ_AEAD_KEY_LEN], iv3[PQ_AEAD_NONCE_LEN];
+		ret = sck_pq0_derive_key_iv(ctx->prk2, SCK_PQ0_K3, sizeof(SCK_PQ0_K3)-1, k3, iv3);
+		if (ret != 0) goto fail;
+		uint8_t pt3[4096+PQ_SIG_MAX_LEN]; uint32_t pt3_len = 0;
+		pt3[pt3_len++] = (uint8_t)(sig3_len >> 8);
+		pt3[pt3_len++] = (uint8_t)(sig3_len & 0xFF);
+		memcpy(pt3+pt3_len, sig3, sig3_len); pt3_len += sig3_len;
+		memcpy(pt3+pt3_len, mac3, PQ_HASH_LEN); pt3_len += PQ_HASH_LEN;
+		uint8_t ct3_aead[4096+PQ_AEAD_TAG_LEN]; size_t ct3_aead_len = 0;
+		ret = pq_aead_encrypt(k3, iv3, NULL, 0, pt3, pt3_len, ct3_aead, &ct3_aead_len);
+		if (ret != 0) goto fail;
+		memcpy(d->msg3_buf, ct3_aead, ct3_aead_len);
+		d->msg3_len = (uint32_t)ct3_aead_len;
+	}
+
+	/* Send msg3 via EAP */
+	ret = eap_send_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &eap_id,
+				 d->msg3_buf, d->msg3_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	/* Derive PRK_out */
+	{
+		uint8_t th4_in[PQ_HASH_LEN + SCK_PQ_MSG_BUF_SIZE]; uint32_t tl = 0;
+		memcpy(th4_in, ctx->th3, PQ_HASH_LEN); tl += PQ_HASH_LEN;
+		memcpy(th4_in+tl, d->msg3_buf, d->msg3_len); tl += d->msg3_len;
+		ret = pq_hash_sha256(th4_in, tl, ctx->th4);
+		if (ret != 0) goto fail;
+		ret = pq_hkdf_expand(ctx->prk2, ctx->th4, PQ_HASH_LEN, ctx->prk_out, PQ_PRK_LEN);
+		if (ret != 0) goto fail;
+	}
+
+	/* EAP post-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_peer_post_handshake(d->sock_fd, ctx->prk_out, PQ_PRK_LEN);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* EAP PQ Type 0 Responder (Server) */
+static void *eap_pq0_responder_thread(void *arg)
+{
+	struct sck_pq_thread_data *d = (struct sck_pq_thread_data *)arg;
+	struct pq_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+	uint8_t eap_id = 1;
+
+	int listen_fd = sock_create_server(d->port);
+	if (listen_fd < 0) return NULL;
+	d->sock_fd = accept(listen_fd, NULL, NULL);
+	close(listen_fd);
+	if (d->sock_fd < 0) return NULL;
+	int opt2 = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt2, sizeof(opt2));
+
+	/* EAP pre-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_server_pre_handshake(d->sock_fd, &eap_id);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Receive msg1 via EAP */
+	{
+		uint8_t rid = 0;
+		ret = eap_recv_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &rid,
+					 d->msg1_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg1_len, &d->txrx_ns);
+		if (ret != 0) goto fail;
+	}
+
+	/* Process msg1 — same crypto as sck_pq0_responder_thread */
+	{
+		uint8_t *m1 = d->msg1_buf; uint32_t off = 0;
+		memcpy(ctx->eph_pk, m1+off, PQ_KEM_PK_LEN); off += PQ_KEM_PK_LEN;
+		uint8_t ct_R[PQ_KEM_CT_LEN];
+		memcpy(ct_R, m1+off, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		uint8_t ss_R[PQ_KEM_SS_LEN];
+		ret = pq_kem_decaps(ss_R, ct_R, ctx->lt_sk);
+		if (ret != 0) goto fail;
+		ret = pq_hkdf_extract(NULL, 0, ss_R, PQ_KEM_SS_LEN, ctx->prk1);
+		if (ret != 0) goto fail;
+		uint8_t k1[PQ_AEAD_KEY_LEN], iv1[PQ_AEAD_NONCE_LEN];
+		ret = sck_pq0_derive_key_iv(ctx->prk1, SCK_PQ0_K1, sizeof(SCK_PQ0_K1)-1, k1, iv1);
+		if (ret != 0) goto fail;
+		uint16_t aead1_len = ((uint16_t)m1[off] << 8) | m1[off+1]; off += 2;
+		uint8_t pt1[256]; size_t pt1_len = 0;
+		ret = pq_aead_decrypt(k1, iv1, NULL, 0, m1+off, aead1_len, pt1, &pt1_len);
+		if (ret != 0) goto fail;
+
+		/* Build msg2 */
+		uint8_t ct_eph2[PQ_KEM_CT_LEN], ss_eph2[PQ_KEM_SS_LEN];
+		ret = pq_kem_encaps(ct_eph2, ss_eph2, ctx->eph_pk);
+		if (ret != 0) goto fail;
+		uint8_t ct_I[PQ_KEM_CT_LEN], ss_I[PQ_KEM_SS_LEN];
+		ret = pq_kem_encaps(ct_I, ss_I, ctx->other_lt_pk);
+		if (ret != 0) goto fail;
+		{
+			uint8_t th2_in[16384]; uint32_t tl = 0;
+			memcpy(th2_in, d->msg1_buf, d->msg1_len); tl += d->msg1_len;
+			memcpy(th2_in+tl, ct_eph2, PQ_KEM_CT_LEN); tl += PQ_KEM_CT_LEN;
+			ret = pq_hash_sha256(th2_in, tl, ctx->th2);
+			if (ret != 0) goto fail;
+		}
+		uint8_t prk2_input[PQ_KEM_SS_LEN*3]; uint32_t pi_len = 0;
+		memcpy(prk2_input+pi_len, ss_R, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		memcpy(prk2_input+pi_len, ss_eph2, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		memcpy(prk2_input+pi_len, ss_I, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		ret = pq_hkdf_extract(ctx->th2, PQ_HASH_LEN, prk2_input, pi_len, ctx->prk2);
+		if (ret != 0) goto fail;
+		/* Sign */
+		uint8_t sig2_msg[256]; uint32_t sig2_msg_len = 0;
+		memcpy(sig2_msg+sig2_msg_len, ctx->th2, PQ_HASH_LEN); sig2_msg_len += PQ_HASH_LEN;
+		memcpy(sig2_msg+sig2_msg_len, SCK_PQ0_IDR, sizeof(SCK_PQ0_IDR)-1); sig2_msg_len += sizeof(SCK_PQ0_IDR)-1;
+		uint8_t sig2[PQ_SIG_MAX_LEN]; size_t sig2_len = 0;
+		ret = pq_sig_sign(sig2_msg, sig2_msg_len, ctx->sig_sk, sig2, &sig2_len);
+		if (ret != 0) goto fail;
+		/* Encrypt */
+		uint8_t k2[PQ_AEAD_KEY_LEN], iv2[PQ_AEAD_NONCE_LEN];
+		ret = sck_pq0_derive_key_iv(ctx->prk2, SCK_PQ0_K2, sizeof(SCK_PQ0_K2)-1, k2, iv2);
+		if (ret != 0) goto fail;
+		uint8_t pt2[64]; uint32_t pt2_len = 0;
+		memcpy(pt2+pt2_len, SCK_PQ0_IDR, sizeof(SCK_PQ0_IDR)-1); pt2_len += sizeof(SCK_PQ0_IDR)-1;
+		uint8_t ct2_aead[128+PQ_AEAD_TAG_LEN]; size_t ct2_aead_len = 0;
+		ret = pq_aead_encrypt(k2, iv2, NULL, 0, pt2, pt2_len, ct2_aead, &ct2_aead_len);
+		if (ret != 0) goto fail;
+		/* Wire msg2 */
+		{
+			uint8_t *p = d->msg2_buf; uint32_t o = 0;
+			memcpy(p+o, ct_eph2, PQ_KEM_CT_LEN); o += PQ_KEM_CT_LEN;
+			memcpy(p+o, ct_I, PQ_KEM_CT_LEN); o += PQ_KEM_CT_LEN;
+			p[o++] = (uint8_t)(sig2_len >> 8);
+			p[o++] = (uint8_t)(sig2_len & 0xFF);
+			memcpy(p+o, sig2, sig2_len); o += sig2_len;
+			p[o++] = (uint8_t)(ct2_aead_len >> 8);
+			p[o++] = (uint8_t)(ct2_aead_len & 0xFF);
+			memcpy(p+o, ct2_aead, ct2_aead_len); o += ct2_aead_len;
+			d->msg2_len = o;
+		}
+	}
+
+	/* Send msg2 via EAP */
+	ret = eap_send_edhoc_msg(d->sock_fd, EAP_CODE_REQUEST, &eap_id,
+				 d->msg2_buf, d->msg2_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	/* Receive msg3 via EAP */
+	{
+		uint8_t rid = 0;
+		ret = eap_recv_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &rid,
+					 d->msg3_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg3_len, &d->txrx_ns);
+		if (ret != 0) goto fail;
+	}
+
+	/* Process msg3 & derive PRK_out */
+	{
+		uint8_t th3_in[PQ_HASH_LEN + SCK_PQ_MSG_BUF_SIZE]; uint32_t tl = 0;
+		memcpy(th3_in, ctx->th2, PQ_HASH_LEN); tl += PQ_HASH_LEN;
+		memcpy(th3_in+tl, d->msg2_buf, d->msg2_len); tl += d->msg2_len;
+		ret = pq_hash_sha256(th3_in, tl, ctx->th3);
+		if (ret != 0) goto fail;
+		uint8_t k3[PQ_AEAD_KEY_LEN], iv3[PQ_AEAD_NONCE_LEN];
+		ret = sck_pq0_derive_key_iv(ctx->prk2, SCK_PQ0_K3, sizeof(SCK_PQ0_K3)-1, k3, iv3);
+		if (ret != 0) goto fail;
+		uint8_t pt3[4096+PQ_SIG_MAX_LEN]; size_t pt3_len = 0;
+		ret = pq_aead_decrypt(k3, iv3, NULL, 0, d->msg3_buf, d->msg3_len, pt3, &pt3_len);
+		if (ret != 0) goto fail;
+		/* Verify sig3 */
+		uint32_t off = 0;
+		uint16_t sig3_len_field = ((uint16_t)pt3[off] << 8) | pt3[off+1]; off += 2;
+		uint8_t sig3_msg[256]; uint32_t sig3_msg_len = 0;
+		memcpy(sig3_msg+sig3_msg_len, ctx->th3, PQ_HASH_LEN); sig3_msg_len += PQ_HASH_LEN;
+		memcpy(sig3_msg+sig3_msg_len, SCK_PQ0_IDI, sizeof(SCK_PQ0_IDI)-1); sig3_msg_len += sizeof(SCK_PQ0_IDI)-1;
+		ret = pq_sig_verify(sig3_msg, sig3_msg_len, pt3+off, sig3_len_field, ctx->other_sig_pk);
+		if (ret != 0) goto fail;
+		/* TH4, PRK_out */
+		uint8_t th4_in[PQ_HASH_LEN + SCK_PQ_MSG_BUF_SIZE]; uint32_t tl4 = 0;
+		memcpy(th4_in, ctx->th3, PQ_HASH_LEN); tl4 += PQ_HASH_LEN;
+		memcpy(th4_in+tl4, d->msg3_buf, d->msg3_len); tl4 += d->msg3_len;
+		ret = pq_hash_sha256(th4_in, tl4, ctx->th4);
+		if (ret != 0) goto fail;
+		ret = pq_hkdf_expand(ctx->prk2, ctx->th4, PQ_HASH_LEN, ctx->prk_out, PQ_PRK_LEN);
+		if (ret != 0) goto fail;
+	}
+
+	/* EAP post-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_server_post_handshake(d->sock_fd, &eap_id, ctx->prk_out, PQ_PRK_LEN);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* EAP PQ Type 3 — reuses the same sck_pq3_thread_data structure.
+ * The PQ Type 3 threads are identical in crypto to sck_pq3 threads
+ * but wrap each message with EAP framing + pre/post handshake.
+ * For brevity, we create thin wrappers that set up the EAP framing
+ * around the message exchange calls. */
+
+/* EAP PQ3 Initiator (Peer, client) */
+static void *eap_pq3_initiator_thread(void *arg)
+{
+	struct sck_pq3_thread_data *d = (struct sck_pq3_thread_data *)arg;
+	struct pq3_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+	uint8_t eap_id = 0;
+
+	d->sock_fd = sock_connect_client(d->port);
+	if (d->sock_fd < 0) return NULL;
+	int opt = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	/* EAP pre-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_peer_pre_handshake(d->sock_fd);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Same crypto as sck_pq3_initiator_thread */
+	ret = pq_kem_keygen(ctx->eph_pk, ctx->eph_sk);
+	if (ret != 0) goto fail;
+	uint8_t ct_R[PQ_KEM_CT_LEN], ss_R[PQ_KEM_SS_LEN];
+	ret = pq_kem_encaps(ct_R, ss_R, ctx->other_lt_pk);
+	if (ret != 0) goto fail;
+	ret = pq_hkdf_extract(NULL, 0, ss_R, PQ_KEM_SS_LEN, ctx->prk1);
+	if (ret != 0) goto fail;
+	uint8_t k1[PQ_AEAD_KEY_LEN], iv1[PQ_AEAD_NONCE_LEN];
+	ret = sck_pq0_derive_key_iv(ctx->prk1, SCK_PQ0_K1, sizeof(SCK_PQ0_K1)-1, k1, iv1);
+	if (ret != 0) goto fail;
+	uint8_t pt1[256]; uint32_t pt1_len = 0;
+	pt1[pt1_len++] = 0x03; pt1[pt1_len++] = 0x00; pt1[pt1_len++] = 0x37;
+	uint8_t ct1_aead[256+PQ_AEAD_TAG_LEN]; size_t ct1_aead_len = 0;
+	ret = pq_aead_encrypt(k1, iv1, NULL, 0, pt1, pt1_len, ct1_aead, &ct1_aead_len);
+	if (ret != 0) goto fail;
+	{
+		uint8_t *p = d->msg1_buf; uint32_t off = 0;
+		memcpy(p+off, ctx->eph_pk, PQ_KEM_PK_LEN); off += PQ_KEM_PK_LEN;
+		memcpy(p+off, ct_R, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		p[off++] = (uint8_t)(ct1_aead_len >> 8);
+		p[off++] = (uint8_t)(ct1_aead_len & 0xFF);
+		memcpy(p+off, ct1_aead, ct1_aead_len); off += ct1_aead_len;
+		d->msg1_len = off;
+	}
+	ret = eap_send_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &eap_id,
+				 d->msg1_buf, d->msg1_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	ret = eap_recv_edhoc_msg(d->sock_fd, EAP_CODE_REQUEST, &eap_id,
+				 d->msg2_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg2_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	/* Process msg2 — PQ Type 3 (KEM-based MAC-MAC, no signatures) */
+	{
+		uint8_t *m2 = d->msg2_buf; uint32_t off = 0;
+		uint8_t ct_eph2[PQ_KEM_CT_LEN]; memcpy(ct_eph2, m2+off, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		uint8_t ss_eph2[PQ_KEM_SS_LEN];
+		ret = pq_kem_decaps(ss_eph2, ct_eph2, ctx->eph_sk);
+		if (ret != 0) goto fail;
+		uint8_t ct_I[PQ_KEM_CT_LEN]; memcpy(ct_I, m2+off, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		uint8_t ss_I[PQ_KEM_SS_LEN];
+		ret = pq_kem_decaps(ss_I, ct_I, ctx->lt_sk);
+		if (ret != 0) goto fail;
+		uint16_t aead2_len_field = ((uint16_t)m2[off] << 8) | m2[off+1]; off += 2;
+		uint8_t ct2_aead[128+PQ_AEAD_TAG_LEN]; memcpy(ct2_aead, m2+off, aead2_len_field);
+		{
+			uint8_t th2_in[16384]; uint32_t tl = 0;
+			memcpy(th2_in, d->msg1_buf, d->msg1_len); tl += d->msg1_len;
+			memcpy(th2_in+tl, ct_eph2, PQ_KEM_CT_LEN); tl += PQ_KEM_CT_LEN;
+			ret = pq_hash_sha256(th2_in, tl, ctx->th2);
+			if (ret != 0) goto fail;
+		}
+		uint8_t prk2_input[PQ_KEM_SS_LEN*3]; uint32_t pi_len = 0;
+		memcpy(prk2_input+pi_len, ss_R, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		memcpy(prk2_input+pi_len, ss_eph2, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		memcpy(prk2_input+pi_len, ss_I, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		ret = pq_hkdf_extract(ctx->th2, PQ_HASH_LEN, prk2_input, pi_len, ctx->prk2);
+		if (ret != 0) goto fail;
+		uint8_t k2[PQ_AEAD_KEY_LEN], iv2[PQ_AEAD_NONCE_LEN];
+		ret = sck_pq0_derive_key_iv(ctx->prk2, SCK_PQ0_K2, sizeof(SCK_PQ0_K2)-1, k2, iv2);
+		if (ret != 0) goto fail;
+		uint8_t pt2[512]; size_t pt2_len = 0;
+		ret = pq_aead_decrypt(k2, iv2, NULL, 0, ct2_aead, aead2_len_field, pt2, &pt2_len);
+		if (ret != 0) goto fail;
+	}
+
+	/* Build & send msg3 */
+	{
+		uint8_t th3_in[PQ_HASH_LEN + SCK_PQ_MSG_BUF_SIZE]; uint32_t tl = 0;
+		memcpy(th3_in, ctx->th2, PQ_HASH_LEN); tl += PQ_HASH_LEN;
+		memcpy(th3_in+tl, d->msg2_buf, d->msg2_len); tl += d->msg2_len;
+		ret = pq_hash_sha256(th3_in, tl, ctx->th3);
+		if (ret != 0) goto fail;
+		uint8_t mac3_input[PQ_HASH_LEN + 32]; uint32_t mi_len = 0;
+		memcpy(mac3_input+mi_len, ctx->th3, PQ_HASH_LEN); mi_len += PQ_HASH_LEN;
+		memcpy(mac3_input+mi_len, SCK_PQ0_IDI, sizeof(SCK_PQ0_IDI)-1); mi_len += sizeof(SCK_PQ0_IDI)-1;
+		uint8_t mac3[PQ_HASH_LEN];
+		ret = pq_hkdf_expand(ctx->prk2, mac3_input, mi_len, mac3, PQ_HASH_LEN);
+		if (ret != 0) goto fail;
+		uint8_t k3[PQ_AEAD_KEY_LEN], iv3[PQ_AEAD_NONCE_LEN];
+		ret = sck_pq0_derive_key_iv(ctx->prk2, SCK_PQ0_K3, sizeof(SCK_PQ0_K3)-1, k3, iv3);
+		if (ret != 0) goto fail;
+		uint8_t ct3_aead[128+PQ_AEAD_TAG_LEN]; size_t ct3_aead_len = 0;
+		ret = pq_aead_encrypt(k3, iv3, NULL, 0, mac3, PQ_HASH_LEN, ct3_aead, &ct3_aead_len);
+		if (ret != 0) goto fail;
+		memcpy(d->msg3_buf, ct3_aead, ct3_aead_len);
+		d->msg3_len = (uint32_t)ct3_aead_len;
+	}
+	ret = eap_send_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &eap_id,
+				 d->msg3_buf, d->msg3_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	/* Derive PRK_out */
+	{
+		uint8_t th4_in[PQ_HASH_LEN + SCK_PQ_MSG_BUF_SIZE]; uint32_t tl = 0;
+		memcpy(th4_in, ctx->th3, PQ_HASH_LEN); tl += PQ_HASH_LEN;
+		memcpy(th4_in+tl, d->msg3_buf, d->msg3_len); tl += d->msg3_len;
+		ret = pq_hash_sha256(th4_in, tl, ctx->th4);
+		if (ret != 0) goto fail;
+		ret = pq_hkdf_expand(ctx->prk2, ctx->th4, PQ_HASH_LEN, ctx->prk_out, PQ_PRK_LEN);
+		if (ret != 0) goto fail;
+	}
+
+	/* EAP post-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_peer_post_handshake(d->sock_fd, ctx->prk_out, PQ_PRK_LEN);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* EAP PQ3 Responder (Server) — mirrors sck_pq3_responder_thread with EAP framing */
+static void *eap_pq3_responder_thread(void *arg)
+{
+	struct sck_pq3_thread_data *d = (struct sck_pq3_thread_data *)arg;
+	struct pq3_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+	uint8_t eap_id = 1;
+
+	int listen_fd = sock_create_server(d->port);
+	if (listen_fd < 0) return NULL;
+	d->sock_fd = accept(listen_fd, NULL, NULL);
+	close(listen_fd);
+	if (d->sock_fd < 0) return NULL;
+	int opt = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	/* EAP pre-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_server_pre_handshake(d->sock_fd, &eap_id);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Receive msg1 via EAP */
+	{
+		uint8_t rid = 0;
+		ret = eap_recv_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &rid,
+					 d->msg1_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg1_len, &d->txrx_ns);
+		if (ret != 0) goto fail;
+	}
+
+	/* Process msg1 — same as sck_pq3_responder_thread */
+	{
+		uint8_t *m1 = d->msg1_buf; uint32_t off = 0;
+		memcpy(ctx->eph_pk, m1+off, PQ_KEM_PK_LEN); off += PQ_KEM_PK_LEN;
+		uint8_t ct_R[PQ_KEM_CT_LEN]; memcpy(ct_R, m1+off, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		uint8_t ss_R[PQ_KEM_SS_LEN];
+		ret = pq_kem_decaps(ss_R, ct_R, ctx->lt_sk);
+		if (ret != 0) goto fail;
+		ret = pq_hkdf_extract(NULL, 0, ss_R, PQ_KEM_SS_LEN, ctx->prk1);
+		if (ret != 0) goto fail;
+		uint8_t k1[PQ_AEAD_KEY_LEN], iv1[PQ_AEAD_NONCE_LEN];
+		ret = sck_pq0_derive_key_iv(ctx->prk1, SCK_PQ0_K1, sizeof(SCK_PQ0_K1)-1, k1, iv1);
+		if (ret != 0) goto fail;
+		uint16_t aead1_len = ((uint16_t)m1[off] << 8) | m1[off+1]; off += 2;
+		uint8_t pt1[256]; size_t pt1_len = 0;
+		ret = pq_aead_decrypt(k1, iv1, NULL, 0, m1+off, aead1_len, pt1, &pt1_len);
+		if (ret != 0) goto fail;
+
+		/* Build msg2: ct_eph || ct_I || aead_len || AEAD(MAC2) */
+		uint8_t ct_eph2[PQ_KEM_CT_LEN], ss_eph2[PQ_KEM_SS_LEN];
+		ret = pq_kem_encaps(ct_eph2, ss_eph2, ctx->eph_pk);
+		if (ret != 0) goto fail;
+		uint8_t ct_I[PQ_KEM_CT_LEN], ss_I[PQ_KEM_SS_LEN];
+		ret = pq_kem_encaps(ct_I, ss_I, ctx->other_lt_pk);
+		if (ret != 0) goto fail;
+		{
+			uint8_t th2_in[16384]; uint32_t tl = 0;
+			memcpy(th2_in, d->msg1_buf, d->msg1_len); tl += d->msg1_len;
+			memcpy(th2_in+tl, ct_eph2, PQ_KEM_CT_LEN); tl += PQ_KEM_CT_LEN;
+			ret = pq_hash_sha256(th2_in, tl, ctx->th2);
+			if (ret != 0) goto fail;
+		}
+		uint8_t prk2_input[PQ_KEM_SS_LEN*3]; uint32_t pi_len = 0;
+		memcpy(prk2_input+pi_len, ss_R, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		memcpy(prk2_input+pi_len, ss_eph2, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		memcpy(prk2_input+pi_len, ss_I, PQ_KEM_SS_LEN); pi_len += PQ_KEM_SS_LEN;
+		ret = pq_hkdf_extract(ctx->th2, PQ_HASH_LEN, prk2_input, pi_len, ctx->prk2);
+		if (ret != 0) goto fail;
+		uint8_t k2[PQ_AEAD_KEY_LEN], iv2[PQ_AEAD_NONCE_LEN];
+		ret = sck_pq0_derive_key_iv(ctx->prk2, SCK_PQ0_K2, sizeof(SCK_PQ0_K2)-1, k2, iv2);
+		if (ret != 0) goto fail;
+		uint8_t mac2_input[PQ_HASH_LEN + 32]; uint32_t mi_len = 0;
+		memcpy(mac2_input+mi_len, ctx->th2, PQ_HASH_LEN); mi_len += PQ_HASH_LEN;
+		memcpy(mac2_input+mi_len, SCK_PQ0_IDR, sizeof(SCK_PQ0_IDR)-1); mi_len += sizeof(SCK_PQ0_IDR)-1;
+		uint8_t mac2[PQ_HASH_LEN];
+		ret = pq_hkdf_expand(ctx->prk2, mac2_input, mi_len, mac2, PQ_HASH_LEN);
+		if (ret != 0) goto fail;
+		uint8_t ct2_aead[128+PQ_AEAD_TAG_LEN]; size_t ct2_aead_len = 0;
+		ret = pq_aead_encrypt(k2, iv2, NULL, 0, mac2, PQ_HASH_LEN, ct2_aead, &ct2_aead_len);
+		if (ret != 0) goto fail;
+		{
+			uint8_t *p = d->msg2_buf; uint32_t o = 0;
+			memcpy(p+o, ct_eph2, PQ_KEM_CT_LEN); o += PQ_KEM_CT_LEN;
+			memcpy(p+o, ct_I, PQ_KEM_CT_LEN); o += PQ_KEM_CT_LEN;
+			p[o++] = (uint8_t)(ct2_aead_len >> 8);
+			p[o++] = (uint8_t)(ct2_aead_len & 0xFF);
+			memcpy(p+o, ct2_aead, ct2_aead_len); o += ct2_aead_len;
+			d->msg2_len = o;
+		}
+	}
+
+	/* Send msg2 via EAP */
+	ret = eap_send_edhoc_msg(d->sock_fd, EAP_CODE_REQUEST, &eap_id,
+				 d->msg2_buf, d->msg2_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	/* Receive msg3 via EAP */
+	{
+		uint8_t rid = 0;
+		ret = eap_recv_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &rid,
+					 d->msg3_buf, SCK_PQ_MSG_BUF_SIZE, &d->msg3_len, &d->txrx_ns);
+		if (ret != 0) goto fail;
+	}
+
+	/* Process msg3, derive PRK_out */
+	{
+		uint8_t th3_in[PQ_HASH_LEN + SCK_PQ_MSG_BUF_SIZE]; uint32_t tl = 0;
+		memcpy(th3_in, ctx->th2, PQ_HASH_LEN); tl += PQ_HASH_LEN;
+		memcpy(th3_in+tl, d->msg2_buf, d->msg2_len); tl += d->msg2_len;
+		ret = pq_hash_sha256(th3_in, tl, ctx->th3);
+		if (ret != 0) goto fail;
+		uint8_t k3[PQ_AEAD_KEY_LEN], iv3[PQ_AEAD_NONCE_LEN];
+		ret = sck_pq0_derive_key_iv(ctx->prk2, SCK_PQ0_K3, sizeof(SCK_PQ0_K3)-1, k3, iv3);
+		if (ret != 0) goto fail;
+		uint8_t pt3[128]; size_t pt3_len = 0;
+		ret = pq_aead_decrypt(k3, iv3, NULL, 0, d->msg3_buf, d->msg3_len, pt3, &pt3_len);
+		if (ret != 0) goto fail;
+		uint8_t th4_in[PQ_HASH_LEN + SCK_PQ_MSG_BUF_SIZE]; uint32_t tl4 = 0;
+		memcpy(th4_in, ctx->th3, PQ_HASH_LEN); tl4 += PQ_HASH_LEN;
+		memcpy(th4_in+tl4, d->msg3_buf, d->msg3_len); tl4 += d->msg3_len;
+		ret = pq_hash_sha256(th4_in, tl4, ctx->th4);
+		if (ret != 0) goto fail;
+		ret = pq_hkdf_expand(ctx->prk2, ctx->th4, PQ_HASH_LEN, ctx->prk_out, PQ_PRK_LEN);
+		if (ret != 0) goto fail;
+	}
+
+	/* EAP post-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_server_post_handshake(d->sock_fd, &eap_id, ctx->prk_out, PQ_PRK_LEN);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* =============================================================================
+ * EAP-EDHOC Hybrid Handshake Threads
+ *
+ * Wrap the hybrid (X25519 + ML-KEM) handshake with EAP framing.
+ * Reuses sck_hyb_thread_data and hybrid_party_ctx structures.
+ * The hybrid initiator/responder message building code is reused
+ * by calling the existing sck_hyb helper functions.
+ * =============================================================================
+ */
+
+/* (sck_hyb_ecdh, sck_hyb_hash, sck_hyb_hkdf_expand, sck_hyb_aead_enc,
+ *  sck_hyb_aead_dec are defined earlier in this file) */
+
+/* EAP Hybrid Initiator (Peer, client) */
+static void *eap_hyb_initiator_thread(void *arg)
+{
+	struct sck_hyb_thread_data *d = (struct sck_hyb_thread_data *)arg;
+	struct hybrid_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+	uint8_t eap_id = 0;
+
+	d->sock_fd = sock_connect_client(d->port);
+	if (d->sock_fd < 0) return NULL;
+	int opt = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	/* EAP pre-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_peer_pre_handshake(d->sock_fd);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Build M1: method(1) || suites(1) || C_I(1) || X(32) || PK_KEM */
+	{
+		uint8_t *p = d->msg1_buf; uint32_t off = 0;
+		p[off++] = 0x03; p[off++] = 0x00; p[off++] = 0x37;
+		memcpy(p+off, ctx->eph_pk, 32); off += 32;
+		memcpy(p+off, ctx->kem_pk, PQ_KEM_PK_LEN); off += PQ_KEM_PK_LEN;
+		d->msg1_len = off;
+	}
+
+	/* Send M1 via EAP */
+	ret = eap_send_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &eap_id,
+				 d->msg1_buf, d->msg1_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	/* Receive M2 via EAP */
+	ret = eap_recv_edhoc_msg(d->sock_fd, EAP_CODE_REQUEST, &eap_id,
+				 d->msg2_buf, SCK_HYB_MSG_BUF_SIZE, &d->msg2_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	/* Process M2 — same as sck_hyb_initiator_thread */
+	{
+		uint8_t *m2 = d->msg2_buf; uint32_t m2_len = d->msg2_len;
+		uint32_t off = 0;
+		uint8_t peer_eph_pk[32]; memcpy(peer_eph_pk, m2+off, 32); off += 32;
+		uint8_t c_kem[PQ_KEM_CT_LEN]; memcpy(c_kem, m2+off, PQ_KEM_CT_LEN); off += PQ_KEM_CT_LEN;
+		uint16_t aead2_len = ((uint16_t)m2[off] << 8) | m2[off+1]; off += 2;
+		uint8_t ct2[512]; memcpy(ct2, m2+off, aead2_len);
+
+		uint8_t k_kem[PQ_KEM_SS_LEN];
+		ret = pq_kem_decaps(k_kem, c_kem, ctx->kem_sk);
+		if (ret != 0) goto fail;
+		uint8_t ss_eph[32];
+		ret = sck_hyb_ecdh(ctx->eph_sk, peer_eph_pk, ss_eph);
+		if (ret != 0) goto fail;
+		{
+			uint8_t th2_in[SCK_HYB_MSG_BUF_SIZE]; uint32_t tl = 0;
+			memcpy(th2_in, d->msg1_buf, d->msg1_len); tl += d->msg1_len;
+			memcpy(th2_in+tl, peer_eph_pk, 32); tl += 32;
+			memcpy(th2_in+tl, c_kem, PQ_KEM_CT_LEN); tl += PQ_KEM_CT_LEN;
+			ret = sck_hyb_hash(th2_in, tl, ctx->th2);
+			if (ret != 0) goto fail;
+		}
+		uint8_t combined[32+PQ_KEM_SS_LEN]; memcpy(combined, ss_eph, 32);
+		memcpy(combined+32, k_kem, PQ_KEM_SS_LEN);
+		uint8_t prk2e[32];
+		{
+			struct byte_array salt = {.len=PQ_HASH_LEN,.ptr=ctx->th2};
+			struct byte_array ikm = {.len=32+PQ_KEM_SS_LEN,.ptr=combined};
+			ret = (hkdf_extract(SHA_256, &salt, &ikm, prk2e) == ok) ? 0 : -1;
+			if (ret != 0) goto fail;
+		}
+		/* ECDH static: Xi */
+		uint8_t ss_static[32];
+		ret = sck_hyb_ecdh(ctx->eph_sk, ctx->other_static_pk, ss_static);
+		if (ret != 0) goto fail;
+		{
+			struct byte_array salt = {.len=32,.ptr=prk2e};
+			struct byte_array ikm = {.len=32,.ptr=ss_static};
+			ret = (hkdf_extract(SHA_256, &salt, &ikm, ctx->prk3e2m) == ok) ? 0 : -1;
+			if (ret != 0) goto fail;
+		}
+		/* Decrypt AEAD2 */
+		uint8_t ek2[16], iv2[13];
+		ret = sck_hyb_hkdf_expand(ctx->prk3e2m, ctx->th2, 32, ek2, 16);
+		if (ret != 0) goto fail;
+		{
+			uint8_t iv_info[33]; memcpy(iv_info, ctx->th2, 32); iv_info[32] = 0xFF;
+			ret = sck_hyb_hkdf_expand(ctx->prk3e2m, iv_info, 33, iv2, 13);
+			if (ret != 0) goto fail;
+		}
+		uint8_t pt2[512]; size_t pt2_len = 0;
+		ret = sck_hyb_aead_dec(ek2, iv2, NULL, 0, ct2, aead2_len, pt2, &pt2_len);
+		if (ret != 0) goto fail;
+		/* TH3 */
+		{
+			uint8_t th3_in[256]; uint32_t len = 0;
+			memcpy(th3_in, ctx->th2, 32); len += 32;
+			memcpy(th3_in+len, ct2, aead2_len); len += aead2_len;
+			memcpy(th3_in+len, ctx->other_static_pk, 32); len += 32;
+			ret = sck_hyb_hash(th3_in, len, ctx->th3);
+			if (ret != 0) goto fail;
+		}
+		/* prk4e3m = HKDF-Extract(prk3e2m, ECDH(I, Y)) */
+		uint8_t ss_iy[32];
+		ret = sck_hyb_ecdh(ctx->static_sk, peer_eph_pk, ss_iy);
+		if (ret != 0) goto fail;
+		{
+			struct byte_array salt = {.len=32,.ptr=ctx->prk3e2m};
+			struct byte_array ikm = {.len=32,.ptr=ss_iy};
+			ret = (hkdf_extract(SHA_256, &salt, &ikm, ctx->prk4e3m) == ok) ? 0 : -1;
+			if (ret != 0) goto fail;
+		}
+	}
+
+	/* Build & send M3 */
+	{
+		uint8_t mac3[32];
+		ret = sck_hyb_hkdf_expand(ctx->prk4e3m, ctx->th3, 32, mac3, 32);
+		if (ret != 0) goto fail;
+		uint8_t ek3[16], iv3[13];
+		ret = sck_hyb_hkdf_expand(ctx->prk3e2m, ctx->th3, 32, ek3, 16);
+		if (ret != 0) goto fail;
+		{
+			uint8_t iv_info[33]; memcpy(iv_info, ctx->th3, 32); iv_info[32] = 0xFF;
+			ret = sck_hyb_hkdf_expand(ctx->prk3e2m, iv_info, 33, iv3, 13);
+			if (ret != 0) goto fail;
+		}
+		uint8_t pt3[64]; uint32_t pt3_len = 0;
+		memcpy(pt3+pt3_len, ctx->static_pk, 32); pt3_len += 32;
+		memcpy(pt3+pt3_len, mac3, 8); pt3_len += 8;
+		memcpy(pt3+pt3_len, mac3, PQ_AEAD_TAG_LEN); pt3_len += PQ_AEAD_TAG_LEN;
+		uint8_t ct3_aead[128+PQ_AEAD_TAG_LEN]; size_t ct3_len = 0;
+		ret = sck_hyb_aead_enc(ek3, iv3, NULL, 0, pt3, pt3_len, ct3_aead, &ct3_len);
+		if (ret != 0) goto fail;
+		{
+			uint8_t th4_in[256]; uint32_t len = 0;
+			memcpy(th4_in, ctx->th3, 32); len += 32;
+			memcpy(th4_in+len, ct3_aead, ct3_len); len += ct3_len;
+			memcpy(th4_in+len, ctx->static_pk, 32); len += 32;
+			ret = sck_hyb_hash(th4_in, len, ctx->th4);
+			if (ret != 0) goto fail;
+		}
+		ret = sck_hyb_hkdf_expand(ctx->prk4e3m, ctx->th4, 32, ctx->prk_out, 32);
+		if (ret != 0) goto fail;
+		memcpy(d->msg3_buf, ct3_aead, ct3_len);
+		d->msg3_len = (uint32_t)ct3_len;
+	}
+
+	ret = eap_send_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &eap_id,
+				 d->msg3_buf, d->msg3_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	/* EAP post-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_peer_post_handshake(d->sock_fd, ctx->prk_out, 32);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* EAP Hybrid Responder (Server) — same crypto as sck_hyb_responder_thread */
+static void *eap_hyb_responder_thread(void *arg)
+{
+	struct sck_hyb_thread_data *d = (struct sck_hyb_thread_data *)arg;
+	struct hybrid_party_ctx *ctx = d->ctx;
+	int ret;
+	d->txrx_ns = 0;
+	d->error = -1;
+	uint8_t eap_id = 1;
+
+	int listen_fd = sock_create_server(d->port);
+	if (listen_fd < 0) return NULL;
+	d->sock_fd = accept(listen_fd, NULL, NULL);
+	close(listen_fd);
+	if (d->sock_fd < 0) return NULL;
+	int opt = 1;
+	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+	/* EAP pre-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_server_pre_handshake(d->sock_fd, &eap_id);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	d->cpu_start_ns = sck_get_thread_cpu_ns();
+	d->wall_start_ns = sck_get_time_ns();
+
+	/* Receive M1 via EAP */
+	{
+		uint8_t rid = 0;
+		ret = eap_recv_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &rid,
+					 d->msg1_buf, SCK_HYB_MSG_BUF_SIZE, &d->msg1_len, &d->txrx_ns);
+		if (ret != 0) goto fail;
+	}
+
+	/* Process M1 & build M2 — same as sck_hyb_responder_thread */
+	{
+		uint8_t *m1 = d->msg1_buf; uint32_t off = 3;
+		uint8_t peer_eph_pk[32]; memcpy(peer_eph_pk, m1+off, 32); off += 32;
+		uint8_t pk_kem[PQ_KEM_PK_LEN]; memcpy(pk_kem, m1+off, PQ_KEM_PK_LEN);
+
+		uint8_t k_kem[PQ_KEM_SS_LEN], c_kem[PQ_KEM_CT_LEN];
+		ret = pq_kem_encaps(c_kem, k_kem, pk_kem);
+		if (ret != 0) goto fail;
+		uint8_t ss_eph[32];
+		ret = sck_hyb_ecdh(ctx->eph_sk, peer_eph_pk, ss_eph);
+		if (ret != 0) goto fail;
+		{
+			uint8_t th2_in[SCK_HYB_MSG_BUF_SIZE]; uint32_t tl = 0;
+			memcpy(th2_in, m1, d->msg1_len); tl += d->msg1_len;
+			memcpy(th2_in+tl, ctx->eph_pk, 32); tl += 32;
+			memcpy(th2_in+tl, c_kem, PQ_KEM_CT_LEN); tl += PQ_KEM_CT_LEN;
+			ret = sck_hyb_hash(th2_in, tl, ctx->th2);
+			if (ret != 0) goto fail;
+		}
+		uint8_t combined[32+PQ_KEM_SS_LEN]; memcpy(combined, ss_eph, 32);
+		memcpy(combined+32, k_kem, PQ_KEM_SS_LEN);
+		uint8_t prk2e[32];
+		{
+			struct byte_array salt = {.len=PQ_HASH_LEN,.ptr=ctx->th2};
+			struct byte_array ikm = {.len=32+PQ_KEM_SS_LEN,.ptr=combined};
+			ret = (hkdf_extract(SHA_256, &salt, &ikm, prk2e) == ok) ? 0 : -1;
+			if (ret != 0) goto fail;
+		}
+		/* ECDH static: Ry */
+		uint8_t ss_static[32];
+		ret = sck_hyb_ecdh(ctx->static_sk, peer_eph_pk, ss_static);
+		if (ret != 0) goto fail;
+		{
+			struct byte_array salt = {.len=32,.ptr=prk2e};
+			struct byte_array ikm = {.len=32,.ptr=ss_static};
+			ret = (hkdf_extract(SHA_256, &salt, &ikm, ctx->prk3e2m) == ok) ? 0 : -1;
+			if (ret != 0) goto fail;
+		}
+		uint8_t mac2[32];
+		ret = sck_hyb_hkdf_expand(ctx->prk3e2m, ctx->th2, 32, mac2, 32);
+		if (ret != 0) goto fail;
+		uint8_t ek2[16], iv2[13];
+		ret = sck_hyb_hkdf_expand(ctx->prk3e2m, ctx->th2, 32, ek2, 16);
+		if (ret != 0) goto fail;
+		{
+			uint8_t iv_info[33]; memcpy(iv_info, ctx->th2, 32); iv_info[32] = 0xFF;
+			ret = sck_hyb_hkdf_expand(ctx->prk3e2m, iv_info, 33, iv2, 13);
+			if (ret != 0) goto fail;
+		}
+		uint8_t pt2[128]; uint32_t pt2_len = 0;
+		memcpy(pt2+pt2_len, ctx->static_pk, 32); pt2_len += 32;
+		memcpy(pt2+pt2_len, mac2, 8); pt2_len += 8;
+		uint8_t ct2_aead[256]; size_t ct2_len = 0;
+		ret = sck_hyb_aead_enc(ek2, iv2, NULL, 0, pt2, pt2_len, ct2_aead, &ct2_len);
+		if (ret != 0) goto fail;
+		/* TH3 */
+		{
+			uint8_t th3_in[256]; uint32_t len = 0;
+			memcpy(th3_in, ctx->th2, 32); len += 32;
+			memcpy(th3_in+len, ct2_aead, ct2_len); len += ct2_len;
+			memcpy(th3_in+len, ctx->static_pk, 32); len += 32;
+			ret = sck_hyb_hash(th3_in, len, ctx->th3);
+			if (ret != 0) goto fail;
+		}
+		/* prk4e3m */
+		uint8_t ss_iy[32];
+		ret = sck_hyb_ecdh(ctx->eph_sk, ctx->other_static_pk, ss_iy);
+		if (ret != 0) goto fail;
+		{
+			struct byte_array salt = {.len=32,.ptr=ctx->prk3e2m};
+			struct byte_array ikm = {.len=32,.ptr=ss_iy};
+			ret = (hkdf_extract(SHA_256, &salt, &ikm, ctx->prk4e3m) == ok) ? 0 : -1;
+			if (ret != 0) goto fail;
+		}
+		/* Wire M2 */
+		{
+			uint8_t *p = d->msg2_buf; uint32_t o = 0;
+			memcpy(p+o, ctx->eph_pk, 32); o += 32;
+			memcpy(p+o, c_kem, PQ_KEM_CT_LEN); o += PQ_KEM_CT_LEN;
+			p[o++] = (uint8_t)(ct2_len >> 8);
+			p[o++] = (uint8_t)(ct2_len & 0xFF);
+			memcpy(p+o, ct2_aead, ct2_len); o += ct2_len;
+			d->msg2_len = o;
+		}
+	}
+
+	/* Send M2 via EAP */
+	ret = eap_send_edhoc_msg(d->sock_fd, EAP_CODE_REQUEST, &eap_id,
+				 d->msg2_buf, d->msg2_len, &d->txrx_ns);
+	if (ret != 0) goto fail;
+
+	/* Receive M3 via EAP */
+	{
+		uint8_t rid = 0;
+		ret = eap_recv_edhoc_msg(d->sock_fd, EAP_CODE_RESPONSE, &rid,
+					 d->msg3_buf, SCK_HYB_MSG_BUF_SIZE, &d->msg3_len, &d->txrx_ns);
+		if (ret != 0) goto fail;
+	}
+
+	/* Process M3, derive PRK_out */
+	{
+		uint8_t ek3[16], iv3[13];
+		ret = sck_hyb_hkdf_expand(ctx->prk3e2m, ctx->th3, 32, ek3, 16);
+		if (ret != 0) goto fail;
+		{
+			uint8_t iv_info[33]; memcpy(iv_info, ctx->th3, 32); iv_info[32] = 0xFF;
+			ret = sck_hyb_hkdf_expand(ctx->prk3e2m, iv_info, 33, iv3, 13);
+			if (ret != 0) goto fail;
+		}
+		uint8_t pt3[128]; size_t pt3_len = 0;
+		ret = sck_hyb_aead_dec(ek3, iv3, NULL, 0, d->msg3_buf, d->msg3_len, pt3, &pt3_len);
+		if (ret != 0) goto fail;
+		{
+			uint8_t th4_in[256]; uint32_t len = 0;
+			memcpy(th4_in, ctx->th3, 32); len += 32;
+			memcpy(th4_in+len, d->msg3_buf, d->msg3_len); len += d->msg3_len;
+			uint8_t peer_static_pk[32]; memcpy(peer_static_pk, pt3, 32);
+			memcpy(th4_in+len, peer_static_pk, 32); len += 32;
+			ret = sck_hyb_hash(th4_in, len, ctx->th4);
+			if (ret != 0) goto fail;
+		}
+		ret = sck_hyb_hkdf_expand(ctx->prk4e3m, ctx->th4, 32, ctx->prk_out, 32);
+		if (ret != 0) goto fail;
+	}
+
+	/* EAP post-handshake */
+	{
+		uint64_t t0 = sck_get_time_ns();
+		ret = eap_server_post_handshake(d->sock_fd, &eap_id, ctx->prk_out, 32);
+		d->txrx_ns += (sck_get_time_ns() - t0);
+		if (ret != 0) goto fail;
+	}
+
+	ctx->success = 1;
+	d->error = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	close(d->sock_fd); d->sock_fd = -1;
+	return NULL;
+fail:
+	ctx->success = 0;
+	d->wall_end_ns = sck_get_time_ns();
+	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
+	return NULL;
+}
+
+/* =============================================================================
  * Handshake Benchmark Runners
  * =============================================================================
  */
@@ -2701,6 +4251,357 @@ static int sck_run_hybrid_handshake(int base_port,
 }
 
 /* =============================================================================
+ * EAP-EDHOC Handshake Benchmark Runners
+ * =============================================================================
+ */
+
+/* EAP adds ~1024 bytes for EAP packet buffers */
+#define EAP_EXTRA_MEMORY 1024
+
+static int sck_run_eap_classic_handshake(int type_num, int base_port,
+				struct sck_ops_benchmark *ops_init,
+				struct sck_ops_benchmark *ops_resp,
+				struct sck_overhead_benchmark *oh_init,
+				struct sck_overhead_benchmark *oh_resp,
+				struct sck_handshake_benchmark *hs_init,
+				struct sck_handshake_benchmark *hs_resp)
+{
+	char buf[128];
+	snprintf(buf, sizeof(buf),
+		 "Socket: EAP Classic Type %d handshake (%d iterations)...",
+		 type_num, SOCK_BENCH_HANDSHAKE_ITERATIONS);
+	print_info(buf);
+
+	double total_i_wall = 0, total_r_wall = 0;
+	double total_i_cpu  = 0, total_r_cpu  = 0;
+	double total_i_txrx = 0, total_r_txrx = 0;
+	int success_count = 0;
+
+	for (int iter = 0; iter < SOCK_BENCH_HANDSHAKE_ITERATIONS; iter++) {
+		int port = base_port + iter;
+
+		struct sck_classic_thread_data i_data, r_data;
+		memset(&i_data, 0, sizeof(i_data));
+		memset(&r_data, 0, sizeof(r_data));
+		i_data.type_num = type_num;
+		i_data.port = port;
+		r_data.type_num = type_num;
+		r_data.port = port;
+
+		pthread_t tid_r, tid_i;
+		pthread_create(&tid_r, NULL, eap_classic_responder_thread, &r_data);
+		usleep(2000);
+		pthread_create(&tid_i, NULL, eap_classic_initiator_thread, &i_data);
+
+		pthread_join(tid_i, NULL);
+		pthread_join(tid_r, NULL);
+
+		if (i_data.error == ok && r_data.error == ok) {
+			total_i_wall += sck_elapsed_us(i_data.wall_start_ns, i_data.wall_end_ns);
+			total_r_wall += sck_elapsed_us(r_data.wall_start_ns, r_data.wall_end_ns);
+			total_i_cpu  += sck_elapsed_us(i_data.cpu_start_ns,  i_data.cpu_end_ns);
+			total_r_cpu  += sck_elapsed_us(r_data.cpu_start_ns,  r_data.cpu_end_ns);
+			total_i_txrx += (double)i_data.txrx_ns / 1000.0;
+			total_r_txrx += (double)r_data.txrx_ns / 1000.0;
+			success_count++;
+		}
+	}
+
+	if (success_count == 0) {
+		print_error("All EAP Classic socket handshake iterations failed!");
+		return -1;
+	}
+
+	double n = (double)success_count;
+	double cpu_i = total_i_cpu / n, cpu_r = total_r_cpu / n;
+	double pre_i = SCOST(ops_init->keygen);
+	double pre_r = SCOST(ops_resp->keygen);
+	double proc_i = cpu_i - pre_i;
+	double proc_r = cpu_r - pre_r;
+	if (proc_i < 0) proc_i = 0;
+	if (proc_r < 0) proc_r = 0;
+
+	oh_init->cpu_us = proc_i;
+	oh_init->memory_bytes = sck_estimate_classic_memory(type_num) + EAP_EXTRA_MEMORY;
+	oh_resp->cpu_us = proc_r;
+	oh_resp->memory_bytes = sck_estimate_classic_memory(type_num) + EAP_EXTRA_MEMORY;
+
+	hs_init->processing_us     = proc_i;
+	hs_init->txrx_us           = total_i_txrx / n;
+	hs_init->precomputation_us = pre_i;
+	hs_init->total_us          = total_i_wall / n;
+	hs_init->overhead_us       = hs_init->total_us - hs_init->processing_us -
+				     hs_init->txrx_us - hs_init->precomputation_us;
+	if (hs_init->overhead_us < 0) {
+		hs_init->overhead_us = 0;
+		hs_init->total_us = hs_init->processing_us + hs_init->txrx_us + hs_init->precomputation_us;
+	}
+
+	hs_resp->processing_us     = proc_r;
+	hs_resp->txrx_us           = total_r_txrx / n;
+	hs_resp->precomputation_us = pre_r;
+	hs_resp->total_us          = total_r_wall / n;
+	hs_resp->overhead_us       = hs_resp->total_us - hs_resp->processing_us -
+				     hs_resp->txrx_us - hs_resp->precomputation_us;
+	if (hs_resp->overhead_us < 0) {
+		hs_resp->overhead_us = 0;
+		hs_resp->total_us = hs_resp->processing_us + hs_resp->txrx_us + hs_resp->precomputation_us;
+	}
+
+	snprintf(buf, sizeof(buf), "EAP Classic Type %d socket handshake: %d/%d successful.",
+		 type_num, success_count, SOCK_BENCH_HANDSHAKE_ITERATIONS);
+	print_success(buf);
+	return 0;
+}
+
+static int sck_run_eap_pq_handshake(int pq_type_num, int base_port,
+				struct sck_ops_benchmark *ops_init,
+				struct sck_ops_benchmark *ops_resp,
+				struct sck_overhead_benchmark *oh_init,
+				struct sck_overhead_benchmark *oh_resp,
+				struct sck_handshake_benchmark *hs_init,
+				struct sck_handshake_benchmark *hs_resp)
+{
+	char buf[128];
+	snprintf(buf, sizeof(buf),
+		 "Socket: EAP PQ Type %d handshake (%d iterations, TCP)...",
+		 pq_type_num, SOCK_BENCH_HANDSHAKE_ITERATIONS);
+	print_info(buf);
+
+	uint8_t init_lt_pk[PQ_KEM_PK_LEN], init_lt_sk[PQ_KEM_SK_LEN];
+	uint8_t resp_lt_pk[PQ_KEM_PK_LEN], resp_lt_sk[PQ_KEM_SK_LEN];
+	if (pq_kem_keygen(init_lt_pk, init_lt_sk) != 0 ||
+	    pq_kem_keygen(resp_lt_pk, resp_lt_sk) != 0) {
+		print_error("PQ keygen setup failed"); return -1;
+	}
+
+	uint8_t init_sig_pk[PQ_SIG_PK_LEN], init_sig_sk[PQ_SIG_SK_LEN];
+	uint8_t resp_sig_pk[PQ_SIG_PK_LEN], resp_sig_sk[PQ_SIG_SK_LEN];
+	if (pq_type_num == 0) {
+		if (pq_sig_keygen(init_sig_pk, init_sig_sk) != 0 ||
+		    pq_sig_keygen(resp_sig_pk, resp_sig_sk) != 0) {
+			print_error("PQ sig keygen setup failed"); return -1;
+		}
+	}
+
+	double total_i_wall = 0, total_r_wall = 0;
+	double total_i_cpu  = 0, total_r_cpu  = 0;
+	double total_i_txrx = 0, total_r_txrx = 0;
+	int success_count = 0;
+
+	for (int iter = 0; iter < SOCK_BENCH_HANDSHAKE_ITERATIONS; iter++) {
+		int port = base_port + iter;
+
+		if (pq_type_num == 0) {
+			struct pq_party_ctx init_ctx, resp_ctx;
+			memset(&init_ctx, 0, sizeof(init_ctx));
+			memset(&resp_ctx, 0, sizeof(resp_ctx));
+			memcpy(init_ctx.lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(init_ctx.lt_sk, init_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(init_ctx.other_lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(init_ctx.sig_pk, init_sig_pk, PQ_SIG_PK_LEN);
+			memcpy(init_ctx.sig_sk, init_sig_sk, PQ_SIG_SK_LEN);
+			memcpy(init_ctx.other_sig_pk, resp_sig_pk, PQ_SIG_PK_LEN);
+			memcpy(resp_ctx.lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx.lt_sk, resp_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(resp_ctx.other_lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx.sig_pk, resp_sig_pk, PQ_SIG_PK_LEN);
+			memcpy(resp_ctx.sig_sk, resp_sig_sk, PQ_SIG_SK_LEN);
+			memcpy(resp_ctx.other_sig_pk, init_sig_pk, PQ_SIG_PK_LEN);
+
+			struct sck_pq_thread_data id, rd;
+			memset(&id, 0, sizeof(id)); memset(&rd, 0, sizeof(rd));
+			id.ctx = &init_ctx; id.port = port;
+			rd.ctx = &resp_ctx; rd.port = port;
+
+			pthread_t tid_r, tid_i;
+			pthread_create(&tid_r, NULL, eap_pq0_responder_thread, &rd);
+			usleep(2000);
+			pthread_create(&tid_i, NULL, eap_pq0_initiator_thread, &id);
+			pthread_join(tid_i, NULL);
+			pthread_join(tid_r, NULL);
+
+			if (id.error == 0 && rd.error == 0) {
+				total_i_wall += sck_elapsed_us(id.wall_start_ns, id.wall_end_ns);
+				total_r_wall += sck_elapsed_us(rd.wall_start_ns, rd.wall_end_ns);
+				total_i_cpu  += sck_elapsed_us(id.cpu_start_ns,  id.cpu_end_ns);
+				total_r_cpu  += sck_elapsed_us(rd.cpu_start_ns,  rd.cpu_end_ns);
+				total_i_txrx += (double)id.txrx_ns / 1000.0;
+				total_r_txrx += (double)rd.txrx_ns / 1000.0;
+				success_count++;
+			}
+		} else {
+			struct pq3_party_ctx init_ctx, resp_ctx;
+			memset(&init_ctx, 0, sizeof(init_ctx));
+			memset(&resp_ctx, 0, sizeof(resp_ctx));
+			memcpy(init_ctx.lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(init_ctx.lt_sk, init_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(init_ctx.other_lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx.lt_pk, resp_lt_pk, PQ_KEM_PK_LEN);
+			memcpy(resp_ctx.lt_sk, resp_lt_sk, PQ_KEM_SK_LEN);
+			memcpy(resp_ctx.other_lt_pk, init_lt_pk, PQ_KEM_PK_LEN);
+
+			struct sck_pq3_thread_data id, rd;
+			memset(&id, 0, sizeof(id)); memset(&rd, 0, sizeof(rd));
+			id.ctx = &init_ctx; id.port = port;
+			rd.ctx = &resp_ctx; rd.port = port;
+
+			pthread_t tid_r, tid_i;
+			pthread_create(&tid_r, NULL, eap_pq3_responder_thread, &rd);
+			usleep(2000);
+			pthread_create(&tid_i, NULL, eap_pq3_initiator_thread, &id);
+			pthread_join(tid_i, NULL);
+			pthread_join(tid_r, NULL);
+
+			if (id.error == 0 && rd.error == 0) {
+				total_i_wall += sck_elapsed_us(id.wall_start_ns, id.wall_end_ns);
+				total_r_wall += sck_elapsed_us(rd.wall_start_ns, rd.wall_end_ns);
+				total_i_cpu  += sck_elapsed_us(id.cpu_start_ns,  id.cpu_end_ns);
+				total_r_cpu  += sck_elapsed_us(rd.cpu_start_ns,  rd.cpu_end_ns);
+				total_i_txrx += (double)id.txrx_ns / 1000.0;
+				total_r_txrx += (double)rd.txrx_ns / 1000.0;
+				success_count++;
+			}
+		}
+	}
+
+	if (success_count == 0) { print_error("All EAP PQ socket handshake failed!"); return -1; }
+
+	double n = (double)success_count;
+	double cpu_i = total_i_cpu / n, cpu_r = total_r_cpu / n;
+	double pre_i = SCOST(ops_init->pq_keygen);
+	double pre_r = SCOST(ops_resp->pq_keygen);
+	double proc_i = cpu_i - pre_i;
+	double proc_r = cpu_r - pre_r;
+	if (proc_i < 0) proc_i = 0;
+	if (proc_r < 0) proc_r = 0;
+
+	oh_init->cpu_us = proc_i; oh_init->memory_bytes = sck_estimate_pq_memory(pq_type_num) + EAP_EXTRA_MEMORY;
+	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = sck_estimate_pq_memory(pq_type_num) + EAP_EXTRA_MEMORY;
+
+	hs_init->processing_us = proc_i; hs_init->txrx_us = total_i_txrx / n;
+	hs_init->precomputation_us = pre_i; hs_init->total_us = total_i_wall / n;
+	hs_init->overhead_us = hs_init->total_us - proc_i - hs_init->txrx_us - pre_i;
+	if (hs_init->overhead_us < 0) { hs_init->overhead_us = 0; hs_init->total_us = proc_i + hs_init->txrx_us + pre_i; }
+
+	hs_resp->processing_us = proc_r; hs_resp->txrx_us = total_r_txrx / n;
+	hs_resp->precomputation_us = pre_r; hs_resp->total_us = total_r_wall / n;
+	hs_resp->overhead_us = hs_resp->total_us - proc_r - hs_resp->txrx_us - pre_r;
+	if (hs_resp->overhead_us < 0) { hs_resp->overhead_us = 0; hs_resp->total_us = proc_r + hs_resp->txrx_us + pre_r; }
+
+	snprintf(buf, sizeof(buf), "EAP PQ Type %d socket handshake: %d/%d successful.",
+		 pq_type_num, success_count, SOCK_BENCH_HANDSHAKE_ITERATIONS);
+	print_success(buf);
+	return 0;
+}
+
+static int sck_run_eap_hybrid_handshake(int base_port,
+				    struct sck_ops_benchmark *ops_init,
+				    struct sck_ops_benchmark *ops_resp,
+				    struct sck_overhead_benchmark *oh_init,
+				    struct sck_overhead_benchmark *oh_resp,
+				    struct sck_handshake_benchmark *hs_init,
+				    struct sck_handshake_benchmark *hs_resp)
+{
+	print_info("Socket: EAP Hybrid Type 3 handshake (TCP)...");
+
+	uint8_t init_static_sk[32], init_static_pk[32];
+	uint8_t resp_static_sk[32], resp_static_pk[32];
+	{
+		struct byte_array sk = {.len=32,.ptr=init_static_sk};
+		struct byte_array pk = {.len=32,.ptr=init_static_pk};
+		if (ephemeral_dh_key_gen(X25519, 500, &sk, &pk) != ok) return -1;
+	}
+	{
+		struct byte_array sk = {.len=32,.ptr=resp_static_sk};
+		struct byte_array pk = {.len=32,.ptr=resp_static_pk};
+		if (ephemeral_dh_key_gen(X25519, 600, &sk, &pk) != ok) return -1;
+	}
+
+	double total_i_wall = 0, total_r_wall = 0;
+	double total_i_cpu  = 0, total_r_cpu  = 0;
+	double total_i_txrx = 0, total_r_txrx = 0;
+	int success_count = 0;
+
+	for (int iter = 0; iter < SOCK_BENCH_HANDSHAKE_ITERATIONS; iter++) {
+		int port = base_port + iter;
+
+		struct hybrid_party_ctx init_ctx, resp_ctx;
+		memset(&init_ctx, 0, sizeof(init_ctx));
+		memset(&resp_ctx, 0, sizeof(resp_ctx));
+		memcpy(init_ctx.static_sk, init_static_sk, 32);
+		memcpy(init_ctx.static_pk, init_static_pk, 32);
+		memcpy(resp_ctx.static_sk, resp_static_sk, 32);
+		memcpy(resp_ctx.static_pk, resp_static_pk, 32);
+		memcpy(init_ctx.other_static_pk, resp_static_pk, 32);
+		memcpy(resp_ctx.other_static_pk, init_static_pk, 32);
+		{
+			struct byte_array sk = {.len=32,.ptr=init_ctx.eph_sk};
+			struct byte_array pk = {.len=32,.ptr=init_ctx.eph_pk};
+			ephemeral_dh_key_gen(X25519, 700+iter, &sk, &pk);
+		}
+		{
+			struct byte_array sk = {.len=32,.ptr=resp_ctx.eph_sk};
+			struct byte_array pk = {.len=32,.ptr=resp_ctx.eph_pk};
+			ephemeral_dh_key_gen(X25519, 800+iter, &sk, &pk);
+		}
+		pq_kem_keygen(init_ctx.kem_pk, init_ctx.kem_sk);
+
+		struct sck_hyb_thread_data id, rd;
+		memset(&id, 0, sizeof(id)); memset(&rd, 0, sizeof(rd));
+		id.ctx = &init_ctx; id.port = port;
+		rd.ctx = &resp_ctx; rd.port = port;
+
+		pthread_t tid_r, tid_i;
+		pthread_create(&tid_r, NULL, eap_hyb_responder_thread, &rd);
+		usleep(2000);
+		pthread_create(&tid_i, NULL, eap_hyb_initiator_thread, &id);
+		pthread_join(tid_i, NULL);
+		pthread_join(tid_r, NULL);
+
+		if (id.error == 0 && rd.error == 0) {
+			total_i_wall += sck_elapsed_us(id.wall_start_ns, id.wall_end_ns);
+			total_r_wall += sck_elapsed_us(rd.wall_start_ns, rd.wall_end_ns);
+			total_i_cpu  += sck_elapsed_us(id.cpu_start_ns,  id.cpu_end_ns);
+			total_r_cpu  += sck_elapsed_us(rd.cpu_start_ns,  rd.cpu_end_ns);
+			total_i_txrx += (double)id.txrx_ns / 1000.0;
+			total_r_txrx += (double)rd.txrx_ns / 1000.0;
+			success_count++;
+		}
+	}
+
+	if (success_count == 0) { print_error("All EAP Hybrid socket handshake failed!"); return -1; }
+
+	double n = (double)success_count;
+	double cpu_i = total_i_cpu / n, cpu_r = total_r_cpu / n;
+	double pre_i = SCOST(ops_init->keygen) + SCOST(ops_init->pq_keygen);
+	double pre_r = SCOST(ops_resp->keygen) + SCOST(ops_resp->pq_keygen);
+	double proc_i = cpu_i - pre_i;
+	double proc_r = cpu_r - pre_r;
+	if (proc_i < 0) proc_i = 0;
+	if (proc_r < 0) proc_r = 0;
+
+	oh_init->cpu_us = proc_i; oh_init->memory_bytes = sck_estimate_hybrid_memory() + EAP_EXTRA_MEMORY;
+	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = sck_estimate_hybrid_memory() + EAP_EXTRA_MEMORY;
+
+	hs_init->processing_us = proc_i; hs_init->txrx_us = total_i_txrx / n;
+	hs_init->precomputation_us = pre_i; hs_init->total_us = total_i_wall / n;
+	hs_init->overhead_us = hs_init->total_us - proc_i - hs_init->txrx_us - pre_i;
+	if (hs_init->overhead_us < 0) { hs_init->overhead_us = 0; hs_init->total_us = proc_i + hs_init->txrx_us + pre_i; }
+
+	hs_resp->processing_us = proc_r; hs_resp->txrx_us = total_r_txrx / n;
+	hs_resp->precomputation_us = pre_r; hs_resp->total_us = total_r_wall / n;
+	hs_resp->overhead_us = hs_resp->total_us - proc_r - hs_resp->txrx_us - pre_r;
+	if (hs_resp->overhead_us < 0) { hs_resp->overhead_us = 0; hs_resp->total_us = proc_r + hs_resp->txrx_us + pre_r; }
+
+	char buf[128];
+	snprintf(buf, sizeof(buf), "EAP Hybrid socket handshake: %d/%d successful.",
+		 success_count, SOCK_BENCH_HANDSHAKE_ITERATIONS);
+	print_success(buf);
+	return 0;
+}
+
+/* =============================================================================
  * CSV Writers (identical format to edhoc_benchmark.c)
  * =============================================================================
  */
@@ -2715,115 +4616,98 @@ static int sck_write_operations_csv(const char *path,
 	struct sck_ops_benchmark *t3i, struct sck_ops_benchmark *t3r,
 	struct sck_ops_benchmark *t0pi, struct sck_ops_benchmark *t0pr,
 	struct sck_ops_benchmark *t3pi, struct sck_ops_benchmark *t3pr,
-	struct sck_ops_benchmark *thi, struct sck_ops_benchmark *thr)
+	struct sck_ops_benchmark *thi, struct sck_ops_benchmark *thr,
+	/* EAP variants — same ops, different type name */
+	struct sck_ops_benchmark *et0i, struct sck_ops_benchmark *et0r,
+	struct sck_ops_benchmark *et3i, struct sck_ops_benchmark *et3r,
+	struct sck_ops_benchmark *et0pi, struct sck_ops_benchmark *et0pr,
+	struct sck_ops_benchmark *et3pi, struct sck_ops_benchmark *et3pr,
+	struct sck_ops_benchmark *ethi, struct sck_ops_benchmark *ethr)
 {
 	FILE *fp = fopen(path, "w");
 	if (!fp) return -1;
 	fprintf(fp, "type,role,operation,avg_time_us,calls_per_handshake,total_per_handshake_us,iterations\n");
 
-	/* Classic Type 0 */
-	SWRITE_OP("Type0_SigSig","Initiator","KeyGen",t0i->keygen);
-	SWRITE_OP("Type0_SigSig","Initiator","Encap",t0i->pq_encaps);
-	SWRITE_OP("Type0_SigSig","Initiator","Decap",t0i->pq_decaps);
-	SWRITE_OP("Type0_SigSig","Initiator","AEAD_Enc",t0i->aead_enc);
-	SWRITE_OP("Type0_SigSig","Initiator","AEAD_Dec",t0i->aead_dec);
-	SWRITE_OP("Type0_SigSig","Initiator","Signature",t0i->signature);
-	SWRITE_OP("Type0_SigSig","Initiator","Verification",t0i->verification);
-	SWRITE_OP("Type0_SigSig","Initiator","ECDH",t0i->ecdh);
-	SWRITE_OP("Type0_SigSig","Initiator","HKDF",t0i->hkdf);
-	SWRITE_OP("Type0_SigSig","Initiator","Hash",t0i->hash);
-	SWRITE_OP("Type0_SigSig","Responder","KeyGen",t0r->keygen);
-	SWRITE_OP("Type0_SigSig","Responder","Encap",t0r->pq_encaps);
-	SWRITE_OP("Type0_SigSig","Responder","Decap",t0r->pq_decaps);
-	SWRITE_OP("Type0_SigSig","Responder","AEAD_Enc",t0r->aead_enc);
-	SWRITE_OP("Type0_SigSig","Responder","AEAD_Dec",t0r->aead_dec);
-	SWRITE_OP("Type0_SigSig","Responder","Signature",t0r->signature);
-	SWRITE_OP("Type0_SigSig","Responder","Verification",t0r->verification);
-	SWRITE_OP("Type0_SigSig","Responder","ECDH",t0r->ecdh);
-	SWRITE_OP("Type0_SigSig","Responder","HKDF",t0r->hkdf);
-	SWRITE_OP("Type0_SigSig","Responder","Hash",t0r->hash);
+	/* Helper macro for a full classic variant */
+	#define WRITE_CLASSIC_OPS(TYPE, IR_I, IR_R) \
+		SWRITE_OP(TYPE,"Initiator","KeyGen",(IR_I)->keygen); \
+		SWRITE_OP(TYPE,"Initiator","Encap",(IR_I)->pq_encaps); \
+		SWRITE_OP(TYPE,"Initiator","Decap",(IR_I)->pq_decaps); \
+		SWRITE_OP(TYPE,"Initiator","AEAD_Enc",(IR_I)->aead_enc); \
+		SWRITE_OP(TYPE,"Initiator","AEAD_Dec",(IR_I)->aead_dec); \
+		SWRITE_OP(TYPE,"Initiator","Signature",(IR_I)->signature); \
+		SWRITE_OP(TYPE,"Initiator","Verification",(IR_I)->verification); \
+		SWRITE_OP(TYPE,"Initiator","ECDH",(IR_I)->ecdh); \
+		SWRITE_OP(TYPE,"Initiator","HKDF",(IR_I)->hkdf); \
+		SWRITE_OP(TYPE,"Initiator","Hash",(IR_I)->hash); \
+		SWRITE_OP(TYPE,"Responder","KeyGen",(IR_R)->keygen); \
+		SWRITE_OP(TYPE,"Responder","Encap",(IR_R)->pq_encaps); \
+		SWRITE_OP(TYPE,"Responder","Decap",(IR_R)->pq_decaps); \
+		SWRITE_OP(TYPE,"Responder","AEAD_Enc",(IR_R)->aead_enc); \
+		SWRITE_OP(TYPE,"Responder","AEAD_Dec",(IR_R)->aead_dec); \
+		SWRITE_OP(TYPE,"Responder","Signature",(IR_R)->signature); \
+		SWRITE_OP(TYPE,"Responder","Verification",(IR_R)->verification); \
+		SWRITE_OP(TYPE,"Responder","ECDH",(IR_R)->ecdh); \
+		SWRITE_OP(TYPE,"Responder","HKDF",(IR_R)->hkdf); \
+		SWRITE_OP(TYPE,"Responder","Hash",(IR_R)->hash)
 
-	/* Classic Type 3 */
-	SWRITE_OP("Type3_MACMAC","Initiator","KeyGen",t3i->keygen);
-	SWRITE_OP("Type3_MACMAC","Initiator","Encap",t3i->pq_encaps);
-	SWRITE_OP("Type3_MACMAC","Initiator","Decap",t3i->pq_decaps);
-	SWRITE_OP("Type3_MACMAC","Initiator","AEAD_Enc",t3i->aead_enc);
-	SWRITE_OP("Type3_MACMAC","Initiator","AEAD_Dec",t3i->aead_dec);
-	SWRITE_OP("Type3_MACMAC","Initiator","Signature",t3i->signature);
-	SWRITE_OP("Type3_MACMAC","Initiator","Verification",t3i->verification);
-	SWRITE_OP("Type3_MACMAC","Initiator","ECDH",t3i->ecdh);
-	SWRITE_OP("Type3_MACMAC","Initiator","HKDF",t3i->hkdf);
-	SWRITE_OP("Type3_MACMAC","Initiator","Hash",t3i->hash);
-	SWRITE_OP("Type3_MACMAC","Responder","KeyGen",t3r->keygen);
-	SWRITE_OP("Type3_MACMAC","Responder","Encap",t3r->pq_encaps);
-	SWRITE_OP("Type3_MACMAC","Responder","Decap",t3r->pq_decaps);
-	SWRITE_OP("Type3_MACMAC","Responder","AEAD_Enc",t3r->aead_enc);
-	SWRITE_OP("Type3_MACMAC","Responder","AEAD_Dec",t3r->aead_dec);
-	SWRITE_OP("Type3_MACMAC","Responder","Signature",t3r->signature);
-	SWRITE_OP("Type3_MACMAC","Responder","Verification",t3r->verification);
-	SWRITE_OP("Type3_MACMAC","Responder","ECDH",t3r->ecdh);
-	SWRITE_OP("Type3_MACMAC","Responder","HKDF",t3r->hkdf);
-	SWRITE_OP("Type3_MACMAC","Responder","Hash",t3r->hash);
+	#define WRITE_PQ_OPS(TYPE, IR_I, IR_R) \
+		SWRITE_OP(TYPE,"Initiator","PQ_KeyGen",(IR_I)->pq_keygen); \
+		SWRITE_OP(TYPE,"Initiator","PQ_Encaps",(IR_I)->pq_encaps); \
+		SWRITE_OP(TYPE,"Initiator","PQ_Decaps",(IR_I)->pq_decaps); \
+		SWRITE_OP(TYPE,"Initiator","PQ_Signature",(IR_I)->pq_sig_sign); \
+		SWRITE_OP(TYPE,"Initiator","PQ_Verification",(IR_I)->pq_sig_verify); \
+		SWRITE_OP(TYPE,"Initiator","PQ_AEAD_Enc",(IR_I)->pq_aead_enc); \
+		SWRITE_OP(TYPE,"Initiator","PQ_AEAD_Dec",(IR_I)->pq_aead_dec); \
+		SWRITE_OP(TYPE,"Initiator","PQ_HKDF",(IR_I)->pq_hkdf); \
+		SWRITE_OP(TYPE,"Initiator","PQ_Hash",(IR_I)->pq_hash); \
+		SWRITE_OP(TYPE,"Responder","PQ_KeyGen",(IR_R)->pq_keygen); \
+		SWRITE_OP(TYPE,"Responder","PQ_Encaps",(IR_R)->pq_encaps); \
+		SWRITE_OP(TYPE,"Responder","PQ_Decaps",(IR_R)->pq_decaps); \
+		SWRITE_OP(TYPE,"Responder","PQ_Signature",(IR_R)->pq_sig_sign); \
+		SWRITE_OP(TYPE,"Responder","PQ_Verification",(IR_R)->pq_sig_verify); \
+		SWRITE_OP(TYPE,"Responder","PQ_AEAD_Enc",(IR_R)->pq_aead_enc); \
+		SWRITE_OP(TYPE,"Responder","PQ_AEAD_Dec",(IR_R)->pq_aead_dec); \
+		SWRITE_OP(TYPE,"Responder","PQ_HKDF",(IR_R)->pq_hkdf); \
+		SWRITE_OP(TYPE,"Responder","PQ_Hash",(IR_R)->pq_hash)
 
-	/* PQ Type 0 */
-	SWRITE_OP("Type0_PQ","Initiator","PQ_KeyGen",t0pi->pq_keygen);
-	SWRITE_OP("Type0_PQ","Initiator","PQ_Encaps",t0pi->pq_encaps);
-	SWRITE_OP("Type0_PQ","Initiator","PQ_Decaps",t0pi->pq_decaps);
-	SWRITE_OP("Type0_PQ","Initiator","PQ_Signature",t0pi->pq_sig_sign);
-	SWRITE_OP("Type0_PQ","Initiator","PQ_Verification",t0pi->pq_sig_verify);
-	SWRITE_OP("Type0_PQ","Initiator","PQ_AEAD_Enc",t0pi->pq_aead_enc);
-	SWRITE_OP("Type0_PQ","Initiator","PQ_AEAD_Dec",t0pi->pq_aead_dec);
-	SWRITE_OP("Type0_PQ","Initiator","PQ_HKDF",t0pi->pq_hkdf);
-	SWRITE_OP("Type0_PQ","Initiator","PQ_Hash",t0pi->pq_hash);
-	SWRITE_OP("Type0_PQ","Responder","PQ_KeyGen",t0pr->pq_keygen);
-	SWRITE_OP("Type0_PQ","Responder","PQ_Encaps",t0pr->pq_encaps);
-	SWRITE_OP("Type0_PQ","Responder","PQ_Decaps",t0pr->pq_decaps);
-	SWRITE_OP("Type0_PQ","Responder","PQ_Signature",t0pr->pq_sig_sign);
-	SWRITE_OP("Type0_PQ","Responder","PQ_Verification",t0pr->pq_sig_verify);
-	SWRITE_OP("Type0_PQ","Responder","PQ_AEAD_Enc",t0pr->pq_aead_enc);
-	SWRITE_OP("Type0_PQ","Responder","PQ_AEAD_Dec",t0pr->pq_aead_dec);
-	SWRITE_OP("Type0_PQ","Responder","PQ_HKDF",t0pr->pq_hkdf);
-	SWRITE_OP("Type0_PQ","Responder","PQ_Hash",t0pr->pq_hash);
+	#define WRITE_HYBRID_OPS(TYPE, IR_I, IR_R) \
+		SWRITE_OP(TYPE,"Initiator","KeyGen",(IR_I)->keygen); \
+		SWRITE_OP(TYPE,"Initiator","AEAD_Enc",(IR_I)->aead_enc); \
+		SWRITE_OP(TYPE,"Initiator","AEAD_Dec",(IR_I)->aead_dec); \
+		SWRITE_OP(TYPE,"Initiator","ECDH",(IR_I)->ecdh); \
+		SWRITE_OP(TYPE,"Initiator","HKDF",(IR_I)->hkdf); \
+		SWRITE_OP(TYPE,"Initiator","Hash",(IR_I)->hash); \
+		SWRITE_OP(TYPE,"Initiator","PQ_KeyGen",(IR_I)->pq_keygen); \
+		SWRITE_OP(TYPE,"Initiator","PQ_Encaps",(IR_I)->pq_encaps); \
+		SWRITE_OP(TYPE,"Initiator","PQ_Decaps",(IR_I)->pq_decaps); \
+		SWRITE_OP(TYPE,"Responder","KeyGen",(IR_R)->keygen); \
+		SWRITE_OP(TYPE,"Responder","AEAD_Enc",(IR_R)->aead_enc); \
+		SWRITE_OP(TYPE,"Responder","AEAD_Dec",(IR_R)->aead_dec); \
+		SWRITE_OP(TYPE,"Responder","ECDH",(IR_R)->ecdh); \
+		SWRITE_OP(TYPE,"Responder","HKDF",(IR_R)->hkdf); \
+		SWRITE_OP(TYPE,"Responder","Hash",(IR_R)->hash); \
+		SWRITE_OP(TYPE,"Responder","PQ_KeyGen",(IR_R)->pq_keygen); \
+		SWRITE_OP(TYPE,"Responder","PQ_Encaps",(IR_R)->pq_encaps); \
+		SWRITE_OP(TYPE,"Responder","PQ_Decaps",(IR_R)->pq_decaps)
 
-	/* PQ Type 3 */
-	SWRITE_OP("Type3_PQ","Initiator","PQ_KeyGen",t3pi->pq_keygen);
-	SWRITE_OP("Type3_PQ","Initiator","PQ_Encaps",t3pi->pq_encaps);
-	SWRITE_OP("Type3_PQ","Initiator","PQ_Decaps",t3pi->pq_decaps);
-	SWRITE_OP("Type3_PQ","Initiator","PQ_Signature",t3pi->pq_sig_sign);
-	SWRITE_OP("Type3_PQ","Initiator","PQ_Verification",t3pi->pq_sig_verify);
-	SWRITE_OP("Type3_PQ","Initiator","PQ_AEAD_Enc",t3pi->pq_aead_enc);
-	SWRITE_OP("Type3_PQ","Initiator","PQ_AEAD_Dec",t3pi->pq_aead_dec);
-	SWRITE_OP("Type3_PQ","Initiator","PQ_HKDF",t3pi->pq_hkdf);
-	SWRITE_OP("Type3_PQ","Initiator","PQ_Hash",t3pi->pq_hash);
-	SWRITE_OP("Type3_PQ","Responder","PQ_KeyGen",t3pr->pq_keygen);
-	SWRITE_OP("Type3_PQ","Responder","PQ_Encaps",t3pr->pq_encaps);
-	SWRITE_OP("Type3_PQ","Responder","PQ_Decaps",t3pr->pq_decaps);
-	SWRITE_OP("Type3_PQ","Responder","PQ_Signature",t3pr->pq_sig_sign);
-	SWRITE_OP("Type3_PQ","Responder","PQ_Verification",t3pr->pq_sig_verify);
-	SWRITE_OP("Type3_PQ","Responder","PQ_AEAD_Enc",t3pr->pq_aead_enc);
-	SWRITE_OP("Type3_PQ","Responder","PQ_AEAD_Dec",t3pr->pq_aead_dec);
-	SWRITE_OP("Type3_PQ","Responder","PQ_HKDF",t3pr->pq_hkdf);
-	SWRITE_OP("Type3_PQ","Responder","PQ_Hash",t3pr->pq_hash);
+	/* 5 EDHOC variants */
+	WRITE_CLASSIC_OPS("Type0_SigSig", t0i, t0r);
+	WRITE_CLASSIC_OPS("Type3_MACMAC", t3i, t3r);
+	WRITE_PQ_OPS("Type0_PQ", t0pi, t0pr);
+	WRITE_PQ_OPS("Type3_PQ", t3pi, t3pr);
+	WRITE_HYBRID_OPS("Type3_Hybrid", thi, thr);
 
-	/* Hybrid Type 3 */
-	SWRITE_OP("Type3_Hybrid","Initiator","KeyGen",thi->keygen);
-	SWRITE_OP("Type3_Hybrid","Initiator","AEAD_Enc",thi->aead_enc);
-	SWRITE_OP("Type3_Hybrid","Initiator","AEAD_Dec",thi->aead_dec);
-	SWRITE_OP("Type3_Hybrid","Initiator","ECDH",thi->ecdh);
-	SWRITE_OP("Type3_Hybrid","Initiator","HKDF",thi->hkdf);
-	SWRITE_OP("Type3_Hybrid","Initiator","Hash",thi->hash);
-	SWRITE_OP("Type3_Hybrid","Initiator","PQ_KeyGen",thi->pq_keygen);
-	SWRITE_OP("Type3_Hybrid","Initiator","PQ_Encaps",thi->pq_encaps);
-	SWRITE_OP("Type3_Hybrid","Initiator","PQ_Decaps",thi->pq_decaps);
-	SWRITE_OP("Type3_Hybrid","Responder","KeyGen",thr->keygen);
-	SWRITE_OP("Type3_Hybrid","Responder","AEAD_Enc",thr->aead_enc);
-	SWRITE_OP("Type3_Hybrid","Responder","AEAD_Dec",thr->aead_dec);
-	SWRITE_OP("Type3_Hybrid","Responder","ECDH",thr->ecdh);
-	SWRITE_OP("Type3_Hybrid","Responder","HKDF",thr->hkdf);
-	SWRITE_OP("Type3_Hybrid","Responder","Hash",thr->hash);
-	SWRITE_OP("Type3_Hybrid","Responder","PQ_KeyGen",thr->pq_keygen);
-	SWRITE_OP("Type3_Hybrid","Responder","PQ_Encaps",thr->pq_encaps);
-	SWRITE_OP("Type3_Hybrid","Responder","PQ_Decaps",thr->pq_decaps);
+	/* 5 EAP-EDHOC variants — same crypto ops */
+	WRITE_CLASSIC_OPS("EAP_Type0_SigSig", et0i, et0r);
+	WRITE_CLASSIC_OPS("EAP_Type3_MACMAC", et3i, et3r);
+	WRITE_PQ_OPS("EAP_Type0_PQ", et0pi, et0pr);
+	WRITE_PQ_OPS("EAP_Type3_PQ", et3pi, et3pr);
+	WRITE_HYBRID_OPS("EAP_Type3_Hybrid", ethi, ethr);
+
+	#undef WRITE_CLASSIC_OPS
+	#undef WRITE_PQ_OPS
+	#undef WRITE_HYBRID_OPS
 
 	fclose(fp);
 	return 0;
@@ -2834,21 +4718,42 @@ static int sck_write_overhead_csv(const char *path,
 	struct sck_overhead_benchmark *t3i, struct sck_overhead_benchmark *t3r,
 	struct sck_overhead_benchmark *t0pi, struct sck_overhead_benchmark *t0pr,
 	struct sck_overhead_benchmark *t3pi, struct sck_overhead_benchmark *t3pr,
-	struct sck_overhead_benchmark *thi, struct sck_overhead_benchmark *thr)
+	struct sck_overhead_benchmark *thi, struct sck_overhead_benchmark *thr,
+	struct sck_overhead_benchmark *et0i, struct sck_overhead_benchmark *et0r,
+	struct sck_overhead_benchmark *et3i, struct sck_overhead_benchmark *et3r,
+	struct sck_overhead_benchmark *et0pi, struct sck_overhead_benchmark *et0pr,
+	struct sck_overhead_benchmark *et3pi, struct sck_overhead_benchmark *et3pr,
+	struct sck_overhead_benchmark *ethi, struct sck_overhead_benchmark *ethr)
 {
 	FILE *fp = fopen(path, "w");
 	if (!fp) return -1;
 	fprintf(fp, "type,role,cpu_time_us,memory_bytes,memory_note\n");
-	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%ld,estimated_stack_heap\n", t0i->cpu_us, t0i->memory_bytes);
-	fprintf(fp, "Type0_SigSig,Responder,%.3f,%ld,estimated_stack_heap\n", t0r->cpu_us, t0r->memory_bytes);
-	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%ld,estimated_stack_heap\n", t3i->cpu_us, t3i->memory_bytes);
-	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%ld,estimated_stack_heap\n", t3r->cpu_us, t3r->memory_bytes);
-	fprintf(fp, "Type0_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n", t0pi->cpu_us, t0pi->memory_bytes);
-	fprintf(fp, "Type0_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n", t0pr->cpu_us, t0pr->memory_bytes);
-	fprintf(fp, "Type3_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n", t3pi->cpu_us, t3pi->memory_bytes);
-	fprintf(fp, "Type3_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n", t3pr->cpu_us, t3pr->memory_bytes);
-	fprintf(fp, "Type3_Hybrid,Initiator,%.3f,%ld,estimated_stack_heap_hybrid\n", thi->cpu_us, thi->memory_bytes);
-	fprintf(fp, "Type3_Hybrid,Responder,%.3f,%ld,estimated_stack_heap_hybrid\n", thr->cpu_us, thr->memory_bytes);
+
+	#define WOH(T, R, D, NOTE) fprintf(fp, "%s,%s,%.3f,%ld,%s\n", T, R, (D)->cpu_us, (D)->memory_bytes, NOTE)
+
+	WOH("Type0_SigSig","Initiator",t0i,"estimated_stack_heap");
+	WOH("Type0_SigSig","Responder",t0r,"estimated_stack_heap");
+	WOH("Type3_MACMAC","Initiator",t3i,"estimated_stack_heap");
+	WOH("Type3_MACMAC","Responder",t3r,"estimated_stack_heap");
+	WOH("Type0_PQ","Initiator",t0pi,"estimated_stack_heap_pq");
+	WOH("Type0_PQ","Responder",t0pr,"estimated_stack_heap_pq");
+	WOH("Type3_PQ","Initiator",t3pi,"estimated_stack_heap_pq");
+	WOH("Type3_PQ","Responder",t3pr,"estimated_stack_heap_pq");
+	WOH("Type3_Hybrid","Initiator",thi,"estimated_stack_heap_hybrid");
+	WOH("Type3_Hybrid","Responder",thr,"estimated_stack_heap_hybrid");
+
+	WOH("EAP_Type0_SigSig","Initiator",et0i,"estimated_stack_heap_eap");
+	WOH("EAP_Type0_SigSig","Responder",et0r,"estimated_stack_heap_eap");
+	WOH("EAP_Type3_MACMAC","Initiator",et3i,"estimated_stack_heap_eap");
+	WOH("EAP_Type3_MACMAC","Responder",et3r,"estimated_stack_heap_eap");
+	WOH("EAP_Type0_PQ","Initiator",et0pi,"estimated_stack_heap_pq_eap");
+	WOH("EAP_Type0_PQ","Responder",et0pr,"estimated_stack_heap_pq_eap");
+	WOH("EAP_Type3_PQ","Initiator",et3pi,"estimated_stack_heap_pq_eap");
+	WOH("EAP_Type3_PQ","Responder",et3pr,"estimated_stack_heap_pq_eap");
+	WOH("EAP_Type3_Hybrid","Initiator",ethi,"estimated_stack_heap_hybrid_eap");
+	WOH("EAP_Type3_Hybrid","Responder",ethr,"estimated_stack_heap_hybrid_eap");
+
+	#undef WOH
 	fclose(fp);
 	return 0;
 }
@@ -2858,18 +4763,31 @@ static int sck_write_handshake_csv(const char *path,
 	struct sck_handshake_benchmark *t3i, struct sck_handshake_benchmark *t3r,
 	struct sck_handshake_benchmark *t0pi, struct sck_handshake_benchmark *t0pr,
 	struct sck_handshake_benchmark *t3pi, struct sck_handshake_benchmark *t3pr,
-	struct sck_handshake_benchmark *thi, struct sck_handshake_benchmark *thr)
+	struct sck_handshake_benchmark *thi, struct sck_handshake_benchmark *thr,
+	struct sck_handshake_benchmark *et0i, struct sck_handshake_benchmark *et0r,
+	struct sck_handshake_benchmark *et3i, struct sck_handshake_benchmark *et3r,
+	struct sck_handshake_benchmark *et0pi, struct sck_handshake_benchmark *et0pr,
+	struct sck_handshake_benchmark *et3pi, struct sck_handshake_benchmark *et3pr,
+	struct sck_handshake_benchmark *ethi, struct sck_handshake_benchmark *ethr)
 {
 	FILE *fp = fopen(path, "w");
 	if (!fp) return -1;
 	fprintf(fp, "type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us\n");
 	#define WHS(T,R,D) fprintf(fp, "%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f\n", T, R, \
 		(D)->processing_us, (D)->txrx_us, (D)->precomputation_us, (D)->overhead_us, (D)->total_us)
+
 	WHS("Type0_SigSig","Initiator",t0i); WHS("Type0_SigSig","Responder",t0r);
 	WHS("Type3_MACMAC","Initiator",t3i); WHS("Type3_MACMAC","Responder",t3r);
 	WHS("Type0_PQ","Initiator",t0pi);     WHS("Type0_PQ","Responder",t0pr);
 	WHS("Type3_PQ","Initiator",t3pi);     WHS("Type3_PQ","Responder",t3pr);
 	WHS("Type3_Hybrid","Initiator",thi);  WHS("Type3_Hybrid","Responder",thr);
+
+	WHS("EAP_Type0_SigSig","Initiator",et0i); WHS("EAP_Type0_SigSig","Responder",et0r);
+	WHS("EAP_Type3_MACMAC","Initiator",et3i); WHS("EAP_Type3_MACMAC","Responder",et3r);
+	WHS("EAP_Type0_PQ","Initiator",et0pi);     WHS("EAP_Type0_PQ","Responder",et0pr);
+	WHS("EAP_Type3_PQ","Initiator",et3pi);     WHS("EAP_Type3_PQ","Responder",et3pr);
+	WHS("EAP_Type3_Hybrid","Initiator",ethi);  WHS("EAP_Type3_Hybrid","Responder",ethr);
+
 	#undef WHS
 	fclose(fp);
 	return 0;
@@ -2882,7 +4800,7 @@ static int sck_write_handshake_csv(const char *path,
 
 int run_edhoc_benchmark_socket(void)
 {
-	print_header("EDHOC Socket-based Benchmark (TCP localhost, All 5 Variants)");
+	print_header("EDHOC Socket-based Benchmark (TCP localhost, All 10 Variants)");
 	printf("\n");
 	char buf[256];
 	snprintf(buf, sizeof(buf), "  Operations iterations : %d", SOCK_BENCH_ITERATIONS);
@@ -2890,7 +4808,7 @@ int run_edhoc_benchmark_socket(void)
 	snprintf(buf, sizeof(buf), "  Handshake iterations  : %d", SOCK_BENCH_HANDSHAKE_ITERATIONS);
 	print_info(buf);
 	print_info("  Transport: TCP localhost (127.0.0.1)");
-	print_info("  Variants: Type0, Type3, Type0_PQ, Type3_PQ, Type3_Hybrid");
+	print_info("  Variants: 5 EDHOC + 5 EAP-EDHOC (10 total)");
 	printf("\n");
 
 	mkdir(SOCK_BENCH_OUTPUT_DIR, 0755);
@@ -2904,7 +4822,7 @@ int run_edhoc_benchmark_socket(void)
 	sck_bench_all_primitives(&pcache);
 	print_success("Primitive benchmarks done.");
 
-	/* Assemble per-variant ops from shared cache */
+	/* Assemble per-variant ops from shared cache — EDHOC */
 	struct sck_ops_benchmark t0_oi, t0_or, t3_oi, t3_or;
 	memset(&t0_oi, 0, sizeof(t0_oi)); memset(&t0_or, 0, sizeof(t0_or));
 	memset(&t3_oi, 0, sizeof(t3_oi)); memset(&t3_or, 0, sizeof(t3_or));
@@ -2925,10 +4843,20 @@ int run_edhoc_benchmark_socket(void)
 	memset(&th_oi, 0, sizeof(th_oi)); memset(&th_or, 0, sizeof(th_or));
 	sck_assemble_hybrid_ops(&pcache, true, &th_oi);
 	sck_assemble_hybrid_ops(&pcache, false, &th_or);
-	print_success("All variant ops assembled.");
 
-	/* === Phase 2: Socket-based Handshakes === */
-	print_header("Phase 2a: Classic Handshake (TCP Socket)");
+	/* Assemble EAP variant ops — crypto is identical, copy from EDHOC */
+	struct sck_ops_benchmark et0_oi, et0_or, et3_oi, et3_or;
+	struct sck_ops_benchmark et0p_oi, et0p_or, et3p_oi, et3p_or;
+	struct sck_ops_benchmark eth_oi, eth_or;
+	memcpy(&et0_oi, &t0_oi, sizeof(t0_oi)); memcpy(&et0_or, &t0_or, sizeof(t0_or));
+	memcpy(&et3_oi, &t3_oi, sizeof(t3_oi)); memcpy(&et3_or, &t3_or, sizeof(t3_or));
+	memcpy(&et0p_oi, &t0p_oi, sizeof(t0p_oi)); memcpy(&et0p_or, &t0p_or, sizeof(t0p_or));
+	memcpy(&et3p_oi, &t3p_oi, sizeof(t3p_oi)); memcpy(&et3p_or, &t3p_or, sizeof(t3p_or));
+	memcpy(&eth_oi, &th_oi, sizeof(th_oi)); memcpy(&eth_or, &th_or, sizeof(th_or));
+	print_success("All variant ops assembled (10 variants).");
+
+	/* === Phase 2a: EDHOC Classic Handshakes === */
+	print_header("Phase 2a: EDHOC Classic Handshake (TCP Socket)");
 	printf("\n");
 	struct sck_overhead_benchmark t0_ohi, t0_ohr, t3_ohi, t3_ohr;
 	struct sck_handshake_benchmark t0_hi, t0_hr, t3_hi, t3_hr;
@@ -2944,7 +4872,8 @@ int run_edhoc_benchmark_socket(void)
 		&t3_oi, &t3_or, &t3_ohi, &t3_ohr, &t3_hi, &t3_hr) != 0)
 		return -1;
 
-	print_header("Phase 2b: PQ Handshake");
+	/* === Phase 2b: EDHOC PQ Handshakes === */
+	print_header("Phase 2b: EDHOC PQ Handshake");
 	printf("\n");
 	struct sck_overhead_benchmark t0p_ohi, t0p_ohr, t3p_ohi, t3p_ohr;
 	struct sck_handshake_benchmark t0p_hi, t0p_hr, t3p_hi, t3p_hr;
@@ -2960,7 +4889,8 @@ int run_edhoc_benchmark_socket(void)
 		&t3p_oi, &t3p_or, &t3p_ohi, &t3p_ohr, &t3p_hi, &t3p_hr) != 0)
 		return -1;
 
-	print_header("Phase 2c: Hybrid Handshake");
+	/* === Phase 2c: EDHOC Hybrid Handshake === */
+	print_header("Phase 2c: EDHOC Hybrid Handshake");
 	printf("\n");
 	struct sck_overhead_benchmark th_ohi, th_ohr;
 	struct sck_handshake_benchmark th_hi, th_hr;
@@ -2971,50 +4901,115 @@ int run_edhoc_benchmark_socket(void)
 		&th_oi, &th_or, &th_ohi, &th_ohr, &th_hi, &th_hr) != 0)
 		return -1;
 
-	/* === Phase 3: Write CSV === */
-	print_header("Writing Socket Benchmark CSV Files");
+	/* === Phase 3a: EAP-EDHOC Classic Handshakes === */
+	print_header("Phase 3a: EAP-EDHOC Classic Handshake (TCP Socket)");
+	printf("\n");
+	struct sck_overhead_benchmark et0_ohi, et0_ohr, et3_ohi, et3_ohr;
+	struct sck_handshake_benchmark et0_hi, et0_hr, et3_hi, et3_hr;
+	memset(&et0_ohi, 0, sizeof(et0_ohi)); memset(&et0_ohr, 0, sizeof(et0_ohr));
+	memset(&et3_ohi, 0, sizeof(et3_ohi)); memset(&et3_ohr, 0, sizeof(et3_ohr));
+	memset(&et0_hi, 0, sizeof(et0_hi)); memset(&et0_hr, 0, sizeof(et0_hr));
+	memset(&et3_hi, 0, sizeof(et3_hi)); memset(&et3_hr, 0, sizeof(et3_hr));
+
+	if (sck_run_eap_classic_handshake(0, SOCK_BENCH_BASE_PORT + 500,
+		&et0_oi, &et0_or, &et0_ohi, &et0_ohr, &et0_hi, &et0_hr) != 0)
+		return -1;
+	if (sck_run_eap_classic_handshake(3, SOCK_BENCH_BASE_PORT + 600,
+		&et3_oi, &et3_or, &et3_ohi, &et3_ohr, &et3_hi, &et3_hr) != 0)
+		return -1;
+
+	/* === Phase 3b: EAP-EDHOC PQ Handshakes === */
+	print_header("Phase 3b: EAP-EDHOC PQ Handshake");
+	printf("\n");
+	struct sck_overhead_benchmark et0p_ohi, et0p_ohr, et3p_ohi, et3p_ohr;
+	struct sck_handshake_benchmark et0p_hi, et0p_hr, et3p_hi, et3p_hr;
+	memset(&et0p_ohi, 0, sizeof(et0p_ohi)); memset(&et0p_ohr, 0, sizeof(et0p_ohr));
+	memset(&et3p_ohi, 0, sizeof(et3p_ohi)); memset(&et3p_ohr, 0, sizeof(et3p_ohr));
+	memset(&et0p_hi, 0, sizeof(et0p_hi)); memset(&et0p_hr, 0, sizeof(et0p_hr));
+	memset(&et3p_hi, 0, sizeof(et3p_hi)); memset(&et3p_hr, 0, sizeof(et3p_hr));
+
+	if (sck_run_eap_pq_handshake(0, SOCK_BENCH_BASE_PORT + 700,
+		&et0p_oi, &et0p_or, &et0p_ohi, &et0p_ohr, &et0p_hi, &et0p_hr) != 0)
+		return -1;
+	if (sck_run_eap_pq_handshake(3, SOCK_BENCH_BASE_PORT + 800,
+		&et3p_oi, &et3p_or, &et3p_ohi, &et3p_ohr, &et3p_hi, &et3p_hr) != 0)
+		return -1;
+
+	/* === Phase 3c: EAP-EDHOC Hybrid Handshake === */
+	print_header("Phase 3c: EAP-EDHOC Hybrid Handshake");
+	printf("\n");
+	struct sck_overhead_benchmark eth_ohi, eth_ohr;
+	struct sck_handshake_benchmark eth_hi, eth_hr;
+	memset(&eth_ohi, 0, sizeof(eth_ohi)); memset(&eth_ohr, 0, sizeof(eth_ohr));
+	memset(&eth_hi, 0, sizeof(eth_hi)); memset(&eth_hr, 0, sizeof(eth_hr));
+
+	if (sck_run_eap_hybrid_handshake(SOCK_BENCH_BASE_PORT + 900,
+		&eth_oi, &eth_or, &eth_ohi, &eth_ohr, &eth_hi, &eth_hr) != 0)
+		return -1;
+
+	/* === Phase 4: Write CSV === */
+	print_header("Writing Socket Benchmark CSV Files (10 variants)");
 	printf("\n");
 
 	int ret;
 	ret = sck_write_operations_csv(SOCK_CSV_OPERATIONS,
 		&t0_oi, &t0_or, &t3_oi, &t3_or,
 		&t0p_oi, &t0p_or, &t3p_oi, &t3p_or,
-		&th_oi, &th_or);
+		&th_oi, &th_or,
+		&et0_oi, &et0_or, &et3_oi, &et3_or,
+		&et0p_oi, &et0p_or, &et3p_oi, &et3p_or,
+		&eth_oi, &eth_or);
 	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", SOCK_CSV_OPERATIONS); print_success(buf); }
 
 	ret = sck_write_overhead_csv(SOCK_CSV_OVERHEAD,
 		&t0_ohi, &t0_ohr, &t3_ohi, &t3_ohr,
 		&t0p_ohi, &t0p_ohr, &t3p_ohi, &t3p_ohr,
-		&th_ohi, &th_ohr);
+		&th_ohi, &th_ohr,
+		&et0_ohi, &et0_ohr, &et3_ohi, &et3_ohr,
+		&et0p_ohi, &et0p_ohr, &et3p_ohi, &et3p_ohr,
+		&eth_ohi, &eth_ohr);
 	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", SOCK_CSV_OVERHEAD); print_success(buf); }
 
 	ret = sck_write_handshake_csv(SOCK_CSV_HANDSHAKE,
 		&t0_hi, &t0_hr, &t3_hi, &t3_hr,
 		&t0p_hi, &t0p_hr, &t3p_hi, &t3p_hr,
-		&th_hi, &th_hr);
+		&th_hi, &th_hr,
+		&et0_hi, &et0_hr, &et3_hi, &et3_hr,
+		&et0p_hi, &et0p_hr, &et3p_hi, &et3p_hr,
+		&eth_hi, &eth_hr);
 	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", SOCK_CSV_HANDSHAKE); print_success(buf); }
 
 	/* === Summary === */
 	printf("\n");
-	print_header("Socket Benchmark — Handshake Summary (µs, avg)");
+	print_header("Socket Benchmark — Handshake Summary (µs, avg) — 10 Variants");
 	printf("\n");
-	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n", "Type", "Role", "Processing", "TxRx", "Precompute", "Overhead", "Total");
-	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n", "────────────────", "────────────", "──────────────", "──────────────", "──────────────", "──────────────", "──────────────");
+	printf("  %-20s %-12s %14s %14s %14s %14s %14s\n", "Type", "Role", "Processing", "TxRx", "Precompute", "Overhead", "Total");
+	printf("  %-20s %-12s %14s %14s %14s %14s %14s\n", "────────────────────", "────────────", "──────────────", "──────────────", "──────────────", "──────────────", "──────────────");
 
-	#define PROW(T,R,D) printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n", T, R, \
+	#define PROW(T,R,D) printf("  %-20s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n", T, R, \
 		(D).processing_us, (D).txrx_us, (D).precomputation_us, (D).overhead_us, (D).total_us)
 
+	/* EDHOC */
 	PROW("Type0_SigSig","Initiator",t0_hi); PROW("Type0_SigSig","Responder",t0_hr);
 	PROW("Type3_MACMAC","Initiator",t3_hi); PROW("Type3_MACMAC","Responder",t3_hr);
 	PROW("Type0_PQ","Initiator",t0p_hi); PROW("Type0_PQ","Responder",t0p_hr);
 	PROW("Type3_PQ","Initiator",t3p_hi); PROW("Type3_PQ","Responder",t3p_hr);
 	PROW("Type3_Hybrid","Initiator",th_hi); PROW("Type3_Hybrid","Responder",th_hr);
 
+	printf("  %-20s %-12s %14s %14s %14s %14s %14s\n", "--------------------", "------------", "--------------", "--------------", "--------------", "--------------", "--------------");
+
+	/* EAP-EDHOC */
+	PROW("EAP_Type0_SigSig","Initiator",et0_hi); PROW("EAP_Type0_SigSig","Responder",et0_hr);
+	PROW("EAP_Type3_MACMAC","Initiator",et3_hi); PROW("EAP_Type3_MACMAC","Responder",et3_hr);
+	PROW("EAP_Type0_PQ","Initiator",et0p_hi); PROW("EAP_Type0_PQ","Responder",et0p_hr);
+	PROW("EAP_Type3_PQ","Initiator",et3p_hi); PROW("EAP_Type3_PQ","Responder",et3p_hr);
+	PROW("EAP_Type3_Hybrid","Initiator",eth_hi); PROW("EAP_Type3_Hybrid","Responder",eth_hr);
+
 	#undef PROW
 	printf("\n");
-	print_success("Socket-based benchmark completed!");
+	print_success("Socket-based benchmark completed (10 variants)!");
 	print_info("● CSV files saved in output/ directory.");
-	print_info("● Verify with: python3 verify_benchmark.py  (after pointing to output/)");
+	print_info("● Verify with: python3 verify_benchmark.py");
 	printf("\n");
 	return 0;
 }
