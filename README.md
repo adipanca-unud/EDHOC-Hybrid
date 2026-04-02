@@ -54,6 +54,7 @@ Interactive menu:
 ./build/edhoc_hybrid
 ```
 
+
 Direct (skip menu):
 ```bash
 ./build/edhoc_hybrid 1   # Type 0 Classic (Sig-Sig)
