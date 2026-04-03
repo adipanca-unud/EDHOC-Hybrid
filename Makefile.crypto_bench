@@ -28,6 +28,11 @@ PQCLEAN_KEM_DIR    = $(PQCLEAN_DIR)/crypto_kem/ml-kem-768/clean
 PQCLEAN_SIG_DIR    = $(PQCLEAN_DIR)/crypto_sign/ml-dsa-65/clean
 PQCLEAN_COMMON_DIR = $(PQCLEAN_DIR)/common
 
+# mbedtls paths
+MBEDTLS_DIR        = $(PROJ_DIR)/lib/uoscore-uedhoc/externals/mbedtls
+MBEDTLS_LIB_DIR    = $(MBEDTLS_DIR)/library
+MBEDTLS_INC_DIR    = $(MBEDTLS_DIR)/include
+
 # Target binary
 TARGET = $(BUILD_DIR)/benchmark_crypto
 
@@ -39,25 +44,32 @@ PQCLEAN_KEM_SRCS    = $(wildcard $(PQCLEAN_KEM_DIR)/*.c)
 PQCLEAN_SIG_SRCS    = $(wildcard $(PQCLEAN_SIG_DIR)/*.c)
 PQCLEAN_COMMON_SRCS = $(wildcard $(PQCLEAN_COMMON_DIR)/*.c)
 
+# mbedtls sources (all library .c files)
+MBEDTLS_SRCS = $(wildcard $(MBEDTLS_LIB_DIR)/*.c)
+
 # Object files
 BENCH_OBJ = $(BUILD_DIR)/benchmark_crypto.o
 
 PQCLEAN_KEM_OBJS    = $(patsubst $(PQCLEAN_KEM_DIR)/%.c,$(BUILD_DIR)/bench_pqkem_%.o,$(PQCLEAN_KEM_SRCS))
 PQCLEAN_SIG_OBJS    = $(patsubst $(PQCLEAN_SIG_DIR)/%.c,$(BUILD_DIR)/bench_pqsig_%.o,$(PQCLEAN_SIG_SRCS))
 PQCLEAN_COMMON_OBJS = $(patsubst $(PQCLEAN_COMMON_DIR)/%.c,$(BUILD_DIR)/bench_pqcommon_%.o,$(PQCLEAN_COMMON_SRCS))
+MBEDTLS_OBJS        = $(patsubst $(MBEDTLS_LIB_DIR)/%.c,$(BUILD_DIR)/bench_mbedtls_%.o,$(MBEDTLS_SRCS))
 
-OBJS = $(BENCH_OBJ) $(PQCLEAN_KEM_OBJS) $(PQCLEAN_SIG_OBJS) $(PQCLEAN_COMMON_OBJS)
+OBJS = $(BENCH_OBJ) $(PQCLEAN_KEM_OBJS) $(PQCLEAN_SIG_OBJS) $(PQCLEAN_COMMON_OBJS) $(MBEDTLS_OBJS)
 
 # Compiler flags
 CFLAGS  = -std=c11 -O2 -Wall -Wextra
 CFLAGS += -Wno-unused-parameter -Wno-sign-conversion -Wno-conversion
 CFLAGS += -Wno-cast-qual -Wno-missing-field-initializers
+CFLAGS += -DMBEDTLS
 
 # Include paths
 C_INCLUDES  = -I$(PQCLEAN_DIR)
 C_INCLUDES += -I$(PQCLEAN_COMMON_DIR)
 C_INCLUDES += -I$(PQCLEAN_KEM_DIR)
 C_INCLUDES += -I$(PQCLEAN_SIG_DIR)
+C_INCLUDES += -I$(MBEDTLS_INC_DIR)
+C_INCLUDES += -I$(MBEDTLS_LIB_DIR)
 
 # Linker flags
 LDFLAGS = -lsodium -lm
@@ -92,6 +104,10 @@ $(BUILD_DIR)/bench_pqcommon_%.o: $(PQCLEAN_COMMON_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
 
+$(BUILD_DIR)/bench_mbedtls_%.o: $(MBEDTLS_LIB_DIR)/%.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(C_INCLUDES) -DMBEDTLS -c $< -o $@
+
 run: all
 	@mkdir -p $(OUTPUT_DIR)
 	@$(TARGET)
@@ -101,6 +117,7 @@ clean:
 	rm -f $(BUILD_DIR)/bench_pqkem_*.o
 	rm -f $(BUILD_DIR)/bench_pqsig_*.o
 	rm -f $(BUILD_DIR)/bench_pqcommon_*.o
+	rm -f $(BUILD_DIR)/bench_mbedtls_*.o
 	rm -f $(TARGET)
 
 help:

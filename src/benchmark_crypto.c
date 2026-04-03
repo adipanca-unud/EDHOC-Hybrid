@@ -10,6 +10,10 @@
  *     - X25519          : DH key exchange (Curve25519)
  *     - Ed25519         : EdDSA signature scheme
  *
+ *   Classical (mbedtls):
+ *     - P-256           : ECDH key exchange (NIST P-256 / secp256r1)
+ *     - ECDSA-P-256     : ECDSA signature scheme (NIST P-256)
+ *
  *   Post-Quantum (PQClean):
  *     - ML-KEM-768      : Key Encapsulation Mechanism (NIST Level 3)
  *     - ML-DSA-65       : Digital Signature (NIST Level 3)
@@ -17,12 +21,12 @@
  *   Hybrid (libsodium + PQClean):
  *     - X25519+ML-KEM-768 : Combined classical + PQ key exchange
  *
- * Columns: X25519 | Ed25519 | ML-KEM-768 | ML-DSA-65 | X25519+ML-KEM-768
+ * Columns: X25519 | Ed25519 | P-256 | ECDSA-P-256 | ML-KEM-768 | ML-DSA-65 | X25519+ML-KEM-768
  *
  * Rows (operations):
- *   Keygen, Encap/DH, Decap/DH, Signature, Verification,
+ *   Keygen, Shared Secret (DH), Encap, Decap, Signature, Verification,
  *   HKDF-Extract, HKDF-Expand, Hash (SHA-256), AEAD Encrypt, AEAD Decrypt,
- *   Key Exchange (full), Shared Secret Derivation
+ *   AEAD Encrypt (AES-GCM), AEAD Decrypt (AES-GCM), Key Exchange (full)
  *
  * Output: CSV file at output/benchmark_crypto_ops.csv
  *
@@ -41,6 +45,15 @@
 
 /* ── libsodium ─────────────────────────────────────────────────────────────── */
 #include <sodium.h>
+
+/* ── mbedtls (P-256 ECDH, ECDSA, AES-GCM) ─────────────────────────────────── */
+#include "mbedtls/ecdh.h"
+#include "mbedtls/ecdsa.h"
+#include "mbedtls/ecp.h"
+#include "mbedtls/gcm.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/error.h"
 
 /* ── PQClean ML-KEM-768 ───────────────────────────────────────────────────── */
 #include "crypto_kem/ml-kem-768/clean/api.h"
@@ -68,6 +81,8 @@
 enum algo_col {
     COL_X25519 = 0,
     COL_ED25519,
+    COL_P256,         /* P-256 ECDH (mbedtls) */
+    COL_ECDSAP256,    /* ECDSA-P-256 (mbedtls) */
     COL_MLKEM768,
     COL_MLDSA65,
     COL_HYBRID,       /* X25519 + ML-KEM-768 */
@@ -77,6 +92,8 @@ enum algo_col {
 static const char *col_names[NUM_COLS] = {
     "X25519",
     "Ed25519",
+    "P-256",
+    "ECDSA-P-256",
     "ML-KEM-768",
     "ML-DSA-65",
     "X25519+ML-KEM-768"
@@ -87,8 +104,9 @@ static const char *col_names[NUM_COLS] = {
  * ========================================================================== */
 enum op_row {
     ROW_KEYGEN = 0,
-    ROW_ENCAP,          /* Encap / DH compute */
-    ROW_DECAP,          /* Decap / DH compute (other side) */
+    ROW_SHARED_SECRET,  /* DH shared secret compute (classical only) */
+    ROW_ENCAP,          /* KEM Encapsulate (PQ / Hybrid only) */
+    ROW_DECAP,          /* KEM Decapsulate (PQ / Hybrid only) */
     ROW_SIGNATURE,
     ROW_VERIFICATION,
     ROW_HKDF_EXTRACT,
@@ -96,13 +114,15 @@ enum op_row {
     ROW_HASH,
     ROW_AEAD_ENCRYPT,
     ROW_AEAD_DECRYPT,
+    ROW_AEAD_ENCRYPT_GCM, /* AES-GCM Encrypt (mbedtls) */
+    ROW_AEAD_DECRYPT_GCM, /* AES-GCM Decrypt (mbedtls) */
     ROW_KEY_EXCHANGE,   /* Full key exchange (both sides) */
-    ROW_SECRET_DERIVE,  /* Shared secret derivation (HKDF Extract+Expand) */
     NUM_ROWS
 };
 
 static const char *row_names[NUM_ROWS] = {
     "Keygen",
+    "Shared Secret",
     "Encap",
     "Decap",
     "Signature",
@@ -112,8 +132,9 @@ static const char *row_names[NUM_ROWS] = {
     "Hash (SHA-256)",
     "AEAD Encrypt",
     "AEAD Decrypt",
-    "Key Exchange (full)",
-    "Shared Secret Derivation"
+    "AEAD Encrypt (AES-GCM)",
+    "AEAD Decrypt (AES-GCM)",
+    "Key Exchange (full)"
 };
 
 /* ==========================================================================
@@ -135,7 +156,6 @@ static double median_us[NUM_ROWS][NUM_COLS];
  *   For verification: public key length.
  *   For symmetric ops: key/hash length.
  *   For key exchange: combined public key length (both sides).
- *   For secret derivation: output keying material length.
  * ========================================================================== */
 static int key_length_bytes[NUM_ROWS][NUM_COLS];
 
@@ -149,30 +169,36 @@ static void init_key_lengths(void)
     /* ── Public key sizes (Keygen) ─────────────────────────────────────── */
     key_length_bytes[ROW_KEYGEN][COL_X25519]  = crypto_scalarmult_curve25519_BYTES;           /* 32 */
     key_length_bytes[ROW_KEYGEN][COL_ED25519] = crypto_sign_ed25519_PUBLICKEYBYTES;           /* 32 */
+    key_length_bytes[ROW_KEYGEN][COL_P256]    = 32;  /* P-256 ECDH public key (compressed: 33, but shared secret = 32) */
+    key_length_bytes[ROW_KEYGEN][COL_ECDSAP256] = 64; /* P-256 ECDSA public key (uncompressed X+Y) */
     key_length_bytes[ROW_KEYGEN][COL_MLKEM768]= PQCLEAN_MLKEM768_CLEAN_CRYPTO_PUBLICKEYBYTES; /* 1184 */
     key_length_bytes[ROW_KEYGEN][COL_MLDSA65] = PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES;  /* 1952 */
     key_length_bytes[ROW_KEYGEN][COL_HYBRID]  = crypto_scalarmult_curve25519_BYTES
                                               + PQCLEAN_MLKEM768_CLEAN_CRYPTO_PUBLICKEYBYTES;  /* 32+1184=1216 */
 
-    /* ── Encap / Shared secret compute: ciphertext or shared secret length ─ */
-    key_length_bytes[ROW_ENCAP][COL_X25519]  = crypto_scalarmult_curve25519_BYTES;             /* 32 (shared secret) */
+    /* ── Shared Secret compute: classical DH only (X25519, P-256) ───────── */
+    key_length_bytes[ROW_SHARED_SECRET][COL_X25519] = crypto_scalarmult_curve25519_BYTES;      /* 32 */
+    key_length_bytes[ROW_SHARED_SECRET][COL_P256]   = 32; /* P-256 ECDH shared secret */
+
+    /* ── Encap: PQ / Hybrid KEM ciphertext length ────────────────────── */
     key_length_bytes[ROW_ENCAP][COL_MLKEM768]= PQCLEAN_MLKEM768_CLEAN_CRYPTO_CIPHERTEXTBYTES;  /* 1088 */
     key_length_bytes[ROW_ENCAP][COL_HYBRID]  = crypto_scalarmult_curve25519_BYTES
                                              + PQCLEAN_MLKEM768_CLEAN_CRYPTO_CIPHERTEXTBYTES;   /* 32+1088=1120 */
 
-    /* ── Decap: same as encap (ciphertext input) ─────────────────────── */
-    key_length_bytes[ROW_DECAP][COL_X25519]  = crypto_scalarmult_curve25519_BYTES;
+    /* ── Decap: only for PQ / Hybrid (not for classical DH) ─────────── */
     key_length_bytes[ROW_DECAP][COL_MLKEM768]= PQCLEAN_MLKEM768_CLEAN_CRYPTO_CIPHERTEXTBYTES;
     key_length_bytes[ROW_DECAP][COL_HYBRID]  = crypto_scalarmult_curve25519_BYTES
                                              + PQCLEAN_MLKEM768_CLEAN_CRYPTO_CIPHERTEXTBYTES;
 
     /* ── Signature: signature length ─────────────────────────────────── */
-    key_length_bytes[ROW_SIGNATURE][COL_ED25519] = crypto_sign_ed25519_BYTES;                  /* 64 */
-    key_length_bytes[ROW_SIGNATURE][COL_MLDSA65] = PQCLEAN_MLDSA65_CLEAN_CRYPTO_BYTES;        /* 3309 */
+    key_length_bytes[ROW_SIGNATURE][COL_ED25519]   = crypto_sign_ed25519_BYTES;                  /* 64 */
+    key_length_bytes[ROW_SIGNATURE][COL_ECDSAP256] = 64; /* ECDSA-P-256 signature (r+s, ~64 bytes DER encoded ~72) */
+    key_length_bytes[ROW_SIGNATURE][COL_MLDSA65]   = PQCLEAN_MLDSA65_CLEAN_CRYPTO_BYTES;        /* 3309 */
 
     /* ── Verification: public key length ─────────────────────────────── */
-    key_length_bytes[ROW_VERIFICATION][COL_ED25519] = crypto_sign_ed25519_PUBLICKEYBYTES;      /* 32 */
-    key_length_bytes[ROW_VERIFICATION][COL_MLDSA65] = PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES; /* 1952 */
+    key_length_bytes[ROW_VERIFICATION][COL_ED25519]   = crypto_sign_ed25519_PUBLICKEYBYTES;      /* 32 */
+    key_length_bytes[ROW_VERIFICATION][COL_ECDSAP256] = 32; /* ECDSA-P-256 verification: public key */
+    key_length_bytes[ROW_VERIFICATION][COL_MLDSA65]   = PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES; /* 1952 */
 
     /* ── Symmetric operations: same key/output length across all columns ─ */
     for (int c = 0; c < NUM_COLS; c++) {
@@ -181,6 +207,8 @@ static void init_key_lengths(void)
         key_length_bytes[ROW_HASH][c]           = crypto_hash_sha256_BYTES; /* 32 */
         key_length_bytes[ROW_AEAD_ENCRYPT][c]   = crypto_aead_xchacha20poly1305_ietf_KEYBYTES; /* 32 */
         key_length_bytes[ROW_AEAD_DECRYPT][c]   = crypto_aead_xchacha20poly1305_ietf_KEYBYTES; /* 32 */
+        key_length_bytes[ROW_AEAD_ENCRYPT_GCM][c] = 32; /* AES-256-GCM key = 32 bytes */
+        key_length_bytes[ROW_AEAD_DECRYPT_GCM][c] = 32; /* AES-256-GCM key = 32 bytes */
     }
 
     /* ── Key Exchange (full): combined public key length (both DH/KEM) ─ */
@@ -188,11 +216,6 @@ static void init_key_lengths(void)
     key_length_bytes[ROW_KEY_EXCHANGE][COL_MLKEM768]= PQCLEAN_MLKEM768_CLEAN_CRYPTO_PUBLICKEYBYTES; /* 1184 */
     key_length_bytes[ROW_KEY_EXCHANGE][COL_HYBRID]  = crypto_scalarmult_curve25519_BYTES
                                                     + PQCLEAN_MLKEM768_CLEAN_CRYPTO_PUBLICKEYBYTES;
-
-    /* ── Shared Secret Derivation: output length ─────────────────────── */
-    key_length_bytes[ROW_SECRET_DERIVE][COL_X25519]  = HKDF_OKM_LEN; /* 32 */
-    key_length_bytes[ROW_SECRET_DERIVE][COL_MLKEM768]= HKDF_OKM_LEN;
-    key_length_bytes[ROW_SECRET_DERIVE][COL_HYBRID]  = HKDF_OKM_LEN;
 }
 
 /* ==========================================================================
@@ -499,6 +522,129 @@ typedef struct {
     uint8_t pt_aead[MSG_LEN];
     unsigned long long pt_aead_len;
 } hybrid_ctx_t;
+
+/* ==========================================================================
+ * Global mbedtls RNG context (shared by P-256 and ECDSA-P-256)
+ * ========================================================================== */
+static mbedtls_entropy_context  mbedtls_entropy;
+static mbedtls_ctr_drbg_context mbedtls_ctr_drbg;
+
+static int mbedtls_rng_wrapper(void *ctx, unsigned char *buf, size_t len)
+{
+    return mbedtls_ctr_drbg_random(ctx, buf, len);
+}
+
+/* ==========================================================================
+ * P-256 ECDH context (mbedtls)
+ * ========================================================================== */
+typedef struct {
+    mbedtls_ecp_group grp;
+    mbedtls_mpi d_a;         /* private key A */
+    mbedtls_ecp_point Q_a;   /* public key A  */
+    mbedtls_mpi d_b;         /* private key B */
+    mbedtls_ecp_point Q_b;   /* public key B  */
+    mbedtls_mpi shared;      /* shared secret (x-coordinate) */
+} p256_ctx_t;
+
+static p256_ctx_t p256_ctx;
+
+/* ── P-256 benchmark functions ───────────────────────────────────────────── */
+static void p256_bench_keygen(void *ctx)
+{
+    (void)ctx;
+    p256_ctx_t *c = &p256_ctx;
+    mbedtls_mpi_free(&c->d_a);
+    mbedtls_ecp_point_free(&c->Q_a);
+    mbedtls_mpi_init(&c->d_a);
+    mbedtls_ecp_point_init(&c->Q_a);
+    mbedtls_ecdh_gen_public(&c->grp, &c->d_a, &c->Q_a,
+                            mbedtls_rng_wrapper, &mbedtls_ctr_drbg);
+}
+
+static void p256_bench_shared_secret(void *ctx)
+{
+    /* Compute shared secret: d_a * Q_b */
+    (void)ctx;
+    p256_ctx_t *c = &p256_ctx;
+    mbedtls_mpi_free(&c->shared);
+    mbedtls_mpi_init(&c->shared);
+    mbedtls_ecdh_compute_shared(&c->grp, &c->shared, &c->Q_b, &c->d_a,
+                                 mbedtls_rng_wrapper, &mbedtls_ctr_drbg);
+}
+
+/* ==========================================================================
+ * ECDSA-P-256 context (mbedtls)
+ * ========================================================================== */
+typedef struct {
+    mbedtls_ecdsa_context key;
+    uint8_t msg[MSG_LEN];
+    uint8_t hash[32];        /* SHA-256 of msg */
+    uint8_t sig[MBEDTLS_ECDSA_MAX_LEN];
+    size_t  sig_len;
+} ecdsap256_ctx_t;
+
+static ecdsap256_ctx_t ecdsa_ctx;
+
+/* ── ECDSA-P-256 benchmark functions ─────────────────────────────────────── */
+static void ecdsap256_bench_sign(void *ctx)
+{
+    (void)ctx;
+    ecdsap256_ctx_t *c = &ecdsa_ctx;
+    c->sig_len = sizeof(c->sig);
+    mbedtls_ecdsa_write_signature(&c->key, MBEDTLS_MD_SHA256,
+                                   c->hash, 32,
+                                   c->sig, sizeof(c->sig), &c->sig_len,
+                                   mbedtls_rng_wrapper, &mbedtls_ctr_drbg);
+}
+
+static void ecdsap256_bench_verify(void *ctx)
+{
+    (void)ctx;
+    ecdsap256_ctx_t *c = &ecdsa_ctx;
+    mbedtls_ecdsa_read_signature(&c->key,
+                                  c->hash, 32,
+                                  c->sig, c->sig_len);
+}
+
+/* ==========================================================================
+ * AES-256-GCM context (mbedtls) — benchmarked once via X25519 column
+ * ========================================================================== */
+typedef struct {
+    mbedtls_gcm_context gcm;
+    uint8_t key[32];       /* AES-256 key */
+    uint8_t iv[12];        /* GCM standard IV */
+    uint8_t msg[MSG_LEN];
+    uint8_t aad[AAD_LEN];
+    uint8_t ct[MSG_LEN];
+    uint8_t tag[16];
+    uint8_t pt[MSG_LEN];
+} aesgcm_ctx_t;
+
+static aesgcm_ctx_t gcm_ctx;
+
+static void aesgcm_bench_encrypt(void *ctx)
+{
+    (void)ctx;
+    aesgcm_ctx_t *c = &gcm_ctx;
+    mbedtls_gcm_crypt_and_tag(&c->gcm, MBEDTLS_GCM_ENCRYPT,
+                               MSG_LEN,
+                               c->iv, 12,
+                               c->aad, AAD_LEN,
+                               c->msg, c->ct,
+                               16, c->tag);
+}
+
+static void aesgcm_bench_decrypt(void *ctx)
+{
+    (void)ctx;
+    aesgcm_ctx_t *c = &gcm_ctx;
+    mbedtls_gcm_auth_decrypt(&c->gcm,
+                              MSG_LEN,
+                              c->iv, 12,
+                              c->aad, AAD_LEN,
+                              c->tag, 16,
+                              c->ct, c->pt);
+}
 
 /* ==========================================================================
  * X25519 benchmark functions
@@ -1057,6 +1203,63 @@ static void init_contexts(void)
         hy_ctx.msg, MSG_LEN,
         hy_ctx.aad, AAD_LEN,
         NULL, hy_ctx.aead_nonce, hy_ctx.aead_key);
+
+    /* ── mbedtls RNG initialization ── */
+    mbedtls_entropy_init(&mbedtls_entropy);
+    mbedtls_ctr_drbg_init(&mbedtls_ctr_drbg);
+    const char *pers = "edhoc_bench_p256";
+    mbedtls_ctr_drbg_seed(&mbedtls_ctr_drbg, mbedtls_entropy_func,
+                           &mbedtls_entropy,
+                           (const unsigned char *)pers, strlen(pers));
+
+    /* ── P-256 ECDH (mbedtls) ── */
+    mbedtls_ecp_group_init(&p256_ctx.grp);
+    mbedtls_ecp_group_load(&p256_ctx.grp, MBEDTLS_ECP_DP_SECP256R1);
+    mbedtls_mpi_init(&p256_ctx.d_a);
+    mbedtls_ecp_point_init(&p256_ctx.Q_a);
+    mbedtls_mpi_init(&p256_ctx.d_b);
+    mbedtls_ecp_point_init(&p256_ctx.Q_b);
+    mbedtls_mpi_init(&p256_ctx.shared);
+    /* Generate key pair A */
+    mbedtls_ecdh_gen_public(&p256_ctx.grp, &p256_ctx.d_a, &p256_ctx.Q_a,
+                            mbedtls_rng_wrapper, &mbedtls_ctr_drbg);
+    /* Generate key pair B */
+    mbedtls_ecdh_gen_public(&p256_ctx.grp, &p256_ctx.d_b, &p256_ctx.Q_b,
+                            mbedtls_rng_wrapper, &mbedtls_ctr_drbg);
+    /* Pre-compute shared secret */
+    mbedtls_ecdh_compute_shared(&p256_ctx.grp, &p256_ctx.shared, &p256_ctx.Q_b,
+                                 &p256_ctx.d_a,
+                                 mbedtls_rng_wrapper, &mbedtls_ctr_drbg);
+
+    /* ── ECDSA-P-256 (mbedtls) ── */
+    mbedtls_ecdsa_init(&ecdsa_ctx.key);
+    mbedtls_ecdsa_genkey(&ecdsa_ctx.key, MBEDTLS_ECP_DP_SECP256R1,
+                          mbedtls_rng_wrapper, &mbedtls_ctr_drbg);
+    randombytes_buf(ecdsa_ctx.msg, MSG_LEN);
+    /* Hash the message with SHA-256 for signing */
+    crypto_hash_sha256(ecdsa_ctx.hash, ecdsa_ctx.msg, MSG_LEN);
+    /* Pre-sign for verification benchmark */
+    ecdsa_ctx.sig_len = sizeof(ecdsa_ctx.sig);
+    mbedtls_ecdsa_write_signature(&ecdsa_ctx.key, MBEDTLS_MD_SHA256,
+                                   ecdsa_ctx.hash, 32,
+                                   ecdsa_ctx.sig, sizeof(ecdsa_ctx.sig),
+                                   &ecdsa_ctx.sig_len,
+                                   mbedtls_rng_wrapper, &mbedtls_ctr_drbg);
+
+    /* ── AES-256-GCM (mbedtls) ── */
+    mbedtls_gcm_init(&gcm_ctx.gcm);
+    randombytes_buf(gcm_ctx.key, 32);
+    randombytes_buf(gcm_ctx.iv, 12);
+    randombytes_buf(gcm_ctx.msg, MSG_LEN);
+    randombytes_buf(gcm_ctx.aad, AAD_LEN);
+    mbedtls_gcm_setkey(&gcm_ctx.gcm, MBEDTLS_CIPHER_ID_AES, gcm_ctx.key, 256);
+    /* Pre-encrypt for decrypt benchmark */
+    mbedtls_gcm_crypt_and_tag(&gcm_ctx.gcm, MBEDTLS_GCM_ENCRYPT,
+                               MSG_LEN,
+                               gcm_ctx.iv, 12,
+                               gcm_ctx.aad, AAD_LEN,
+                               gcm_ctx.msg, gcm_ctx.ct,
+                               16, gcm_ctx.tag);
 }
 
 /* ==========================================================================
@@ -1150,7 +1353,7 @@ static void write_csv(void)
 
     for (int r = 0; r < NUM_ROWS; r++) {
         for (int c = 0; c < NUM_COLS; c++) {
-            if (r == ROW_KEYGEN && (c == COL_ED25519 || c == COL_MLDSA65)) {
+            if (r == ROW_KEYGEN && (c == COL_ED25519 || c == COL_ECDSAP256 || c == COL_MLDSA65)) {
                 continue;
             }
             int kl = key_length_bytes[r][c];
@@ -1257,11 +1460,19 @@ static void write_simple_csv(void)
 
     /* ── X25519 ─────────────────────────────────────────────────────── */
     ROW("X25519",            "Keygen",        ROW_KEYGEN,  COL_X25519);
-    ROW("",                  "Shared Secret", ROW_ENCAP,   COL_X25519);
+    ROW("",                  "Shared Secret", ROW_SHARED_SECRET, COL_X25519);
 
     /* ── Ed25519 ────────────────────────────────────────────────────── */
     ROW("Ed25519",           "Signature",     ROW_SIGNATURE,    COL_ED25519);
     ROW("",                  "Verification",  ROW_VERIFICATION, COL_ED25519);
+
+    /* ── P-256 (mbedtls ECDH) ───────────────────────────────────────── */
+    ROW("P-256",             "Keygen",        ROW_KEYGEN,  COL_P256);
+    ROW("",                  "Shared Secret", ROW_SHARED_SECRET, COL_P256);
+
+    /* ── ECDSA-P-256 (mbedtls) ──────────────────────────────────────── */
+    ROW("ECDSA-P-256",      "Signature",     ROW_SIGNATURE,    COL_ECDSAP256);
+    ROW("",                  "Verification",  ROW_VERIFICATION, COL_ECDSAP256);
 
     /* ── ML-KEM-768 ─────────────────────────────────────────────────── */
     ROW("ML-KEM-768",        "Keygen",        ROW_KEYGEN,  COL_MLKEM768);
@@ -1280,8 +1491,10 @@ static void write_simple_csv(void)
     /* ── Symmetric (shared, benchmarked once via X25519 context) ───── */
     ROW("Hash (SHA-256)",    "Cryptography",  ROW_HASH,         COL_X25519);
     ROW("HKDF",              "Cryptography",  ROW_HKDF_EXTRACT, COL_X25519);
-    ROW("AEAD Encrypt",      "Cryptography",  ROW_AEAD_ENCRYPT, COL_X25519);
-    ROW("AEAD Decrypt",      "Cryptography",  ROW_AEAD_DECRYPT, COL_X25519);
+    ROW("AEAD Encrypt",      "xchacha20poly1305",  ROW_AEAD_ENCRYPT, COL_X25519);
+    ROW("AEAD Decrypt",      "xchacha20poly1305",  ROW_AEAD_DECRYPT, COL_X25519);
+    ROW("AEAD Encrypt",      "AES-GCM",      ROW_AEAD_ENCRYPT_GCM, COL_X25519);
+    ROW("AEAD Decrypt",      "AES-GCM",      ROW_AEAD_DECRYPT_GCM, COL_X25519);
 
 #undef ROW
 
@@ -1312,8 +1525,8 @@ int main(void)
     init_key_lengths();
 
     /* Count total bench operations for progress display */
-    /* X25519: 10, Ed25519: 7, ML-KEM: 10, ML-DSA: 7, Hybrid: 10 = 44 */
-    bench_op_total = 44;
+    /* X25519: 8, Ed25519: 7, P-256: 2, ECDSA-P-256: 2, ML-KEM: 9, ML-DSA: 7, Hybrid: 9, AES-GCM: 2 = 46 */
+    bench_op_total = 46;
 
     /* Initialize contexts */
     printf("  Initializing cryptographic contexts...\n");
@@ -1323,10 +1536,9 @@ int main(void)
     /* ====================================================================
      * X25519 column
      * ==================================================================== */
-    printf("  [1/5] Benchmarking X25519 (libsodium)...\n");
+    printf("  [1/8] Benchmarking X25519 (libsodium)...\n");
     run_bench(x25519_bench_keygen,       NULL, ROW_KEYGEN,         COL_X25519);
-    run_bench(x25519_bench_encap,        NULL, ROW_ENCAP,          COL_X25519);
-    run_bench(x25519_bench_decap,        NULL, ROW_DECAP,          COL_X25519);
+    run_bench(x25519_bench_encap,        NULL, ROW_SHARED_SECRET,  COL_X25519);
     /* Signature & Verification: N/A for X25519 (it's a key exchange only) */
     run_bench(x25519_bench_hkdf_extract, NULL, ROW_HKDF_EXTRACT,   COL_X25519);
     run_bench(x25519_bench_hkdf_expand,  NULL, ROW_HKDF_EXPAND,    COL_X25519);
@@ -1334,12 +1546,11 @@ int main(void)
     run_bench(x25519_bench_aead_enc,     NULL, ROW_AEAD_ENCRYPT,   COL_X25519);
     run_bench(x25519_bench_aead_dec,     NULL, ROW_AEAD_DECRYPT,   COL_X25519);
     run_bench(x25519_bench_key_exchange, NULL, ROW_KEY_EXCHANGE,    COL_X25519);
-    run_bench(x25519_bench_secret_derive,NULL, ROW_SECRET_DERIVE,   COL_X25519);
 
     /* ====================================================================
      * Ed25519 column
      * ==================================================================== */
-    printf("  [2/5] Benchmarking Ed25519 (libsodium)...\n");
+    printf("  [2/8] Benchmarking Ed25519 (libsodium)...\n");
     /* Keygen skipped: generated during certificate provisioning */
     /* Encap/Decap: N/A for signature scheme */
     run_bench(ed25519_bench_sign,         NULL, ROW_SIGNATURE,      COL_ED25519);
@@ -1351,9 +1562,23 @@ int main(void)
     run_bench(ed25519_bench_aead_dec,     NULL, ROW_AEAD_DECRYPT,   COL_ED25519);
 
     /* ====================================================================
+     * P-256 ECDH column (mbedtls)
+     * ==================================================================== */
+    printf("  [3/8] Benchmarking P-256 ECDH (mbedtls)...\n");
+    run_bench(p256_bench_keygen,         NULL, ROW_KEYGEN,          COL_P256);
+    run_bench(p256_bench_shared_secret,  NULL, ROW_SHARED_SECRET,  COL_P256);
+
+    /* ====================================================================
+     * ECDSA-P-256 column (mbedtls)
+     * ==================================================================== */
+    printf("  [4/8] Benchmarking ECDSA-P-256 (mbedtls)...\n");
+    run_bench(ecdsap256_bench_sign,      NULL, ROW_SIGNATURE,       COL_ECDSAP256);
+    run_bench(ecdsap256_bench_verify,    NULL, ROW_VERIFICATION,    COL_ECDSAP256);
+
+    /* ====================================================================
      * ML-KEM-768 column
      * ==================================================================== */
-    printf("  [3/5] Benchmarking ML-KEM-768 (PQClean)...\n");
+    printf("  [5/8] Benchmarking ML-KEM-768 (PQClean)...\n");
     run_bench(mlkem_bench_keygen,        NULL, ROW_KEYGEN,          COL_MLKEM768);
     run_bench(mlkem_bench_encap,         NULL, ROW_ENCAP,           COL_MLKEM768);
     run_bench(mlkem_bench_decap,         NULL, ROW_DECAP,           COL_MLKEM768);
@@ -1364,12 +1589,11 @@ int main(void)
     run_bench(mlkem_bench_aead_enc,      NULL, ROW_AEAD_ENCRYPT,    COL_MLKEM768);
     run_bench(mlkem_bench_aead_dec,      NULL, ROW_AEAD_DECRYPT,    COL_MLKEM768);
     run_bench(mlkem_bench_key_exchange,  NULL, ROW_KEY_EXCHANGE,     COL_MLKEM768);
-    run_bench(mlkem_bench_secret_derive, NULL, ROW_SECRET_DERIVE,    COL_MLKEM768);
 
     /* ====================================================================
      * ML-DSA-65 column
      * ==================================================================== */
-    printf("  [4/5] Benchmarking ML-DSA-65 (PQClean)...\n");
+    printf("  [6/8] Benchmarking ML-DSA-65 (PQClean)...\n");
     /* Keygen skipped: generated during certificate provisioning */
     /* Encap/Decap: N/A for signature scheme */
     run_bench(mldsa_bench_sign,          NULL, ROW_SIGNATURE,       COL_MLDSA65);
@@ -1383,7 +1607,7 @@ int main(void)
     /* ====================================================================
      * Hybrid (X25519 + ML-KEM-768) column
      * ==================================================================== */
-    printf("  [5/5] Benchmarking X25519 + ML-KEM-768 (Hybrid)...\n");
+    printf("  [7/8] Benchmarking X25519 + ML-KEM-768 (Hybrid)...\n");
     run_bench(hybrid_bench_keygen,        NULL, ROW_KEYGEN,         COL_HYBRID);
     run_bench(hybrid_bench_encap,         NULL, ROW_ENCAP,          COL_HYBRID);
     run_bench(hybrid_bench_decap,         NULL, ROW_DECAP,          COL_HYBRID);
@@ -1394,7 +1618,13 @@ int main(void)
     run_bench(hybrid_bench_aead_enc,      NULL, ROW_AEAD_ENCRYPT,   COL_HYBRID);
     run_bench(hybrid_bench_aead_dec,      NULL, ROW_AEAD_DECRYPT,   COL_HYBRID);
     run_bench(hybrid_bench_key_exchange,  NULL, ROW_KEY_EXCHANGE,    COL_HYBRID);
-    run_bench(hybrid_bench_secret_derive, NULL, ROW_SECRET_DERIVE,   COL_HYBRID);
+
+    /* ====================================================================
+     * AES-256-GCM (mbedtls) — benchmarked once, stored in X25519 column
+     * ==================================================================== */
+    printf("  [8/8] Benchmarking AES-256-GCM (mbedtls)...\n");
+    run_bench(aesgcm_bench_encrypt,      NULL, ROW_AEAD_ENCRYPT_GCM, COL_X25519);
+    run_bench(aesgcm_bench_decrypt,      NULL, ROW_AEAD_DECRYPT_GCM, COL_X25519);
 
     printf("\n");
 
