@@ -150,15 +150,51 @@ def verify_results(ops_data):
 
     # Check 5: All N/A values are in correct places
     checks_total += 1
-    expected_na = {
-        ("Encap", "Ed25519"), ("Decap", "Ed25519"),
-        ("Encap", "ML-DSA-65"), ("Decap", "ML-DSA-65"),
-        ("Signature", "X25519"), ("Verification", "X25519"),
-        ("Signature", "ML-KEM-768"), ("Verification", "ML-KEM-768"),
-        ("Signature", "X25519+ML-KEM-768"), ("Verification", "X25519+ML-KEM-768"),
-        ("Key Exchange (full)", "Ed25519"), ("Key Exchange (full)", "ML-DSA-65"),
-        ("Shared Secret Derivation", "Ed25519"), ("Shared Secret Derivation", "ML-DSA-65"),
-    }
+    # Define which (operation, algorithm) combos are expected to be N/A.
+    # Only specific algorithms support specific operations:
+    #   Shared Secret : X25519, P-256 only (classical DH)
+    #   Encap/Decap   : ML-KEM-768, Hybrid only (KEM)
+    #   Keygen        : X25519, P-256, ML-KEM-768, Hybrid (not signing-only cols)
+    #   Signature/Verify: Ed25519, ECDSA-P-256, ML-DSA-65 only
+    #   HKDF/Hash/AEAD: X25519, Ed25519, ML-KEM-768, ML-DSA-65, Hybrid (not P-256, ECDSA-P-256)
+    #   AES-GCM       : benchmarked once via X25519 column only
+    #   Key Exchange  : X25519, ML-KEM-768, Hybrid only
+    expected_na = set()
+
+    all_algos = {"X25519", "Ed25519", "P-256", "ECDSA-P-256", "ML-KEM-768", "ML-DSA-65", "X25519+ML-KEM-768"}
+
+    # Shared Secret: only X25519, P-256
+    for a in all_algos - {"X25519", "P-256"}:
+        expected_na.add(("Shared Secret", a))
+
+    # Encap/Decap: only ML-KEM-768, Hybrid
+    for a in all_algos - {"ML-KEM-768", "X25519+ML-KEM-768"}:
+        expected_na.add(("Encap", a))
+        expected_na.add(("Decap", a))
+
+    # Keygen: not for signing-only columns (Ed25519, ECDSA-P-256, ML-DSA-65)
+    for a in {"Ed25519", "ECDSA-P-256", "ML-DSA-65"}:
+        expected_na.add(("Keygen", a))
+
+    # Signature/Verification: only Ed25519, ECDSA-P-256, ML-DSA-65
+    for a in all_algos - {"Ed25519", "ECDSA-P-256", "ML-DSA-65"}:
+        expected_na.add(("Signature", a))
+        expected_na.add(("Verification", a))
+
+    # Symmetric ops (HKDF, Hash, AEAD xchacha20): not for P-256, ECDSA-P-256
+    sym_na_algos = {"P-256", "ECDSA-P-256"}
+    for op in ["HKDF-Extract", "HKDF-Expand", "Hash (SHA-256)", "AEAD Encrypt", "AEAD Decrypt"]:
+        for a in sym_na_algos:
+            expected_na.add((op, a))
+
+    # AES-GCM: only benchmarked via X25519 column
+    for a in all_algos - {"X25519"}:
+        expected_na.add(("AEAD Encrypt (AES-GCM)", a))
+        expected_na.add(("AEAD Decrypt (AES-GCM)", a))
+
+    # Key Exchange (full): only X25519, ML-KEM-768, Hybrid
+    for a in all_algos - {"X25519", "ML-KEM-768", "X25519+ML-KEM-768"}:
+        expected_na.add(("Key Exchange (full)", a))
     na_correct = True
     for r in ops_data:
         key = (r["operation"], r["algorithm"])
@@ -194,7 +230,7 @@ def try_plot(columns, matrix):
     fig, axes = plt.subplots(1, len(asym_ops), figsize=(20, 6), sharey=False)
     fig.suptitle("Asymmetric Cryptographic Operations Benchmark (µs)", fontsize=14, fontweight="bold")
 
-    colors = ["#2196F3", "#4CAF50", "#FF9800", "#F44336", "#9C27B0"]
+    colors = ["#2196F3", "#4CAF50", "#FF9800", "#F44336", "#9C27B0", "#00BCD4", "#795548"]
 
     for idx, op in enumerate(asym_ops):
         ax = axes[idx]
@@ -207,7 +243,7 @@ def try_plot(columns, matrix):
                 if v != "N/A":
                     vals.append(float(v))
                     labels.append(col_labels[i])
-                    bar_colors.append(colors[i])
+                    bar_colors.append(colors[i % len(colors)])
 
         if vals:
             bars = ax.bar(range(len(vals)), vals, color=bar_colors, width=0.6)
@@ -237,7 +273,7 @@ def try_plot(columns, matrix):
         for op in sym_ops:
             v = matrix.get(op, {}).get(col, "N/A")
             vals.append(float(v) if v != "N/A" else 0)
-        bars = ax.bar(x + i * width, vals, width, label=col_labels[i], color=colors[i])
+        bars = ax.bar(x + i * width, vals, width, label=col_labels[i], color=colors[i % len(colors)])
 
     ax.set_ylabel("Time (µs)")
     ax.set_xticks(x + width * 2)
@@ -252,31 +288,30 @@ def try_plot(columns, matrix):
     print(f"  Chart saved: {chart_path}")
 
     # ── Chart 3: Key Exchange comparison ──
-    ke_ops = ["Key Exchange (full)", "Shared Secret Derivation"]
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle("Key Exchange & Secret Derivation Benchmark (µs)", fontsize=14, fontweight="bold")
+    ke_ops = ["Key Exchange (full)"]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle("Key Exchange Benchmark (µs)", fontsize=14, fontweight="bold")
 
-    for idx, op in enumerate(ke_ops):
-        ax = axes[idx]
-        vals = []
-        labels = []
-        bar_colors = []
-        if op in matrix:
-            for i, col in enumerate(columns):
-                v = matrix[op].get(col, "N/A")
-                if v != "N/A":
-                    vals.append(float(v))
-                    labels.append(col_labels[i])
-                    bar_colors.append(colors[i])
-        if vals:
-            bars = ax.bar(range(len(vals)), vals, color=bar_colors, width=0.5)
-            ax.set_xticks(range(len(vals)))
-            ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
-            for bar, val in zip(bars, vals):
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
-                       f"{val:.2f}", ha="center", va="bottom", fontsize=8)
-        ax.set_title(op, fontsize=10, fontweight="bold")
-        ax.set_ylabel("Time (µs)")
+    op = ke_ops[0]
+    vals = []
+    labels = []
+    bar_colors = []
+    if op in matrix:
+        for i, col in enumerate(columns):
+            v = matrix[op].get(col, "N/A")
+            if v != "N/A":
+                vals.append(float(v))
+                labels.append(col_labels[i])
+                bar_colors.append(colors[i % len(colors)])
+    if vals:
+        bars = ax.bar(range(len(vals)), vals, color=bar_colors, width=0.5)
+        ax.set_xticks(range(len(vals)))
+        ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                   f"{val:.2f}", ha="center", va="bottom", fontsize=8)
+    ax.set_title(op, fontsize=10, fontweight="bold")
+    ax.set_ylabel("Time (µs)")
 
     plt.tight_layout()
     chart_path = os.path.join(OUTPUT_DIR, "benchmark_crypto_keyexchange.png")
