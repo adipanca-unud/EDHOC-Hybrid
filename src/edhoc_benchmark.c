@@ -561,7 +561,12 @@ static struct sck_op_result sck_bench_pq_sig_verify(int iterations)
 }
 
 /* =============================================================================
- * Shared primitive timing cache — each operation benchmarked exactly once
+ * Primitive timing cache (per role)
+ *
+ * NOTE:
+ *   We keep separate caches for Initiator and Responder measurements so
+ *   avg_time_us in benchmark_operations.csv is role-specific and not copied
+ *   from one shared timing sample.
  * =============================================================================
  */
 struct sck_prim_cache {
@@ -635,6 +640,9 @@ static void sck_bench_all_primitives(struct sck_prim_cache *c)
 /* Helper: copy timing from cache, set calls count */
 static struct sck_op_result sck_op(const struct sck_op_result *src, int calls)
 {
+	if (calls <= 0)
+		return (struct sck_op_result){0};
+
 	struct sck_op_result r = *src;
 	r.calls = calls;
 	return r;
@@ -2895,36 +2903,40 @@ int run_edhoc_benchmark_socket(void)
 
 	mkdir(SOCK_BENCH_OUTPUT_DIR, 0755);
 
-	/* === Phase 1: Benchmark each crypto primitive exactly once === */
+	/* === Phase 1: Benchmark each crypto primitive per role === */
 	print_header("Phase 1: Crypto Primitive Benchmarks");
 	printf("\n");
-	print_info("Benchmarking all primitives (each measured once, shared across variants)...");
-	struct sck_prim_cache pcache;
-	memset(&pcache, 0, sizeof(pcache));
-	sck_bench_all_primitives(&pcache);
+	print_info("Benchmarking all primitives for Initiator role...");
+	struct sck_prim_cache pcache_i;
+	memset(&pcache_i, 0, sizeof(pcache_i));
+	sck_bench_all_primitives(&pcache_i);
+	print_info("Benchmarking all primitives for Responder role...");
+	struct sck_prim_cache pcache_r;
+	memset(&pcache_r, 0, sizeof(pcache_r));
+	sck_bench_all_primitives(&pcache_r);
 	print_success("Primitive benchmarks done.");
 
-	/* Assemble per-variant ops from shared cache */
+	/* Assemble per-variant ops from role-specific caches */
 	struct sck_ops_benchmark t0_oi, t0_or, t3_oi, t3_or;
 	memset(&t0_oi, 0, sizeof(t0_oi)); memset(&t0_or, 0, sizeof(t0_or));
 	memset(&t3_oi, 0, sizeof(t3_oi)); memset(&t3_or, 0, sizeof(t3_or));
-	sck_assemble_classic_ops(&pcache, 0, true, &t0_oi);
-	sck_assemble_classic_ops(&pcache, 0, false, &t0_or);
-	sck_assemble_classic_ops(&pcache, 3, true, &t3_oi);
-	sck_assemble_classic_ops(&pcache, 3, false, &t3_or);
+	sck_assemble_classic_ops(&pcache_i, 0, true, &t0_oi);
+	sck_assemble_classic_ops(&pcache_r, 0, false, &t0_or);
+	sck_assemble_classic_ops(&pcache_i, 3, true, &t3_oi);
+	sck_assemble_classic_ops(&pcache_r, 3, false, &t3_or);
 
 	struct sck_ops_benchmark t0p_oi, t0p_or, t3p_oi, t3p_or;
 	memset(&t0p_oi, 0, sizeof(t0p_oi)); memset(&t0p_or, 0, sizeof(t0p_or));
 	memset(&t3p_oi, 0, sizeof(t3p_oi)); memset(&t3p_or, 0, sizeof(t3p_or));
-	sck_assemble_pq_ops(&pcache, 0, true, &t0p_oi);
-	sck_assemble_pq_ops(&pcache, 0, false, &t0p_or);
-	sck_assemble_pq_ops(&pcache, 3, true, &t3p_oi);
-	sck_assemble_pq_ops(&pcache, 3, false, &t3p_or);
+	sck_assemble_pq_ops(&pcache_i, 0, true, &t0p_oi);
+	sck_assemble_pq_ops(&pcache_r, 0, false, &t0p_or);
+	sck_assemble_pq_ops(&pcache_i, 3, true, &t3p_oi);
+	sck_assemble_pq_ops(&pcache_r, 3, false, &t3p_or);
 
 	struct sck_ops_benchmark th_oi, th_or;
 	memset(&th_oi, 0, sizeof(th_oi)); memset(&th_or, 0, sizeof(th_or));
-	sck_assemble_hybrid_ops(&pcache, true, &th_oi);
-	sck_assemble_hybrid_ops(&pcache, false, &th_or);
+	sck_assemble_hybrid_ops(&pcache_i, true, &th_oi);
+	sck_assemble_hybrid_ops(&pcache_r, false, &th_or);
 	print_success("All variant ops assembled.");
 
 	/* === Phase 2: Socket-based Handshakes === */
