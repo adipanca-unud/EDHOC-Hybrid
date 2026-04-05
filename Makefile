@@ -44,6 +44,7 @@ APP_SRCS += $(SRC_DIR)/edhoc_type3_hybrid.c
 APP_SRCS += $(SRC_DIR)/edhoc_benchmark.c
 APP_SRCS += $(SRC_DIR)/eap_edhoc.c
 APP_SRCS += $(SRC_DIR)/crypto_libsodium.c
+APP_SRCS += $(SRC_DIR)/radius_client.c
 
 TV_SRCS = $(TV_DIR)/edhoc_test_vectors_rfc9529.c
 

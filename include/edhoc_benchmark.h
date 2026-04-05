@@ -12,12 +12,23 @@
  * Outputs the same 3 CSV files (to output/ directory) with identical
  * format so that verify_benchmark.py can validate.
  *
- * All 5 variants:
+ * All 15 variants:
+ *   EDHOC (2-party, TCP):
  *   - Type 0 Classic (Sig-Sig)
  *   - Type 3 Classic (MAC-MAC)
  *   - Type 0 PQ (KEM-based Sig-Sig, ML-KEM-768)
  *   - Type 3 PQ (KEM-based MAC-MAC, ML-KEM-768)
  *   - Type 3 Hybrid (X25519 ECDHE + ML-KEM-768)
+ *
+ *   EAP-EDHOC (2-party, EAP over TCP):
+ *   - EAP Type 0 Classic, EAP Type 3 Classic
+ *   - EAP Type 0 PQ, EAP Type 3 PQ
+ *   - EAP Type 3 Hybrid
+ *
+ *   AAA EAP-EDHOC (3-party, Peer ↔ Authenticator ↔ AAA Server via RADIUS):
+ *   - AAA Type 0 Classic, AAA Type 3 Classic
+ *   - AAA Type 0 PQ, AAA Type 3 PQ
+ *   - AAA Type 3 Hybrid
  */
 
 #ifndef EDHOC_BENCHMARK_H
@@ -36,12 +47,16 @@
 /* Base TCP port — each iteration uses base_port + variant_offset */
 #define SOCK_BENCH_BASE_PORT    19000
 
+/* Base UDP port for AAA RADIUS server (3-party architecture) */
+#define AAA_RADIUS_BASE_PORT    21000
+
 /**
- * @brief Run full socket-based benchmark (all 5 variants).
+ * @brief Run full socket-based benchmark (all 15 variants).
  *
  * Measures:
  *   - Crypto operations (same as in-memory benchmark)
  *   - Handshake timing over TCP localhost sockets
+ *   - AAA handshake timing over RADIUS/UDP (3-party architecture)
  *   - Overhead derived from calibrated ops
  *
  * @return 0 on success, -1 on failure
