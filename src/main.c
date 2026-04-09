@@ -26,9 +26,11 @@
  *   ./build/edhoc_hybrid 6     # Run Socket Benchmark (all variants)
  */
 
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "edhoc_common.h"
 #include "edhoc_type0_classic.h"
