@@ -13,7 +13,7 @@ Classic paths use libsodium for X25519/Ed25519/HKDF-SHA256; PQ paths use PQClean
 | 4    | Type 3 PQ (KEM MAC-MAC)  | ML-KEM-768 (PQClean)                        | MAC with KEM-derived keys | HKDF-HMAC-SHA256 (libsodium)/SHA256 | AES-CCM-16-64-128 (mbedTLS) |
 | 5    | Type 3 Hybrid (MAC-MAC)  | X25519 ECDHE + ML-KEM-768 KEM (chained HKDF)| MAC from hybrid secrets   | HKDF-HMAC-SHA256 (libsodium)        | AES-CCM-16-64-128 (mbedTLS) |
 
-Menu **6** runs the benchmark (TCP client-server) across all 5 variants. Menu **7** runs a standalone hybrid handshake. Menu **8** runs full benchmarks across classic, PQ, and hybrid, writing CSVs under `output/`. Menu **9** runs the **All-in-One Benchmark** (crypto + socket + P2P handshake) producing all 8 CSV files in a single run on each machine.
+Menu **6** runs the benchmark (TCP client-server) across all 5 variants. Menu **7** runs a standalone hybrid handshake. Menu **8** runs full benchmarks across classic, PQ, and hybrid, writing CSVs under `output/`. Menu **9** runs the **All-in-One Benchmark** (crypto + socket + P2P handshake) producing 8 role-suffixed CSV files (`_initiator` / `_responder`) in a single run on each machine.
 
 ## Prerequisites
 
@@ -124,25 +124,32 @@ make clean && make -j$(nproc)
 
 #### P2P Benchmark Output (Menu 9 — All-in-One)
 
-Menu 9 runs **three benchmark phases** sequentially on each machine, producing **all 8 CSV files** in a single invocation:
+Menu 9 runs **three benchmark phases** sequentially on each machine, producing **8 CSV files per machine** in a single invocation. CSV filenames include a **role suffix** (`_initiator` or `_responder`) so that both sides can write to the same `output/` directory without overwriting each other.
 
 **Phase A — Pure Crypto Operations (local, no network):**
-- `output/benchmark_crypto_ops.csv`
-- `output/benchmark_crypto_matrix.csv`
-- `output/benchmark_crypto_simple.csv`
+| Responder | Initiator |
+|-----------|-----------|
+| `output/benchmark_crypto_ops_responder.csv` | `output/benchmark_crypto_ops_initiator.csv` |
+| `output/benchmark_crypto_matrix_responder.csv` | `output/benchmark_crypto_matrix_initiator.csv` |
+| `output/benchmark_crypto_simple_responder.csv` | `output/benchmark_crypto_simple_initiator.csv` |
 
 **Phase B — Socket Benchmark (TCP localhost, all 5 variants):**
-- `output/benchmark_operations.csv`
-- `output/benchmark_overhead.csv`
-- `output/benchmark_handshake.csv`
+| Responder | Initiator |
+|-----------|-----------|
+| `output/benchmark_operations_responder.csv` | `output/benchmark_operations_initiator.csv` |
+| `output/benchmark_overhead_responder.csv` | `output/benchmark_overhead_initiator.csv` |
+| `output/benchmark_handshake_responder.csv` | `output/benchmark_handshake_initiator.csv` |
 
 **Phase C — P2P Network Handshake (Initiator ↔ Responder over TCP):**
-- **Responder:** `output/p2p_handshake_responder.csv`
-- **Initiator:** `output/p2p_handshake_initiator.csv`
+| Responder | Initiator |
+|-----------|-----------|
+| `output/p2p_handshake_responder.csv` | `output/p2p_handshake_initiator.csv` |
 
 Columns (P2P CSV): `type, role, processing_us, txrx_us, total_us, success_count`
 
 The benchmark runs all 5 handshake variants (Classic Type 0/3, PQ Type 0/3, Hybrid Type 3) with 1000 iterations each. Key material is exchanged over a control channel at startup.
+
+> **Note:** When running standalone modes (Menu 6 for socket benchmark, or `make crypto_bench` for crypto benchmark), CSV filenames have **no role suffix** (e.g. `benchmark_operations.csv`).
 
 #### Cross-Compilation for Raspberry Pi (optional)
 
