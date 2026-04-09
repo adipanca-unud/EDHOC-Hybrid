@@ -73,7 +73,20 @@
 #define HKDF_OKM_LEN      32    /* output keying material length             */
 
 #define OUTPUT_DIR        "output"
-#define OUTPUT_FILE       OUTPUT_DIR "/benchmark_crypto_ops.csv"
+#define OUTPUT_FILE_BASE  "benchmark_crypto_ops"
+
+/* Role suffix for CSV filenames (set by run_crypto_benchmark) */
+static const char *csv_role_suffix = "";
+
+/* Build a path like "output/benchmark_crypto_ops_initiator.csv" */
+static void make_csv_path(char *dst, size_t dstsz,
+                          const char *base_name)
+{
+    if (csv_role_suffix && csv_role_suffix[0])
+        snprintf(dst, dstsz, "%s/%s_%s.csv", OUTPUT_DIR, base_name, csv_role_suffix);
+    else
+        snprintf(dst, dstsz, "%s/%s.csv", OUTPUT_DIR, base_name);
+}
 
 /* ==========================================================================
  * Column identifiers
@@ -1342,7 +1355,9 @@ static void print_table(void)
 static void write_csv(void)
 {
     mkdir(OUTPUT_DIR, 0755);
-    FILE *f = fopen(OUTPUT_FILE, "w");
+    char path[512];
+    make_csv_path(path, sizeof(path), OUTPUT_FILE_BASE);
+    FILE *f = fopen(path, "w");
     if (!f) {
         perror("fopen output CSV");
         return;
@@ -1382,14 +1397,15 @@ static void write_csv(void)
     }
 
     fclose(f);
-    printf("  CSV output written to: %s\n\n", OUTPUT_FILE);
+    printf("  CSV output written to: %s\n\n", path);
 }
 
 /* Also write a "matrix" style CSV (operations as rows, algorithms as columns) */
 static void write_matrix_csv(void)
 {
-    const char *MATRIX_FILE = OUTPUT_DIR "/benchmark_crypto_matrix.csv";
-    FILE *f = fopen(MATRIX_FILE, "w");
+    char path[512];
+    make_csv_path(path, sizeof(path), "benchmark_crypto_matrix");
+    FILE *f = fopen(path, "w");
     if (!f) {
         perror("fopen matrix CSV");
         return;
@@ -1421,7 +1437,7 @@ static void write_matrix_csv(void)
     }
 
     fclose(f);
-    printf("  Matrix CSV written to: %s\n\n", MATRIX_FILE);
+    printf("  Matrix CSV written to: %s\n\n", path);
 }
 
 /* Write the simplified CSV: algorithm-grouped, only relevant ops per algo,
@@ -1431,8 +1447,9 @@ static void write_matrix_csv(void)
  */
 static void write_simple_csv(void)
 {
-    const char *SIMPLE_FILE = OUTPUT_DIR "/benchmark_crypto_simple.csv";
-    FILE *f = fopen(SIMPLE_FILE, "w");
+    char path[512];
+    make_csv_path(path, sizeof(path), "benchmark_crypto_simple");
+    FILE *f = fopen(path, "w");
     if (!f) { perror("fopen simple CSV"); return; }
 
     fprintf(f, "algorithm,operation,avg_us,stddev_us,min_us,max_us,median_us,iterations,key_length\n");
@@ -1499,14 +1516,17 @@ static void write_simple_csv(void)
 #undef ROW
 
     fclose(f);
-    printf("  Simple CSV written to: %s\n\n", SIMPLE_FILE);
+    printf("  Simple CSV written to: %s\n\n", path);
 }
 
 /* ==========================================================================
  * Core benchmark logic — callable from main binary or standalone
  * ========================================================================== */
-int run_crypto_benchmark(void)
+int run_crypto_benchmark(const char *role_suffix)
 {
+    /* Store suffix for write_csv / write_matrix_csv / write_simple_csv */
+    csv_role_suffix = (role_suffix && role_suffix[0]) ? role_suffix : "";
+
     if (sodium_init() < 0) {
         fprintf(stderr, "ERROR: sodium_init() failed\n");
         return 1;
@@ -1646,6 +1666,6 @@ int run_crypto_benchmark(void)
 #ifdef BENCHMARK_CRYPTO_STANDALONE
 int main(void)
 {
-    return run_crypto_benchmark();
+    return run_crypto_benchmark(NULL);
 }
 #endif

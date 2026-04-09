@@ -168,7 +168,7 @@ int main(int argc, char *argv[])
 			break;
 
 		case 6:
-			result = run_edhoc_benchmark_socket();
+			result = run_edhoc_benchmark_socket(NULL);
 			if (result != 0) {
 				print_error("Socket Benchmark (TCP) failed!");
 			}

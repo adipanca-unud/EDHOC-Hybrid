@@ -44,8 +44,11 @@
  *   - Handshake timing over TCP localhost sockets
  *   - Overhead derived from calibrated ops
  *
+ * @param role_suffix  If non-NULL and non-empty (e.g. "initiator"),
+ *                     CSV filenames are suffixed: benchmark_operations_initiator.csv
+ *                     Pass NULL or "" for default (no suffix).
  * @return 0 on success, -1 on failure
  */
-int run_edhoc_benchmark_socket(void);
+int run_edhoc_benchmark_socket(const char *role_suffix);
 
 #endif /* EDHOC_BENCHMARK_H */

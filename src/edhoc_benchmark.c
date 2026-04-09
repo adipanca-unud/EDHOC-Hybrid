@@ -2889,7 +2889,7 @@ static int sck_write_handshake_csv(const char *path,
  * =============================================================================
  */
 
-int run_edhoc_benchmark_socket(void)
+int run_edhoc_benchmark_socket(const char *role_suffix)
 {
 	print_header("EDHOC Socket-based Benchmark (TCP localhost, All 5 Variants)");
 	printf("\n");
@@ -2988,24 +2988,39 @@ int run_edhoc_benchmark_socket(void)
 	print_header("Writing Socket Benchmark CSV Files");
 	printf("\n");
 
+	/* Build role-suffixed filenames */
+	char csv_ops[512], csv_ovh[512], csv_hs[512];
+	if (role_suffix && role_suffix[0]) {
+		snprintf(csv_ops, sizeof(csv_ops), "%s/benchmark_operations_%s.csv",
+			 SOCK_BENCH_OUTPUT_DIR, role_suffix);
+		snprintf(csv_ovh, sizeof(csv_ovh), "%s/benchmark_overhead_%s.csv",
+			 SOCK_BENCH_OUTPUT_DIR, role_suffix);
+		snprintf(csv_hs, sizeof(csv_hs), "%s/benchmark_handshake_%s.csv",
+			 SOCK_BENCH_OUTPUT_DIR, role_suffix);
+	} else {
+		snprintf(csv_ops, sizeof(csv_ops), "%s", SOCK_CSV_OPERATIONS);
+		snprintf(csv_ovh, sizeof(csv_ovh), "%s", SOCK_CSV_OVERHEAD);
+		snprintf(csv_hs, sizeof(csv_hs), "%s", SOCK_CSV_HANDSHAKE);
+	}
+
 	int ret;
-	ret = sck_write_operations_csv(SOCK_CSV_OPERATIONS,
+	ret = sck_write_operations_csv(csv_ops,
 		&t0_oi, &t0_or, &t3_oi, &t3_or,
 		&t0p_oi, &t0p_or, &t3p_oi, &t3p_or,
 		&th_oi, &th_or);
-	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", SOCK_CSV_OPERATIONS); print_success(buf); }
+	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", csv_ops); print_success(buf); }
 
-	ret = sck_write_overhead_csv(SOCK_CSV_OVERHEAD,
+	ret = sck_write_overhead_csv(csv_ovh,
 		&t0_ohi, &t0_ohr, &t3_ohi, &t3_ohr,
 		&t0p_ohi, &t0p_ohr, &t3p_ohi, &t3p_ohr,
 		&th_ohi, &th_ohr);
-	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", SOCK_CSV_OVERHEAD); print_success(buf); }
+	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", csv_ovh); print_success(buf); }
 
-	ret = sck_write_handshake_csv(SOCK_CSV_HANDSHAKE,
+	ret = sck_write_handshake_csv(csv_hs,
 		&t0_hi, &t0_hr, &t3_hi, &t3_hr,
 		&t0p_hi, &t0p_hr, &t3p_hi, &t3p_hr,
 		&th_hi, &th_hr);
-	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", SOCK_CSV_HANDSHAKE); print_success(buf); }
+	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", csv_hs); print_success(buf); }
 
 	/* === Summary === */
 	printf("\n");

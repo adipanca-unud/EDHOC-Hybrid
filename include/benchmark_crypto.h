@@ -22,8 +22,11 @@
  * X25519+ML-KEM-768 (Hybrid), and AES-256-GCM.  Results are written to
  * three CSV files under output/.
  *
+ * @param role_suffix  If non-NULL and non-empty (e.g. "initiator"),
+ *                     CSV filenames are suffixed: benchmark_crypto_ops_initiator.csv
+ *                     Pass NULL or "" for default (no suffix).
  * @return 0 on success, non-zero on failure.
  */
-int run_crypto_benchmark(void);
+int run_crypto_benchmark(const char *role_suffix);
 
 #endif /* BENCHMARK_CRYPTO_H */
