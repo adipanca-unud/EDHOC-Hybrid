@@ -1503,9 +1503,9 @@ static void write_simple_csv(void)
 }
 
 /* ==========================================================================
- * MAIN
+ * Core benchmark logic — callable from main binary or standalone
  * ========================================================================== */
-int main(void)
+int run_crypto_benchmark(void)
 {
     if (sodium_init() < 0) {
         fprintf(stderr, "ERROR: sodium_init() failed\n");
@@ -1639,3 +1639,13 @@ int main(void)
     printf("  Benchmark complete.\n\n");
     return 0;
 }
+
+/* ==========================================================================
+ * Standalone entry point (used by Makefile.crypto_bench)
+ * ========================================================================== */
+#ifdef BENCHMARK_CRYPTO_STANDALONE
+int main(void)
+{
+    return run_crypto_benchmark();
+}
+#endif

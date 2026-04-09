@@ -48,7 +48,7 @@ PQCLEAN_COMMON_SRCS = $(wildcard $(PQCLEAN_COMMON_DIR)/*.c)
 MBEDTLS_SRCS = $(wildcard $(MBEDTLS_LIB_DIR)/*.c)
 
 # Object files
-BENCH_OBJ = $(BUILD_DIR)/benchmark_crypto.o
+BENCH_OBJ = $(BUILD_DIR)/benchmark_crypto_standalone.o
 
 PQCLEAN_KEM_OBJS    = $(patsubst $(PQCLEAN_KEM_DIR)/%.c,$(BUILD_DIR)/bench_pqkem_%.o,$(PQCLEAN_KEM_SRCS))
 PQCLEAN_SIG_OBJS    = $(patsubst $(PQCLEAN_SIG_DIR)/%.c,$(BUILD_DIR)/bench_pqsig_%.o,$(PQCLEAN_SIG_SRCS))
@@ -91,9 +91,9 @@ $(TARGET): $(OBJS)
 	$(CC) $(OBJS) $(LDFLAGS) -o $@
 	@echo '=== Linked: $@ ==='
 
-$(BUILD_DIR)/benchmark_crypto.o: $(SRC_DIR)/benchmark_crypto.c
+$(BUILD_DIR)/benchmark_crypto_standalone.o: $(SRC_DIR)/benchmark_crypto.c
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) $(C_INCLUDES) -DBENCHMARK_CRYPTO_STANDALONE -c $< -o $@
 
 $(BUILD_DIR)/bench_pqkem_%.o: $(PQCLEAN_KEM_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)
@@ -116,7 +116,7 @@ run: all
 	@$(TARGET)
 
 clean:
-	rm -f $(BUILD_DIR)/benchmark_crypto.o
+	rm -f $(BUILD_DIR)/benchmark_crypto_standalone.o
 	rm -f $(BUILD_DIR)/bench_pqkem_*.o
 	rm -f $(BUILD_DIR)/bench_pqsig_*.o
 	rm -f $(BUILD_DIR)/bench_pqcommon_*.o

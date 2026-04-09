@@ -38,6 +38,8 @@
 #include <signal.h>
 
 #include "edhoc_benchmark_p2p.h"
+#include "edhoc_benchmark.h"
+#include "benchmark_crypto.h"
 #include "edhoc_common.h"
 #include "edhoc_type0_classic.h"
 #include "edhoc_type3_classic.h"
@@ -1072,5 +1074,53 @@ int run_p2p_benchmark(int argc, char *argv[])
 	}
 	if(role<0){print_error("Specify --initiator or --responder");p2p_usage();return -1;}
 	if(role==1&&strlen(host)==0){print_error("Initiator needs --host");p2p_usage();return -1;}
-	return role ? run_p2p_initiator(host,port) : run_p2p_responder(port);
+
+	int rc;
+
+	/* ── Phase A: Pure Crypto Benchmark (local, no network) ────────── */
+	print_header("Phase A: Pure Cryptographic Operations Benchmark");
+	printf("  → benchmark_crypto_ops.csv, benchmark_crypto_matrix.csv, benchmark_crypto_simple.csv\n\n");
+	rc = run_crypto_benchmark();
+	if (rc != 0) {
+		print_error("Crypto benchmark failed!");
+		return rc;
+	}
+	print_success("Phase A complete — 3 crypto CSV files written.");
+	printf("\n");
+
+	/* ── Phase B: Socket Benchmark (TCP localhost, all 5 variants) ── */
+	print_header("Phase B: Socket-based Benchmark (TCP localhost)");
+	printf("  → benchmark_operations.csv, benchmark_overhead.csv, benchmark_handshake.csv\n\n");
+	rc = run_edhoc_benchmark_socket();
+	if (rc != 0) {
+		print_error("Socket benchmark failed!");
+		return rc;
+	}
+	print_success("Phase B complete — 3 socket CSV files written.");
+	printf("\n");
+
+	/* ── Phase C: P2P Network Handshake Benchmark ──────────────────── */
+	print_header("Phase C: P2P Network Benchmark (Initiator ↔ Responder)");
+	printf("  → p2p_handshake_%s.csv\n\n", role ? "initiator" : "responder");
+	rc = role ? run_p2p_initiator(host,port) : run_p2p_responder(port);
+	if (rc != 0) {
+		print_error("P2P benchmark failed!");
+		return rc;
+	}
+	print_success("Phase C complete — P2P CSV file written.");
+	printf("\n");
+
+	/* ── Summary ───────────────────────────────────────────────────── */
+	print_header("All Benchmarks Complete!");
+	printf("\n  Generated CSV files:\n");
+	printf("    ✓ output/benchmark_crypto_ops.csv\n");
+	printf("    ✓ output/benchmark_crypto_matrix.csv\n");
+	printf("    ✓ output/benchmark_crypto_simple.csv\n");
+	printf("    ✓ output/benchmark_operations.csv\n");
+	printf("    ✓ output/benchmark_overhead.csv\n");
+	printf("    ✓ output/benchmark_handshake.csv\n");
+	printf("    ✓ output/p2p_handshake_%s.csv\n", role ? "initiator" : "responder");
+	printf("\n");
+
+	return 0;
 }

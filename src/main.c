@@ -88,9 +88,9 @@ static void print_menu(void)
 	printf("      %sTCP localhost | All 5 variants → 3 CSV files (output/)%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
-	printf("  %s[9]%s P2P Network Benchmark (Initiator ↔ Responder over TCP)\n",
+	printf("  %s[9]%s All-in-One Benchmark (Crypto + Socket + P2P Network)\n",
 	       CLR_GREEN, CLR_RESET);
-	printf("      %sTwo machines | All 5 variants | --initiator / --responder%s\n",
+	printf("      %sAll 8 CSV files | --initiator / --responder%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
 	printf("  %s[0]%s Exit\n", CLR_RED, CLR_RESET);

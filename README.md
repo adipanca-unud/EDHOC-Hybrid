@@ -13,7 +13,7 @@ Classic paths use libsodium for X25519/Ed25519/HKDF-SHA256; PQ paths use PQClean
 | 4    | Type 3 PQ (KEM MAC-MAC)  | ML-KEM-768 (PQClean)                        | MAC with KEM-derived keys | HKDF-HMAC-SHA256 (libsodium)/SHA256 | AES-CCM-16-64-128 (mbedTLS) |
 | 5    | Type 3 Hybrid (MAC-MAC)  | X25519 ECDHE + ML-KEM-768 KEM (chained HKDF)| MAC from hybrid secrets   | HKDF-HMAC-SHA256 (libsodium)        | AES-CCM-16-64-128 (mbedTLS) |
 
-Menu **6** runs the benchmark (TCP client-server) across all 5 variants. Menu **7** runs a standalone hybrid handshake. Menu **8** runs full benchmarks across classic, PQ, and hybrid, writing CSVs under `output/`. Menu **9** runs the **P2P Network Benchmark** between two separate machines (e.g. Raspberry Pi as Initiator + Ubuntu server as Responder).
+Menu **6** runs the benchmark (TCP client-server) across all 5 variants. Menu **7** runs a standalone hybrid handshake. Menu **8** runs full benchmarks across classic, PQ, and hybrid, writing CSVs under `output/`. Menu **9** runs the **All-in-One Benchmark** (crypto + socket + P2P handshake) producing all 8 CSV files in a single run on each machine.
 
 ## Prerequisites
 
@@ -122,15 +122,27 @@ make clean && make -j$(nproc)
 ./build/edhoc_hybrid 9 --initiator --host 192.168.1.100 --port 20000
 ```
 
-#### P2P Benchmark Output
+#### P2P Benchmark Output (Menu 9 — All-in-One)
 
-Each machine writes its own CSV:
+Menu 9 runs **three benchmark phases** sequentially on each machine, producing **all 8 CSV files** in a single invocation:
+
+**Phase A — Pure Crypto Operations (local, no network):**
+- `output/benchmark_crypto_ops.csv`
+- `output/benchmark_crypto_matrix.csv`
+- `output/benchmark_crypto_simple.csv`
+
+**Phase B — Socket Benchmark (TCP localhost, all 5 variants):**
+- `output/benchmark_operations.csv`
+- `output/benchmark_overhead.csv`
+- `output/benchmark_handshake.csv`
+
+**Phase C — P2P Network Handshake (Initiator ↔ Responder over TCP):**
 - **Responder:** `output/p2p_handshake_responder.csv`
 - **Initiator:** `output/p2p_handshake_initiator.csv`
 
-Columns: `type, role, processing_us, txrx_us, total_us, success_count`
+Columns (P2P CSV): `type, role, processing_us, txrx_us, total_us, success_count`
 
-The benchmark runs all 5 handshake variants (Classic Type 0/3, PQ Type 0/3, Hybrid Type 3) with 50 iterations each. Key material is exchanged over a control channel at startup.
+The benchmark runs all 5 handshake variants (Classic Type 0/3, PQ Type 0/3, Hybrid Type 3) with 1000 iterations each. Key material is exchanged over a control channel at startup.
 
 #### Cross-Compilation for Raspberry Pi (optional)
 
