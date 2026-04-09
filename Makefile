@@ -16,6 +16,8 @@ LIB_DIR     = $(PROJ_DIR)/lib/uoscore-uedhoc
 LIB_BUILD   = $(LIB_DIR)/build
 TV_DIR      = $(LIB_DIR)/test_vectors
 EXT_DIR     = $(LIB_DIR)/externals
+COMPACT25519_DIR = $(EXT_DIR)/compact25519/src
+COMPACT25519_C25519_DIR = $(COMPACT25519_DIR)/c25519
 
 TARGET = $(BUILD_DIR)/edhoc_hybrid
 
@@ -53,16 +55,24 @@ ZCBOR_SRCS += $(EXT_DIR)/zcbor/src/zcbor_encode.c
 
 MBEDTLS_SRCS = $(wildcard $(EXT_DIR)/mbedtls/library/*.c)
 
+# Fallback compact25519 objects are linked into the final app so builds still
+# succeed even if lib/uoscore-uedhoc was built without compact25519 sources.
+COMPACT25519_TOP_SRCS    = $(wildcard $(COMPACT25519_DIR)/*.c)
+COMPACT25519_C25519_SRCS = $(wildcard $(COMPACT25519_C25519_DIR)/*.c)
+
 APP_OBJS       = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(APP_SRCS))
 TV_OBJS        = $(patsubst $(TV_DIR)/%.c,$(BUILD_DIR)/tv_%.o,$(TV_SRCS))
 ZCBOR_OBJS     = $(patsubst $(EXT_DIR)/zcbor/src/%.c,$(BUILD_DIR)/zcbor_%.o,$(ZCBOR_SRCS))
 MBEDTLS_OBJS   = $(patsubst $(EXT_DIR)/mbedtls/library/%.c,$(BUILD_DIR)/mbedtls_%.o,$(MBEDTLS_SRCS))
+COMPACT25519_TOP_OBJS = $(patsubst $(COMPACT25519_DIR)/%.c,$(BUILD_DIR)/compact25519_%.o,$(COMPACT25519_TOP_SRCS))
+COMPACT25519_C25519_OBJS = $(patsubst $(COMPACT25519_C25519_DIR)/%.c,$(BUILD_DIR)/compact25519_c25519_%.o,$(COMPACT25519_C25519_SRCS))
 
 PQCLEAN_KEM_OBJS    = $(patsubst $(PQCLEAN_KEM_DIR)/%.c,$(BUILD_DIR)/pqclean_kem_%.o,$(PQCLEAN_KEM_SRCS))
 PQCLEAN_SIG_OBJS    = $(patsubst $(PQCLEAN_SIG_DIR)/%.c,$(BUILD_DIR)/pqclean_sig_%.o,$(PQCLEAN_SIG_SRCS))
 PQCLEAN_COMMON_OBJS = $(patsubst $(PQCLEAN_COMMON_DIR)/%.c,$(BUILD_DIR)/pqclean_common_%.o,$(PQCLEAN_COMMON_SRCS))
 
 OBJS = $(APP_OBJS) $(TV_OBJS) $(ZCBOR_OBJS) $(MBEDTLS_OBJS)
+OBJS += $(COMPACT25519_TOP_OBJS) $(COMPACT25519_C25519_OBJS)
 
 ifeq ($(USE_PQCLEAN),1)
 OBJS += $(PQCLEAN_KEM_OBJS) $(PQCLEAN_SIG_OBJS) $(PQCLEAN_COMMON_OBJS)
@@ -91,6 +101,8 @@ C_INCLUDES += -I$(EXT_DIR)/mbedtls/include
 C_INCLUDES += -I$(EXT_DIR)/mbedtls/include/mbedtls
 C_INCLUDES += -I$(EXT_DIR)/mbedtls/include/psa
 C_INCLUDES += -I$(EXT_DIR)/zcbor/include
+C_INCLUDES += -I$(COMPACT25519_DIR)
+C_INCLUDES += -I$(COMPACT25519_C25519_DIR)
 
 ifeq ($(USE_PQCLEAN),1)
 C_INCLUDES += -I$(PQCLEAN_DIR)
@@ -140,6 +152,14 @@ $(BUILD_DIR)/zcbor_%.o: $(EXT_DIR)/zcbor/src/%.c
 	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
 
 $(BUILD_DIR)/mbedtls_%.o: $(EXT_DIR)/mbedtls/library/%.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/compact25519_%.o: $(COMPACT25519_DIR)/%.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/compact25519_c25519_%.o: $(COMPACT25519_C25519_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(C_INCLUDES) -c $< -o $@
 
