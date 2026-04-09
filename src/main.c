@@ -37,6 +37,7 @@
 #include "edhoc_type3_pq.h"
 #include "edhoc_type3_hybrid.h"
 #include "edhoc_benchmark.h"
+#include "edhoc_benchmark_p2p.h"
 
 static void print_banner(void)
 {
@@ -85,6 +86,11 @@ static void print_menu(void)
 	printf("      %sTCP localhost | All 5 variants → 3 CSV files (output/)%s\n",
 	       CLR_CYAN, CLR_RESET);
 	printf("\n");
+	printf("  %s[9]%s P2P Network Benchmark (Initiator ↔ Responder over TCP)\n",
+	       CLR_GREEN, CLR_RESET);
+	printf("      %sTwo machines | All 5 variants | --initiator / --responder%s\n",
+	       CLR_CYAN, CLR_RESET);
+	printf("\n");
 	printf("  %s[0]%s Exit\n", CLR_RED, CLR_RESET);
 	printf("\n");
 	printf("  %s> Choice: %s", CLR_BOLD, CLR_RESET);
@@ -111,7 +117,7 @@ int main(int argc, char *argv[])
 				while ((c = getchar()) != '\n' && c != EOF)
 					;
 				printf("\n");
-				print_error("Invalid input. Please enter 0-6.");
+				print_error("Invalid input. Please enter 0-6 or 9.");
 				choice = -1;
 				continue;
 			}
@@ -166,9 +172,16 @@ int main(int argc, char *argv[])
 			}
 			break;
 
+		case 9:
+			result = run_p2p_benchmark(argc, argv);
+			if (result != 0) {
+				print_error("P2P Network Benchmark failed!");
+			}
+			break;
+
 		default:
 			printf("\n");
-			print_error("Invalid choice. Please enter 0-6.");
+			print_error("Invalid choice. Please enter 0-6 or 9.");
 			break;
 		}
 

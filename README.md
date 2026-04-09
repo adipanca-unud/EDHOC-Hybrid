@@ -13,7 +13,7 @@ Classic paths use libsodium for X25519/Ed25519/HKDF-SHA256; PQ paths use PQClean
 | 4    | Type 3 PQ (KEM MAC-MAC)  | ML-KEM-768 (PQClean)                        | MAC with KEM-derived keys | HKDF-HMAC-SHA256 (libsodium)/SHA256 | AES-CCM-16-64-128 (mbedTLS) |
 | 5    | Type 3 Hybrid (MAC-MAC)  | X25519 ECDHE + ML-KEM-768 KEM (chained HKDF)| MAC from hybrid secrets   | HKDF-HMAC-SHA256 (libsodium)        | AES-CCM-16-64-128 (mbedTLS) |
 
-Menu **6** runs the benchmark (TCP client-server) across all 5 variants. Menu **7** runs a standalone hybrid handshake. Menu **8** runs full benchmarks across classic, PQ, and hybrid, writing CSVs under `output/`.
+Menu **6** runs the benchmark (TCP client-server) across all 5 variants. Menu **7** runs a standalone hybrid handshake. Menu **8** runs full benchmarks across classic, PQ, and hybrid, writing CSVs under `output/`. Menu **9** runs the **P2P Network Benchmark** between two separate machines (e.g. Raspberry Pi as Initiator + Ubuntu server as Responder).
 
 ## Prerequisites
 
@@ -66,6 +66,82 @@ Direct (skip menu):
 ./build/edhoc_hybrid 7   # Type 3 Hybrid (X25519 + ML-KEM-768)
 ```
 
+### P2P Network Benchmark (Menu 9)
+
+Run **real network** benchmarks between two separate machines (e.g. Raspberry Pi → Ubuntu server).
+
+#### Architecture
+
+```
+ ┌──────────────────────┐          TCP         ┌──────────────────────┐
+ │   Raspberry Pi       │ ◄───────────────────► │   Ubuntu Server      │
+ │   (Initiator)        │      Port 19000       │   (Responder)        │
+ │                      │   Control channel     │                      │
+ │   ./edhoc_hybrid 9   │   + handshake ports   │   ./edhoc_hybrid 9   │
+ │     --initiator      │                       │     --responder      │
+ │     --host <IP>      │                       │                      │
+ └──────────────────────┘                       └──────────────────────┘
+```
+
+Both machines run the same binary. The **Responder** starts first and waits; the **Initiator** connects and drives the benchmark.
+
+#### Setup on Responder (Ubuntu Server)
+
+```bash
+# 1. Clone and build on the server
+git clone --recursive https://github.com/<your-user>/EDHOC-Hybrid.git
+cd EDHOC-Hybrid
+sudo apt-get install -y gcc make libsodium-dev
+make clean && make -j$(nproc)
+
+# 2. Open firewall for benchmark ports
+sudo ufw allow 19000:19999/tcp   # or: sudo iptables -A INPUT -p tcp --dport 19000:19999 -j ACCEPT
+
+# 3. Start Responder (waits for Initiator)
+./build/edhoc_hybrid 9 --responder
+# Optional: custom port
+./build/edhoc_hybrid 9 --responder --port 20000
+```
+
+#### Setup on Initiator (Raspberry Pi)
+
+```bash
+# 1. Clone and build on the Raspberry Pi
+git clone --recursive https://github.com/<your-user>/EDHOC-Hybrid.git
+cd EDHOC-Hybrid
+sudo apt-get install -y gcc make libsodium-dev
+make clean && make -j$(nproc)
+
+# 2. Run Initiator (connects to Responder)
+./build/edhoc_hybrid 9 --initiator --host <SERVER_IP>
+# Example:
+./build/edhoc_hybrid 9 --initiator --host 192.168.1.100
+# Optional: custom port (must match Responder)
+./build/edhoc_hybrid 9 --initiator --host 192.168.1.100 --port 20000
+```
+
+#### P2P Benchmark Output
+
+Each machine writes its own CSV:
+- **Responder:** `output/p2p_handshake_responder.csv`
+- **Initiator:** `output/p2p_handshake_initiator.csv`
+
+Columns: `type, role, processing_us, txrx_us, total_us, success_count`
+
+The benchmark runs all 5 handshake variants (Classic Type 0/3, PQ Type 0/3, Hybrid Type 3) with 50 iterations each. Key material is exchanged over a control channel at startup.
+
+#### Cross-Compilation for Raspberry Pi (optional)
+
+If you prefer to cross-compile on the server instead of building natively on the Pi:
+
+```bash
+# On Ubuntu server
+sudo apt-get install -y gcc-aarch64-linux-gnu
+make CC=aarch64-linux-gnu-gcc clean all
+# Copy binary to Raspberry Pi
+scp build/edhoc_hybrid pi@<PI_IP>:~/
+```
+
 Benchmark output CSVs (TCP client-server):
 - `output/benchmark_operations.csv`
 - `output/benchmark_overhead.csv`
@@ -109,7 +185,8 @@ EDHOC-Hybrid/
 │   ├── edhoc_type0_pq.h      # PQ KEM Sig-like
 │   ├── edhoc_type3_pq.h      # PQ KEM MAC-MAC
 │   ├── edhoc_type3_hybrid.h  # Hybrid MAC-MAC (ECDHE + KEM)
-│   └── edhoc_benchmark.h     # Benchmark header
+│   ├── edhoc_benchmark.h     # Benchmark header
+│   └── edhoc_benchmark_p2p.h # P2P Network Benchmark header
 ├── src/
 │   ├── main.c                # Menu + dispatcher (1–8)
 │   ├── edhoc_common.c
@@ -118,7 +195,8 @@ EDHOC-Hybrid/
 │   ├── edhoc_type0_pq.c
 │   ├── edhoc_type3_pq.c
 │   ├── edhoc_type3_hybrid.c  # Hybrid Type 3 implementation
-│   └── edhoc_benchmark.c     # Benchmark (TCP client-server)
+│   ├── edhoc_benchmark.c     # Benchmark (TCP client-server)
+│   └── edhoc_benchmark_p2p.c # P2P Network Benchmark (two machines)
 ├── lib/
 │   ├── PQClean/              # PQ KEM/Signature (ML-KEM-768, ML-DSA-65)
 │   └── uoscore-uedhoc/       # Core EDHOC/OSCORE library + nested externals
