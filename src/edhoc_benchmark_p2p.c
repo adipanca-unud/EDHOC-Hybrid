@@ -96,7 +96,7 @@ static int p2p_connect(const char *host, int port) {
 		struct hostent *h=gethostbyname(host); if(!h){close(fd);return -1;}
 		memcpy(&a.sin_addr,h->h_addr_list[0],h->h_length);
 	}
-	for(int r=0;r<100;r++){if(connect(fd,(struct sockaddr*)&a,sizeof(a))==0) return fd; usleep(50000);}
+	for(int r=0;r<100;r++){if(connect(fd,(struct sockaddr*)&a,sizeof(a))==0) return fd; struct timespec ts={0,50000*1000}; nanosleep(&ts,NULL);}
 	close(fd); return -1;
 }
 static void p2p_nodelay(int fd){int o=1;setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&o,sizeof(o));}

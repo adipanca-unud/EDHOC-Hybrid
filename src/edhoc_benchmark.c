@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <time.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -213,7 +214,7 @@ static int sock_connect_client(int port)
 	for (int retry = 0; retry < 50; retry++) {
 		if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0)
 			return fd;
-		usleep(1000); /* 1ms */
+			   { struct timespec ts = {0, 1000 * 1000}; nanosleep(&ts, NULL); } /* 1ms */
 	}
 	close(fd);
 	return -1;
@@ -2387,7 +2388,7 @@ static int sck_run_classic_handshake(int type_num, int base_port,
 		pthread_t tid_r, tid_i;
 		/* Start responder (server) first, then initiator (client) */
 		pthread_create(&tid_r, NULL, sck_classic_responder_thread, &r_data);
-		usleep(2000); /* 2ms to let server bind+listen */
+			   { struct timespec ts = {0, 2000 * 1000}; nanosleep(&ts, NULL); } /* 2ms to let server bind+listen */
 		pthread_create(&tid_i, NULL, sck_classic_initiator_thread, &i_data);
 
 		pthread_join(tid_i, NULL);
@@ -2517,7 +2518,7 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 
 			pthread_t tid_r, tid_i;
 			pthread_create(&tid_r, NULL, sck_pq0_responder_thread, &rd);
-			usleep(2000);
+					   { struct timespec ts = {0, 2000 * 1000}; nanosleep(&ts, NULL); }
 			pthread_create(&tid_i, NULL, sck_pq0_initiator_thread, &id);
 			pthread_join(tid_i, NULL);
 			pthread_join(tid_r, NULL);
@@ -2550,7 +2551,7 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 
 			pthread_t tid_r, tid_i;
 			pthread_create(&tid_r, NULL, sck_pq3_responder_thread, &rd);
-			usleep(2000);
+					   { struct timespec ts = {0, 2000 * 1000}; nanosleep(&ts, NULL); }
 			pthread_create(&tid_i, NULL, sck_pq3_initiator_thread, &id);
 			pthread_join(tid_i, NULL);
 			pthread_join(tid_r, NULL);
@@ -2658,7 +2659,7 @@ static int sck_run_hybrid_handshake(int base_port,
 
 		pthread_t tid_r, tid_i;
 		pthread_create(&tid_r, NULL, sck_hyb_responder_thread, &rd);
-		usleep(2000);
+			   { struct timespec ts = {0, 2000 * 1000}; nanosleep(&ts, NULL); }
 		pthread_create(&tid_i, NULL, sck_hyb_initiator_thread, &id);
 		pthread_join(tid_i, NULL);
 		pthread_join(tid_r, NULL);
