@@ -95,9 +95,9 @@ sudo apt-get install -y gcc make libsodium-dev
 make clean && make -j$(nproc)
 
 # 2. Open firewall for benchmark ports
-# Mode 9 uses control port PORT plus handshake ports up to PORT+1849.
-# For default PORT=19000, open 19000-20849.
-sudo ufw allow 19000:20849/tcp   # or: sudo iptables -A INPUT -p tcp --dport 19000:20849 -j ACCEPT
+# Mode 9 uses control port PORT plus handshake ports up to PORT+2799.
+# For default PORT=19000, open 19000-21799.
+sudo ufw allow 19000:21799/tcp   # or: sudo iptables -A INPUT -p tcp --dport 19000:21799 -j ACCEPT
 
 # 3. Start Responder (waits for Initiator)
 ./build/edhoc_hybrid 9 --responder

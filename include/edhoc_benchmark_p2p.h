@@ -35,8 +35,8 @@
 #define EDHOC_BENCHMARK_P2P_H
 
 /* Iteration counts for P2P benchmark */
-#define P2P_BENCH_ITERATIONS             100
-#define P2P_BENCH_HANDSHAKE_ITERATIONS   50
+#define P2P_BENCH_ITERATIONS             1000
+#define P2P_BENCH_HANDSHAKE_ITERATIONS   1000
 
 /* Output directory */
 #define P2P_BENCH_OUTPUT_DIR   "output"

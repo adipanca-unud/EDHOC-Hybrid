@@ -24,8 +24,8 @@
 #define EDHOC_BENCHMARK_H
 
 /* Same iteration counts as the in-memory benchmark */
-#define SOCK_BENCH_ITERATIONS             100
-#define SOCK_BENCH_HANDSHAKE_ITERATIONS   50
+#define SOCK_BENCH_ITERATIONS             1000
+#define SOCK_BENCH_HANDSHAKE_ITERATIONS   1000
 
 /* Output directory for socket benchmark CSVs */
 #define SOCK_BENCH_OUTPUT_DIR   "output"
