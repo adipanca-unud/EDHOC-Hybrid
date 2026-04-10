@@ -30,11 +30,19 @@ This repo vendors only the pieces we use: `uoscore-uedhoc` and `PQClean` (plus n
 ```bash
 git clone --recursive https://github.com/<your-user>/EDHOC-Hybrid.git
 cd EDHOC-Hybrid
-# If you pulled without --recursive
-git submodule update --init --recursive
+git checkout raspberrypi        # Switch to the benchmarking branch
+git submodule update --init --recursive   # If you pulled without --recursive
 ```
 
-## Build
+## Build (Quick Start)
+
+The easiest way to build — especially on Raspberry Pi — is to use the **setup script** which automatically patches the library and builds everything:
+
+```bash
+./setup.sh              # Applies patches + full build (recommended)
+```
+
+### Manual Build
 
 ```bash
 make                    # Build (default: USE_PQCLEAN=1, libsodium HKDF)
@@ -42,6 +50,15 @@ make USE_PQCLEAN=1 -j$(nproc)   # Explicit PQClean path
 make clean              # Clean application objects
 make lib-clean          # Clean everything (app + uoscore-uedhoc build)
 ```
+
+> **Important**: After a fresh clone, the `lib/uoscore-uedhoc` library needs a patch
+> for production benchmarking (disables verbose hex-dump output, enables -O2 optimization,
+> fixes compact25519 build on ARM). The patch is at `patches/uoscore-uedhoc.patch` and is
+> applied automatically by `./setup.sh`. To apply manually:
+> ```bash
+> git -C lib/uoscore-uedhoc apply "$(pwd)/patches/uoscore-uedhoc.patch"
+> make lib-clean && make -j$(nproc)
+> ```
 
 Notes:
 - liboqs is **not** vendored anymore. The supported/tested path is `USE_PQCLEAN=1` (default). If you experiment with `USE_PQCLEAN=0`, install liboqs separately and adjust include/library paths as needed.
@@ -91,8 +108,9 @@ Both machines run the same binary. The **Responder** starts first and waits; the
 # 1. Clone and build on the server
 git clone --recursive https://github.com/<your-user>/EDHOC-Hybrid.git
 cd EDHOC-Hybrid
+git checkout raspberrypi
 sudo apt-get install -y gcc make libsodium-dev
-make clean && make -j$(nproc)
+./setup.sh              # Apply patches + build
 
 # 2. Open firewall for benchmark ports
 # Mode 9 uses control port PORT plus handshake ports up to PORT+2799.
@@ -111,8 +129,9 @@ sudo ufw allow 19000:21799/tcp   # or: sudo iptables -A INPUT -p tcp --dport 190
 # 1. Clone and build on the Raspberry Pi
 git clone --recursive https://github.com/<your-user>/EDHOC-Hybrid.git
 cd EDHOC-Hybrid
+git checkout raspberrypi
 sudo apt-get install -y gcc make libsodium-dev
-make clean && make -j$(nproc)
+./setup.sh              # Apply patches + build
 
 # 2. Run Initiator (connects to Responder)
 ./build/edhoc_hybrid 9 --initiator --host <SERVER_IP>
