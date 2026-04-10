@@ -49,6 +49,24 @@ else
     echo "✓ Patch applied successfully."
 fi
 
+# ── Step 1b: Apply mbedTLS threading patch ───────────────────────────────────
+# mbedTLS PSA Crypto is NOT thread-safe by default. Our socket benchmarks run
+# initiator + responder in concurrent pthreads, both calling psa_xxx() APIs.
+# Without MBEDTLS_THREADING_C + MBEDTLS_THREADING_PTHREAD, concurrent key
+# slot access corrupts the heap → "free(): invalid next size (fast)" on ARM/RPi.
+MBEDTLS_PATCH_FILE="patches/mbedtls-threading.patch"
+MBEDTLS_DIR="$SUBMOD_DIR/externals/mbedtls"
+
+if [ -f "$MBEDTLS_PATCH_FILE" ] && [ -d "$MBEDTLS_DIR" ]; then
+    if grep -q '^#define MBEDTLS_THREADING_C' "$MBEDTLS_DIR/include/mbedtls/mbedtls_config.h" 2>/dev/null; then
+        echo "✓ mbedTLS threading patch already applied — skipping."
+    else
+        echo "→ Applying mbedTLS threading patch ..."
+        git -C "$MBEDTLS_DIR" apply "$SCRIPT_DIR/$MBEDTLS_PATCH_FILE"
+        echo "✓ mbedTLS threading patch applied successfully."
+    fi
+fi
+
 echo ""
 
 # ── Step 2: Build ────────────────────────────────────────────────────────────
