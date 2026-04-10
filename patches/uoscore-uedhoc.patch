@@ -1,0 +1,73 @@
+From 366dc95e361728ab3e4cd71bad85babfa4717a8d Mon Sep 17 00:00:00 2001
+From: Ubuntu <axl.pondz@gmail.com>
+Date: Fri, 10 Apr 2026 02:12:04 +0000
+Subject: [PATCH] fix: disable DEBUG_PRINT, use -O2 optimization, fix
+ compact25519 build
+
+- Change OPT from -O0 to -O2 for production benchmarking
+- Comment out DEBUG_PRINT to eliminate hex-dump I/O bottleneck
+  on resource-constrained devices (RPi) with 1000+ iterations
+- Add compact25519 sources to C_SOURCES for proper X25519 linking
+- Suppress conversion warnings for compact25519 on ARM toolchains
+---
+ Makefile           | 9 +++++++++
+ makefile_config.mk | 7 +++++--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index f88feef..a1f0127 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,10 +28,14 @@ $(shell mkdir -p $(DIR))
+ ################################################################################
+ # C Source files
+ 
++
+ C_SOURCES += $(wildcard src/edhoc/*.c)
+ C_SOURCES += $(wildcard src/oscore/*.c)
+ C_SOURCES += $(wildcard src/common/*.c)
+ C_SOURCES += $(wildcard src/cbor/*.c)
++# Tambahkan compact25519 sources agar fungsi X25519 ter-link
++C_SOURCES += $(wildcard externals/compact25519/src/*.c)
++C_SOURCES += $(wildcard externals/compact25519/src/c25519/*.c)
+ 
+ 
+ #$(info    \n C_SOURCES is $(C_SOURCES))
+@@ -137,6 +141,11 @@ C_INCLUDES += -Iinc
+ ifeq ($(findstring COMPACT25519,$(EXTENDED_CFLAGS)),COMPACT25519) 
+ C_INCLUDES += -Iexternals/compact25519/src/c25519/ 
+ C_INCLUDES += -Iexternals/compact25519/src/ 
++# compact25519 upstream code triggers conversion warnings on some GCC versions
++# (notably ARM/Raspberry Pi toolchains). Keep warnings enabled, but do not
++# fail the build for conversion-only diagnostics.
++EXTENDED_CFLAGS += -Wno-error=conversion
++EXTENDED_CFLAGS += -Wno-error=sign-conversion
+ endif
+ 
+ ifeq ($(findstring TINYCRYPT,$(EXTENDED_CFLAGS)),TINYCRYPT)
+diff --git a/makefile_config.mk b/makefile_config.mk
+index 0bc6951..374740d 100644
+--- a/makefile_config.mk
++++ b/makefile_config.mk
+@@ -19,13 +19,16 @@
+ ################################################################################ 
+ # Compiler optimization
+ ################################################################################ 
+-OPT = -O0
++OPT = -O2
+ 
+ 
+ ################################################################################
+ # Print helpful debug messages
+ ################################################################################
+-DEBUG_PRINT += -DDEBUG_PRINT
++# Disabled for benchmarking — hex-dump output causes severe I/O bottleneck
++# on resource-constrained devices (e.g. Raspberry Pi) with 1000+ iterations.
++# Uncomment for protocol debugging only:
++#DEBUG_PRINT += -DDEBUG_PRINT
+ 
+ ################################################################################
+ # Use Address Sanitizer, e.g. with native_sim
+-- 
+2.43.0
+

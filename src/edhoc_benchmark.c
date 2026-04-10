@@ -2894,6 +2894,17 @@ int run_edhoc_benchmark_socket(const char *role_suffix)
 	print_header("EDHOC Socket-based Benchmark (TCP localhost, All 5 Variants)");
 	printf("\n");
 	char buf[256];
+
+	/*
+	 * When two processes run mode-9 simultaneously on the same machine
+	 * (loopback test), both execute Phase B on localhost.  We offset the
+	 * base port for the "responder" role so the two port ranges never
+	 * overlap.  5 variant groups × 1000 ports ≈ 5000 ports consumed,
+	 * so a 6000-port gap is safe.
+	 */
+	int bp = SOCK_BENCH_BASE_PORT;
+	if (role_suffix && strcmp(role_suffix, "responder") == 0)
+		bp += 6000;   /* responder → 25000-29999, initiator → 19000-23999 */
 	snprintf(buf, sizeof(buf), "  Operations iterations : %d", SOCK_BENCH_ITERATIONS);
 	print_info(buf);
 	snprintf(buf, sizeof(buf), "  Handshake iterations  : %d", SOCK_BENCH_HANDSHAKE_ITERATIONS);
@@ -2950,10 +2961,10 @@ int run_edhoc_benchmark_socket(const char *role_suffix)
 	memset(&t0_hi, 0, sizeof(t0_hi)); memset(&t0_hr, 0, sizeof(t0_hr));
 	memset(&t3_hi, 0, sizeof(t3_hi)); memset(&t3_hr, 0, sizeof(t3_hr));
 
-	if (sck_run_classic_handshake(0, SOCK_BENCH_BASE_PORT,
+	if (sck_run_classic_handshake(0, bp,
 		&t0_oi, &t0_or, &t0_ohi, &t0_ohr, &t0_hi, &t0_hr) != 0)
 		return -1;
-	if (sck_run_classic_handshake(3, SOCK_BENCH_BASE_PORT + 100,
+	if (sck_run_classic_handshake(3, bp + 1000,
 		&t3_oi, &t3_or, &t3_ohi, &t3_ohr, &t3_hi, &t3_hr) != 0)
 		return -1;
 
@@ -2966,10 +2977,10 @@ int run_edhoc_benchmark_socket(const char *role_suffix)
 	memset(&t0p_hi, 0, sizeof(t0p_hi)); memset(&t0p_hr, 0, sizeof(t0p_hr));
 	memset(&t3p_hi, 0, sizeof(t3p_hi)); memset(&t3p_hr, 0, sizeof(t3p_hr));
 
-	if (sck_run_pq_handshake(0, SOCK_BENCH_BASE_PORT + 200,
+	if (sck_run_pq_handshake(0, bp + 2000,
 		&t0p_oi, &t0p_or, &t0p_ohi, &t0p_ohr, &t0p_hi, &t0p_hr) != 0)
 		return -1;
-	if (sck_run_pq_handshake(3, SOCK_BENCH_BASE_PORT + 300,
+	if (sck_run_pq_handshake(3, bp + 3000,
 		&t3p_oi, &t3p_or, &t3p_ohi, &t3p_ohr, &t3p_hi, &t3p_hr) != 0)
 		return -1;
 
@@ -2980,7 +2991,7 @@ int run_edhoc_benchmark_socket(const char *role_suffix)
 	memset(&th_ohi, 0, sizeof(th_ohi)); memset(&th_ohr, 0, sizeof(th_ohr));
 	memset(&th_hi, 0, sizeof(th_hi)); memset(&th_hr, 0, sizeof(th_hr));
 
-	if (sck_run_hybrid_handshake(SOCK_BENCH_BASE_PORT + 400,
+	if (sck_run_hybrid_handshake(bp + 4000,
 		&th_oi, &th_or, &th_ohi, &th_ohr, &th_hi, &th_hr) != 0)
 		return -1;
 
