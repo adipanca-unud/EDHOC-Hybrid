@@ -30,6 +30,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -78,6 +79,9 @@ static int p2p_send(int fd, const uint8_t *d, uint32_t len) {
 	return 0;
 }
 static int p2p_recv(int fd, uint8_t *buf, uint32_t bsz, uint32_t *olen) {
+	/* Set 30-second receive timeout so we never block forever */
+	struct timeval tv = {30, 0};
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	uint32_t nl, g=0;
 	while (g<4) { ssize_t n=recv(fd,((uint8_t*)&nl)+g,4-g,0); if(n<=0) return -1; g+=(uint32_t)n; }
 	uint32_t ml=ntohl(nl); if(ml>bsz) return -1; g=0;
@@ -100,6 +104,12 @@ static int p2p_connect(const char *host, int port) {
 	}
 	for(int r=0;r<100;r++){if(connect(fd,(struct sockaddr*)&a,sizeof(a))==0) return fd; struct timespec ts={0,50000*1000}; nanosleep(&ts,NULL);}
 	close(fd); return -1;
+}
+static int p2p_accept(int listen_fd) {
+	/* Set 30-second accept timeout so we never block forever */
+	struct timeval tv = {30, 0};
+	setsockopt(listen_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	return accept(listen_fd, NULL, NULL);
 }
 static void p2p_nodelay(int fd){int o=1;setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&o,sizeof(o));}
 
@@ -209,7 +219,7 @@ static struct p2p_hs_result p2p_classic_initiator(int type, const char *host, in
 static struct p2p_hs_result p2p_classic_responder(int type, int listen_fd)
 {
 	struct p2p_hs_result res = {0};
-	_p2p_fd = accept(listen_fd, NULL, NULL);
+	_p2p_fd = p2p_accept(listen_fd);
 	if (_p2p_fd < 0) return res;
 	p2p_nodelay(_p2p_fd);
 	_p2p_txrx = 0;
@@ -390,7 +400,7 @@ static struct p2p_hs_result p2p_pq0_responder(int listen_fd,
 	const uint8_t *resp_sig_pk, const uint8_t *resp_sig_sk, const uint8_t *init_sig_pk)
 {
 	struct p2p_hs_result res={0};
-	int fd=accept(listen_fd,NULL,NULL); if(fd<0)return res;
+	int fd=p2p_accept(listen_fd); if(fd<0)return res;
 	p2p_nodelay(fd);
 	struct pq_party_ctx ctx; memset(&ctx,0,sizeof(ctx));
 	memcpy(ctx.lt_pk,resp_lt_pk,PQ_KEM_PK_LEN);memcpy(ctx.lt_sk,resp_lt_sk,PQ_KEM_SK_LEN);
@@ -556,7 +566,7 @@ static struct p2p_hs_result p2p_pq3_responder(int lfd,
 	const uint8_t *r_pk, const uint8_t *r_sk, const uint8_t *i_pk)
 {
 	struct p2p_hs_result res={0};
-	int fd=accept(lfd,NULL,NULL);if(fd<0)return res;
+	int fd=p2p_accept(lfd);if(fd<0)return res;
 	p2p_nodelay(fd);
 	struct pq3_party_ctx ctx;memset(&ctx,0,sizeof(ctx));
 	memcpy(ctx.lt_pk,r_pk,PQ_KEM_PK_LEN);memcpy(ctx.lt_sk,r_sk,PQ_KEM_SK_LEN);
@@ -759,7 +769,7 @@ static struct p2p_hs_result p2p_hyb_responder(int lfd,
 	const uint8_t *r_esk, const uint8_t *r_epk)
 {
 	struct p2p_hs_result res={0};
-	int fd=accept(lfd,NULL,NULL);if(fd<0)return res;
+	int fd=p2p_accept(lfd);if(fd<0)return res;
 	p2p_nodelay(fd);
 	struct hybrid_party_ctx ctx;memset(&ctx,0,sizeof(ctx));
 	memcpy(ctx.static_sk,r_ssk,32);memcpy(ctx.static_pk,r_spk,32);
@@ -904,15 +914,21 @@ int run_p2p_responder(int port)
 	for(int v=0;v<5;v++){
 		snprintf(buf,sizeof(buf),"[%d/5] %s",v+1,VARIANT_NAMES[v]); print_header(buf);
 		/* Tell Initiator which variant + port */
-		int hs_port = port + 1000 + v*200;
+		int hs_port = port + 1000 + v;
 		snprintf(buf,sizeof(buf),"%d:%d",v,hs_port);
 		ctrl_s(cfd,buf);
 		ctrl_r(cfd,cb,sizeof(cb)); /* READY */
 
+		/* Single listen socket per variant — reuse for all iterations */
+		int lfd = p2p_server(hs_port);
+		if(lfd<0){
+			for(int iter=0;iter<P2P_BENCH_HANDSHAKE_ITERATIONS;iter++){
+				ctrl_s(cfd,"FAIL"); ctrl_r(cfd,cb,sizeof(cb));
+			}
+			continue;
+		}
+
 		for(int iter=0;iter<P2P_BENCH_HANDSHAKE_ITERATIONS;iter++){
-			int ip = hs_port + iter;
-			int lfd = p2p_server(ip);
-			if(lfd<0){ctrl_s(cfd,"FAIL");continue;}
 			ctrl_s(cfd,P2P_TAG_READY); /* tell Initiator to connect */
 
 			struct p2p_hs_result r;
@@ -929,13 +945,13 @@ int run_p2p_responder(int port)
 			} break;
 			default: r=(struct p2p_hs_result){0};
 			}
-			close(lfd);
 			if(r.success){
 				acc[v].total_wall+=r.wall_us; acc[v].total_cpu+=r.cpu_us;
 				acc[v].total_txrx+=r.txrx_us; acc[v].success_count++;
 			}
 			ctrl_r(cfd,cb,sizeof(cb)); /* ITER_OK */
 		}
+		close(lfd);
 		snprintf(buf,sizeof(buf),"%s: %d/%d ok",VARIANT_NAMES[v],acc[v].success_count,P2P_BENCH_HANDSHAKE_ITERATIONS);
 		print_success(buf);
 	}
@@ -1010,19 +1026,18 @@ int run_p2p_initiator(const char *host, int port)
 			ctrl_r(cfd,cb,sizeof(cb)); /* READY or FAIL */
 			if(strcmp(cb,"FAIL")==0){ctrl_s(cfd,P2P_TAG_ITER_OK);continue;}
 
-			int ip = hs_port + iter;
 			struct p2p_hs_result r;
 			switch(var_id){
-			case 0: r=p2p_classic_initiator(0,host,ip); break;
-			case 1: r=p2p_classic_initiator(3,host,ip); break;
-			case 2: r=p2p_pq0_initiator(host,ip,i_lt_pk,i_lt_sk,r_lt_pk,i_sig_pk,i_sig_sk,r_sig_pk); break;
-			case 3: r=p2p_pq3_initiator(host,ip,i_lt_pk,i_lt_sk,r_lt_pk); break;
+			case 0: r=p2p_classic_initiator(0,host,hs_port); break;
+			case 1: r=p2p_classic_initiator(3,host,hs_port); break;
+			case 2: r=p2p_pq0_initiator(host,hs_port,i_lt_pk,i_lt_sk,r_lt_pk,i_sig_pk,i_sig_sk,r_sig_pk); break;
+			case 3: r=p2p_pq3_initiator(host,hs_port,i_lt_pk,i_lt_sk,r_lt_pk); break;
 			case 4: {
 				uint8_t esk[32],epk[32],kpk[PQ_KEM_PK_LEN],ksk[PQ_KEM_SK_LEN];
 				struct byte_array sk={.len=32,.ptr=esk},pk={.len=32,.ptr=epk};
 				ephemeral_dh_key_gen(X25519,300+iter,&sk,&pk);
 				pq_kem_keygen(kpk,ksk);
-				r=p2p_hyb_initiator(host,ip,i_ssk,i_spk,r_spk,esk,epk,kpk,ksk);
+				r=p2p_hyb_initiator(host,hs_port,i_ssk,i_spk,r_spk,esk,epk,kpk,ksk);
 			} break;
 			default: r=(struct p2p_hs_result){0};
 			}
