@@ -46,6 +46,15 @@
 #include "common/crypto_wrapper.h"
 #include "edhoc/suites.h"
 
+/*
+ * PQ threads (ML-DSA-65 sign/verify) allocate ~55+ KB of stack for polyvec
+ * matrices, plus ~31 KB for our own local buffers.  The default pthread
+ * stack on ARM (Raspberry Pi) is only 128 KB, which is not enough and
+ * causes heap-metadata corruption ("free(): invalid next size (fast)").
+ * We use 1 MB per thread to be safe.
+ */
+#define BENCH_THREAD_STACK_SIZE (1U << 20) /* 1 MiB */
+
 /* =============================================================================
  * Timing utilities (identical to edhoc_benchmark.c)
  * =============================================================================
@@ -2490,6 +2499,11 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 	double total_i_txrx = 0, total_r_txrx = 0;
 	int success_count = 0;
 
+	/* PQ threads need a large stack (ML-DSA-65 polyvec matrices ≈ 55 KB) */
+	pthread_attr_t tattr;
+	pthread_attr_init(&tattr);
+	pthread_attr_setstacksize(&tattr, BENCH_THREAD_STACK_SIZE);
+
 	for (int iter = 0; iter < SOCK_BENCH_HANDSHAKE_ITERATIONS; iter++) {
 		int port = base_port + iter;
 
@@ -2517,9 +2531,9 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 			rd.ctx = &resp_ctx; rd.port = port;
 
 			pthread_t tid_r, tid_i;
-			pthread_create(&tid_r, NULL, sck_pq0_responder_thread, &rd);
+			pthread_create(&tid_r, &tattr, sck_pq0_responder_thread, &rd);
 					   { struct timespec ts = {0, 2000 * 1000}; nanosleep(&ts, NULL); }
-			pthread_create(&tid_i, NULL, sck_pq0_initiator_thread, &id);
+			pthread_create(&tid_i, &tattr, sck_pq0_initiator_thread, &id);
 			pthread_join(tid_i, NULL);
 			pthread_join(tid_r, NULL);
 
@@ -2550,9 +2564,9 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 			rd.ctx = &resp_ctx; rd.port = port;
 
 			pthread_t tid_r, tid_i;
-			pthread_create(&tid_r, NULL, sck_pq3_responder_thread, &rd);
+			pthread_create(&tid_r, &tattr, sck_pq3_responder_thread, &rd);
 					   { struct timespec ts = {0, 2000 * 1000}; nanosleep(&ts, NULL); }
-			pthread_create(&tid_i, NULL, sck_pq3_initiator_thread, &id);
+			pthread_create(&tid_i, &tattr, sck_pq3_initiator_thread, &id);
 			pthread_join(tid_i, NULL);
 			pthread_join(tid_r, NULL);
 
@@ -2568,7 +2582,7 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 		}
 	}
 
-	if (success_count == 0) { print_error("All PQ socket handshake failed!"); return -1; }
+	if (success_count == 0) { print_error("All PQ socket handshake failed!"); pthread_attr_destroy(&tattr); return -1; }
 
 	double n = (double)success_count;
 	double cpu_i = total_i_cpu / n, cpu_r = total_r_cpu / n;
@@ -2597,6 +2611,7 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 	snprintf(buf, sizeof(buf), "PQ Type %d socket handshake: %d/%d successful.",
 		 pq_type_num, success_count, SOCK_BENCH_HANDSHAKE_ITERATIONS);
 	print_success(buf);
+	pthread_attr_destroy(&tattr);
 	return 0;
 }
 
@@ -2628,6 +2643,11 @@ static int sck_run_hybrid_handshake(int base_port,
 	double total_i_txrx = 0, total_r_txrx = 0;
 	int success_count = 0;
 
+	/* Hybrid threads use ML-KEM-768 which needs extra stack on ARM */
+	pthread_attr_t tattr;
+	pthread_attr_init(&tattr);
+	pthread_attr_setstacksize(&tattr, BENCH_THREAD_STACK_SIZE);
+
 	for (int iter = 0; iter < SOCK_BENCH_HANDSHAKE_ITERATIONS; iter++) {
 		int port = base_port + iter;
 
@@ -2658,9 +2678,9 @@ static int sck_run_hybrid_handshake(int base_port,
 		rd.ctx = &resp_ctx; rd.port = port;
 
 		pthread_t tid_r, tid_i;
-		pthread_create(&tid_r, NULL, sck_hyb_responder_thread, &rd);
+		pthread_create(&tid_r, &tattr, sck_hyb_responder_thread, &rd);
 			   { struct timespec ts = {0, 2000 * 1000}; nanosleep(&ts, NULL); }
-		pthread_create(&tid_i, NULL, sck_hyb_initiator_thread, &id);
+		pthread_create(&tid_i, &tattr, sck_hyb_initiator_thread, &id);
 		pthread_join(tid_i, NULL);
 		pthread_join(tid_r, NULL);
 
@@ -2675,7 +2695,7 @@ static int sck_run_hybrid_handshake(int base_port,
 		}
 	}
 
-	if (success_count == 0) { print_error("All Hybrid socket handshake failed!"); return -1; }
+	if (success_count == 0) { print_error("All Hybrid socket handshake failed!"); pthread_attr_destroy(&tattr); return -1; }
 
 	double n = (double)success_count;
 	double cpu_i = total_i_cpu / n, cpu_r = total_r_cpu / n;
@@ -2706,6 +2726,7 @@ static int sck_run_hybrid_handshake(int base_port,
 	snprintf(buf, sizeof(buf), "Hybrid socket handshake: %d/%d successful.",
 		 success_count, SOCK_BENCH_HANDSHAKE_ITERATIONS);
 	print_success(buf);
+	pthread_attr_destroy(&tattr);
 	return 0;
 }
 
