@@ -1,0 +1,20 @@
+
+multipass launch --network en0 --name routering
+
+multipass list
+
+multipass shell routering
+
+sudo sysctl -w net.ipv4.ip_forward=1
+
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-edhoc-forward.conf
+
+sudo sysctl --system
+
+sudo iptables -t nat -A PREROUTING -p tcp -d 192.168.0.115 --dport 19000:20849 -j DNAT --to-destination 192.168.64.33
+
+sudo iptables -A FORWARD -p tcp -d 192.168.64.33 --dport 19000:20849 -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+
+sudo iptables -A FORWARD -p tcp -s 192.168.64.33 --sport 19000:20849 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+sudo iptables -t nat -A POSTROUTING -p tcp -d 192.168.64.33 --dport 19000:20849 -j MASQUERADE
