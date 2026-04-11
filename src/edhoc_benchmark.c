@@ -2741,6 +2741,7 @@ static int sck_run_hybrid_handshake(int base_port,
 		(OP).avg_us * (double)(OP).calls, (OP).count)
 
 static int sck_write_operations_csv(const char *path,
+	const char *role_suffix,
 	struct sck_ops_benchmark *t0i, struct sck_ops_benchmark *t0r,
 	struct sck_ops_benchmark *t3i, struct sck_ops_benchmark *t3r,
 	struct sck_ops_benchmark *t0pi, struct sck_ops_benchmark *t0pr,
@@ -2751,7 +2752,15 @@ static int sck_write_operations_csv(const char *path,
 	if (!fp) return -1;
 	fprintf(fp, "type,role,operation,avg_time_us,calls_per_handshake,total_per_handshake_us,iterations\n");
 
+	/* Determine which roles to include based on role_suffix */
+	int write_initiator = 1, write_responder = 1;
+	if (role_suffix && strcmp(role_suffix, "initiator") == 0)
+		write_responder = 0;
+	else if (role_suffix && strcmp(role_suffix, "responder") == 0)
+		write_initiator = 0;
+
 	/* Classic Type 0 */
+	if (write_initiator) {
 	SWRITE_OP("Type0_SigSig","Initiator","KeyGen",t0i->keygen);
 	SWRITE_OP("Type0_SigSig","Initiator","Encap",t0i->pq_encaps);
 	SWRITE_OP("Type0_SigSig","Initiator","Decap",t0i->pq_decaps);
@@ -2762,6 +2771,8 @@ static int sck_write_operations_csv(const char *path,
 	SWRITE_OP("Type0_SigSig","Initiator","ECDH",t0i->ecdh);
 	SWRITE_OP("Type0_SigSig","Initiator","HKDF",t0i->hkdf);
 	SWRITE_OP("Type0_SigSig","Initiator","Hash",t0i->hash);
+	}
+	if (write_responder) {
 	SWRITE_OP("Type0_SigSig","Responder","KeyGen",t0r->keygen);
 	SWRITE_OP("Type0_SigSig","Responder","Encap",t0r->pq_encaps);
 	SWRITE_OP("Type0_SigSig","Responder","Decap",t0r->pq_decaps);
@@ -2772,8 +2783,10 @@ static int sck_write_operations_csv(const char *path,
 	SWRITE_OP("Type0_SigSig","Responder","ECDH",t0r->ecdh);
 	SWRITE_OP("Type0_SigSig","Responder","HKDF",t0r->hkdf);
 	SWRITE_OP("Type0_SigSig","Responder","Hash",t0r->hash);
+	}
 
 	/* Classic Type 3 */
+	if (write_initiator) {
 	SWRITE_OP("Type3_MACMAC","Initiator","KeyGen",t3i->keygen);
 	SWRITE_OP("Type3_MACMAC","Initiator","Encap",t3i->pq_encaps);
 	SWRITE_OP("Type3_MACMAC","Initiator","Decap",t3i->pq_decaps);
@@ -2784,6 +2797,8 @@ static int sck_write_operations_csv(const char *path,
 	SWRITE_OP("Type3_MACMAC","Initiator","ECDH",t3i->ecdh);
 	SWRITE_OP("Type3_MACMAC","Initiator","HKDF",t3i->hkdf);
 	SWRITE_OP("Type3_MACMAC","Initiator","Hash",t3i->hash);
+	}
+	if (write_responder) {
 	SWRITE_OP("Type3_MACMAC","Responder","KeyGen",t3r->keygen);
 	SWRITE_OP("Type3_MACMAC","Responder","Encap",t3r->pq_encaps);
 	SWRITE_OP("Type3_MACMAC","Responder","Decap",t3r->pq_decaps);
@@ -2794,8 +2809,10 @@ static int sck_write_operations_csv(const char *path,
 	SWRITE_OP("Type3_MACMAC","Responder","ECDH",t3r->ecdh);
 	SWRITE_OP("Type3_MACMAC","Responder","HKDF",t3r->hkdf);
 	SWRITE_OP("Type3_MACMAC","Responder","Hash",t3r->hash);
+	}
 
 	/* PQ Type 0 */
+	if (write_initiator) {
 	SWRITE_OP("Type0_PQ","Initiator","PQ_KeyGen",t0pi->pq_keygen);
 	SWRITE_OP("Type0_PQ","Initiator","PQ_Encaps",t0pi->pq_encaps);
 	SWRITE_OP("Type0_PQ","Initiator","PQ_Decaps",t0pi->pq_decaps);
@@ -2805,6 +2822,8 @@ static int sck_write_operations_csv(const char *path,
 	SWRITE_OP("Type0_PQ","Initiator","PQ_AEAD_Dec",t0pi->pq_aead_dec);
 	SWRITE_OP("Type0_PQ","Initiator","PQ_HKDF",t0pi->pq_hkdf);
 	SWRITE_OP("Type0_PQ","Initiator","PQ_Hash",t0pi->pq_hash);
+	}
+	if (write_responder) {
 	SWRITE_OP("Type0_PQ","Responder","PQ_KeyGen",t0pr->pq_keygen);
 	SWRITE_OP("Type0_PQ","Responder","PQ_Encaps",t0pr->pq_encaps);
 	SWRITE_OP("Type0_PQ","Responder","PQ_Decaps",t0pr->pq_decaps);
@@ -2814,8 +2833,10 @@ static int sck_write_operations_csv(const char *path,
 	SWRITE_OP("Type0_PQ","Responder","PQ_AEAD_Dec",t0pr->pq_aead_dec);
 	SWRITE_OP("Type0_PQ","Responder","PQ_HKDF",t0pr->pq_hkdf);
 	SWRITE_OP("Type0_PQ","Responder","PQ_Hash",t0pr->pq_hash);
+	}
 
 	/* PQ Type 3 */
+	if (write_initiator) {
 	SWRITE_OP("Type3_PQ","Initiator","PQ_KeyGen",t3pi->pq_keygen);
 	SWRITE_OP("Type3_PQ","Initiator","PQ_Encaps",t3pi->pq_encaps);
 	SWRITE_OP("Type3_PQ","Initiator","PQ_Decaps",t3pi->pq_decaps);
@@ -2825,6 +2846,8 @@ static int sck_write_operations_csv(const char *path,
 	SWRITE_OP("Type3_PQ","Initiator","PQ_AEAD_Dec",t3pi->pq_aead_dec);
 	SWRITE_OP("Type3_PQ","Initiator","PQ_HKDF",t3pi->pq_hkdf);
 	SWRITE_OP("Type3_PQ","Initiator","PQ_Hash",t3pi->pq_hash);
+	}
+	if (write_responder) {
 	SWRITE_OP("Type3_PQ","Responder","PQ_KeyGen",t3pr->pq_keygen);
 	SWRITE_OP("Type3_PQ","Responder","PQ_Encaps",t3pr->pq_encaps);
 	SWRITE_OP("Type3_PQ","Responder","PQ_Decaps",t3pr->pq_decaps);
@@ -2834,8 +2857,10 @@ static int sck_write_operations_csv(const char *path,
 	SWRITE_OP("Type3_PQ","Responder","PQ_AEAD_Dec",t3pr->pq_aead_dec);
 	SWRITE_OP("Type3_PQ","Responder","PQ_HKDF",t3pr->pq_hkdf);
 	SWRITE_OP("Type3_PQ","Responder","PQ_Hash",t3pr->pq_hash);
+	}
 
 	/* Hybrid Type 3 */
+	if (write_initiator) {
 	SWRITE_OP("Type3_Hybrid","Initiator","KeyGen",thi->keygen);
 	SWRITE_OP("Type3_Hybrid","Initiator","AEAD_Enc",thi->aead_enc);
 	SWRITE_OP("Type3_Hybrid","Initiator","AEAD_Dec",thi->aead_dec);
@@ -2845,6 +2870,8 @@ static int sck_write_operations_csv(const char *path,
 	SWRITE_OP("Type3_Hybrid","Initiator","PQ_KeyGen",thi->pq_keygen);
 	SWRITE_OP("Type3_Hybrid","Initiator","PQ_Encaps",thi->pq_encaps);
 	SWRITE_OP("Type3_Hybrid","Initiator","PQ_Decaps",thi->pq_decaps);
+	}
+	if (write_responder) {
 	SWRITE_OP("Type3_Hybrid","Responder","KeyGen",thr->keygen);
 	SWRITE_OP("Type3_Hybrid","Responder","AEAD_Enc",thr->aead_enc);
 	SWRITE_OP("Type3_Hybrid","Responder","AEAD_Dec",thr->aead_dec);
@@ -2854,12 +2881,14 @@ static int sck_write_operations_csv(const char *path,
 	SWRITE_OP("Type3_Hybrid","Responder","PQ_KeyGen",thr->pq_keygen);
 	SWRITE_OP("Type3_Hybrid","Responder","PQ_Encaps",thr->pq_encaps);
 	SWRITE_OP("Type3_Hybrid","Responder","PQ_Decaps",thr->pq_decaps);
+	}
 
 	fclose(fp);
 	return 0;
 }
 
 static int sck_write_overhead_csv(const char *path,
+	const char *role_suffix,
 	struct sck_overhead_benchmark *t0i, struct sck_overhead_benchmark *t0r,
 	struct sck_overhead_benchmark *t3i, struct sck_overhead_benchmark *t3r,
 	struct sck_overhead_benchmark *t0pi, struct sck_overhead_benchmark *t0pr,
@@ -2869,21 +2898,40 @@ static int sck_write_overhead_csv(const char *path,
 	FILE *fp = fopen(path, "w");
 	if (!fp) return -1;
 	fprintf(fp, "type,role,cpu_time_us,memory_bytes,memory_note\n");
-	fprintf(fp, "Type0_SigSig,Initiator,%.3f,%ld,estimated_stack_heap\n", t0i->cpu_us, t0i->memory_bytes);
-	fprintf(fp, "Type0_SigSig,Responder,%.3f,%ld,estimated_stack_heap\n", t0r->cpu_us, t0r->memory_bytes);
-	fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%ld,estimated_stack_heap\n", t3i->cpu_us, t3i->memory_bytes);
-	fprintf(fp, "Type3_MACMAC,Responder,%.3f,%ld,estimated_stack_heap\n", t3r->cpu_us, t3r->memory_bytes);
-	fprintf(fp, "Type0_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n", t0pi->cpu_us, t0pi->memory_bytes);
-	fprintf(fp, "Type0_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n", t0pr->cpu_us, t0pr->memory_bytes);
-	fprintf(fp, "Type3_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n", t3pi->cpu_us, t3pi->memory_bytes);
-	fprintf(fp, "Type3_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n", t3pr->cpu_us, t3pr->memory_bytes);
-	fprintf(fp, "Type3_Hybrid,Initiator,%.3f,%ld,estimated_stack_heap_hybrid\n", thi->cpu_us, thi->memory_bytes);
-	fprintf(fp, "Type3_Hybrid,Responder,%.3f,%ld,estimated_stack_heap_hybrid\n", thr->cpu_us, thr->memory_bytes);
+
+	/* Determine which roles to include based on role_suffix */
+	int write_initiator = 1, write_responder = 1;
+	if (role_suffix && strcmp(role_suffix, "initiator") == 0)
+		write_responder = 0;
+	else if (role_suffix && strcmp(role_suffix, "responder") == 0)
+		write_initiator = 0;
+
+	if (write_initiator)
+		fprintf(fp, "Type0_SigSig,Initiator,%.3f,%ld,estimated_stack_heap\n", t0i->cpu_us, t0i->memory_bytes);
+	if (write_responder)
+		fprintf(fp, "Type0_SigSig,Responder,%.3f,%ld,estimated_stack_heap\n", t0r->cpu_us, t0r->memory_bytes);
+	if (write_initiator)
+		fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%ld,estimated_stack_heap\n", t3i->cpu_us, t3i->memory_bytes);
+	if (write_responder)
+		fprintf(fp, "Type3_MACMAC,Responder,%.3f,%ld,estimated_stack_heap\n", t3r->cpu_us, t3r->memory_bytes);
+	if (write_initiator)
+		fprintf(fp, "Type0_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n", t0pi->cpu_us, t0pi->memory_bytes);
+	if (write_responder)
+		fprintf(fp, "Type0_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n", t0pr->cpu_us, t0pr->memory_bytes);
+	if (write_initiator)
+		fprintf(fp, "Type3_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n", t3pi->cpu_us, t3pi->memory_bytes);
+	if (write_responder)
+		fprintf(fp, "Type3_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n", t3pr->cpu_us, t3pr->memory_bytes);
+	if (write_initiator)
+		fprintf(fp, "Type3_Hybrid,Initiator,%.3f,%ld,estimated_stack_heap_hybrid\n", thi->cpu_us, thi->memory_bytes);
+	if (write_responder)
+		fprintf(fp, "Type3_Hybrid,Responder,%.3f,%ld,estimated_stack_heap_hybrid\n", thr->cpu_us, thr->memory_bytes);
 	fclose(fp);
 	return 0;
 }
 
 static int sck_write_handshake_csv(const char *path,
+	const char *role_suffix,
 	struct sck_handshake_benchmark *t0i, struct sck_handshake_benchmark *t0r,
 	struct sck_handshake_benchmark *t3i, struct sck_handshake_benchmark *t3r,
 	struct sck_handshake_benchmark *t0pi, struct sck_handshake_benchmark *t0pr,
@@ -2893,13 +2941,26 @@ static int sck_write_handshake_csv(const char *path,
 	FILE *fp = fopen(path, "w");
 	if (!fp) return -1;
 	fprintf(fp, "type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us\n");
+
+	/* Determine which roles to include based on role_suffix */
+	int write_initiator = 1, write_responder = 1;
+	if (role_suffix && strcmp(role_suffix, "initiator") == 0)
+		write_responder = 0;
+	else if (role_suffix && strcmp(role_suffix, "responder") == 0)
+		write_initiator = 0;
+
 	#define WHS(T,R,D) fprintf(fp, "%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f\n", T, R, \
 		(D)->processing_us, (D)->txrx_us, (D)->precomputation_us, (D)->overhead_us, (D)->total_us)
-	WHS("Type0_SigSig","Initiator",t0i); WHS("Type0_SigSig","Responder",t0r);
-	WHS("Type3_MACMAC","Initiator",t3i); WHS("Type3_MACMAC","Responder",t3r);
-	WHS("Type0_PQ","Initiator",t0pi);     WHS("Type0_PQ","Responder",t0pr);
-	WHS("Type3_PQ","Initiator",t3pi);     WHS("Type3_PQ","Responder",t3pr);
-	WHS("Type3_Hybrid","Initiator",thi);  WHS("Type3_Hybrid","Responder",thr);
+	if (write_initiator) WHS("Type0_SigSig","Initiator",t0i);
+	if (write_responder) WHS("Type0_SigSig","Responder",t0r);
+	if (write_initiator) WHS("Type3_MACMAC","Initiator",t3i);
+	if (write_responder) WHS("Type3_MACMAC","Responder",t3r);
+	if (write_initiator) WHS("Type0_PQ","Initiator",t0pi);
+	if (write_responder) WHS("Type0_PQ","Responder",t0pr);
+	if (write_initiator) WHS("Type3_PQ","Initiator",t3pi);
+	if (write_responder) WHS("Type3_PQ","Responder",t3pr);
+	if (write_initiator) WHS("Type3_Hybrid","Initiator",thi);
+	if (write_responder) WHS("Type3_Hybrid","Responder",thr);
 	#undef WHS
 	fclose(fp);
 	return 0;
@@ -3036,19 +3097,19 @@ int run_edhoc_benchmark_socket(const char *role_suffix)
 	}
 
 	int ret;
-	ret = sck_write_operations_csv(csv_ops,
+	ret = sck_write_operations_csv(csv_ops, role_suffix,
 		&t0_oi, &t0_or, &t3_oi, &t3_or,
 		&t0p_oi, &t0p_or, &t3p_oi, &t3p_or,
 		&th_oi, &th_or);
 	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", csv_ops); print_success(buf); }
 
-	ret = sck_write_overhead_csv(csv_ovh,
+	ret = sck_write_overhead_csv(csv_ovh, role_suffix,
 		&t0_ohi, &t0_ohr, &t3_ohi, &t3_ohr,
 		&t0p_ohi, &t0p_ohr, &t3p_ohi, &t3p_ohr,
 		&th_ohi, &th_ohr);
 	if (ret == 0) { snprintf(buf, sizeof(buf), "Written: %s", csv_ovh); print_success(buf); }
 
-	ret = sck_write_handshake_csv(csv_hs,
+	ret = sck_write_handshake_csv(csv_hs, role_suffix,
 		&t0_hi, &t0_hr, &t3_hi, &t3_hr,
 		&t0p_hi, &t0p_hr, &t3p_hi, &t3p_hr,
 		&th_hi, &th_hr);
