@@ -1185,8 +1185,8 @@ int run_p2p_responder(int port)
 
 	/* Write CSV */
 	p2p_write_hs_csv(P2P_BENCH_OUTPUT_DIR "/p2p_handshake_responder.csv","Responder",VARIANT_NAMES,acc,5,&precomp);
-	p2p_write_overhead_csv(P2P_BENCH_OUTPUT_DIR "/benchmark_overhead_responder.csv","Responder",acc,&precomp,0);
-	p2p_write_operations_csv(P2P_BENCH_OUTPUT_DIR "/benchmark_operations_responder.csv","Responder",acc,&precomp);
+	p2p_write_overhead_csv(P2P_BENCH_OUTPUT_DIR "/p2p_overhead_responder.csv","Responder",acc,&precomp,0);
+	p2p_write_operations_csv(P2P_BENCH_OUTPUT_DIR "/p2p_operations_responder.csv","Responder",acc,&precomp);
 
 	printf("\n"); print_header("Responder — Handshake Summary (µs, avg)");
 	printf("  %-16s %14s %14s %14s %14s %14s %6s\n","Type","Processing","TxRx","Precompute","Overhead","Total","N");
@@ -1293,8 +1293,8 @@ int run_p2p_initiator(const char *host, int port)
 
 	/* Write CSV */
 	p2p_write_hs_csv(P2P_BENCH_OUTPUT_DIR "/p2p_handshake_initiator.csv","Initiator",VARIANT_NAMES,acc,5,&precomp);
-	p2p_write_overhead_csv(P2P_BENCH_OUTPUT_DIR "/benchmark_overhead_initiator.csv","Initiator",acc,&precomp,1);
-	p2p_write_operations_csv(P2P_BENCH_OUTPUT_DIR "/benchmark_operations_initiator.csv","Initiator",acc,&precomp);
+	p2p_write_overhead_csv(P2P_BENCH_OUTPUT_DIR "/p2p_overhead_initiator.csv","Initiator",acc,&precomp,1);
+	p2p_write_operations_csv(P2P_BENCH_OUTPUT_DIR "/p2p_operations_initiator.csv","Initiator",acc,&precomp);
 
 	printf("\n"); print_header("Initiator — Handshake Summary (µs, avg)");
 	printf("  %-16s %14s %14s %14s %14s %14s %6s\n","Type","Processing","TxRx","Precompute","Overhead","Total","N");
