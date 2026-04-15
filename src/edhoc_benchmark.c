@@ -747,26 +747,221 @@ static void sck_assemble_hybrid_ops(const struct sck_prim_cache *c,
 #define SCOST(OP) ((OP).avg_us * (double)(OP).calls)
 
 /* Memory estimation (same as edhoc_benchmark.c) */
-static long sck_estimate_classic_memory(int type_num)
-{
-	return 1116 + 1536 + 640 + 256 + 128 + 256 +
-	       ((type_num == 0) ? 512 : 0) + 384 + 512 + 256;
-}
+/*
+ * Memory estimation per role (Initiator vs Responder).
+ *
+ * The estimates account for:
+ *   1. Context structures (edhoc_initiator_context vs edhoc_responder_context,
+ *      or pq_party_ctx / pq3_party_ctx / hybrid_party_ctx — same for both).
+ *   2. Per-thread LOCAL stack variables (buffers for crypto operations) which
+ *      differ between initiator and responder because the protocol is
+ *      asymmetric: the initiator generates msg1/msg3 while the responder
+ *      generates msg2; each side holds different intermediate buffers.
+ *   3. Thread data struct (msg buffers, timing fields).
+ *
+ * is_initiator: 1 = Initiator, 0 = Responder
+ */
 
-static long sck_estimate_pq_memory(int pq_type_num)
+static long sck_estimate_classic_memory(int type_num, int is_initiator)
 {
-	long base = 2*(PQ_KEM_PK_LEN+PQ_KEM_SK_LEN) + 3*PQ_KEM_CT_LEN +
-		    3*PQ_KEM_SS_LEN + 4*PQ_PRK_LEN + 4*PQ_HASH_LEN +
-		    3*8192 + 1024 + 4096 + 512 + 512;
-	if (pq_type_num == 0)
-		base += 2*(PQ_SIG_PK_LEN+PQ_SIG_SK_LEN) + PQ_SIG_MAX_LEN + 4096;
+	/*
+	 * Shared base: test vector credential buffers, PRK, connection IDs,
+	 * err_msg_buf[64], struct byte_array overhead, cred_array, etc.
+	 */
+	long base = 1536 + 640 + 256 + 128 + 256 + 384 + 512 + 256;
+
+	if (is_initiator) {
+		/* edhoc_initiator_context: method enum(4) + 13 byte_arrays(208) +
+		 * 2 pointers(16) = ~228 bytes.
+		 * Type 0 uses sk_i/pk_i (sign keys), Type 3 uses g_i/i (static DH).
+		 * Initiator generates msg1, processes msg2, generates msg3. */
+		base += 228;
+		if (type_num == 0)
+			base += 512;  /* sign-key buffers (sk_i, pk_i data) */
+	} else {
+		/* edhoc_responder_context: 14 byte_arrays(224) + 2 pointers(16) =
+		 * ~240 bytes.  Has extra ead_4 field vs initiator.
+		 * Type 0 uses sk_r/pk_r (sign keys), Type 3 uses g_r/r (static DH).
+		 * Responder processes msg1, generates msg2, processes msg3.
+		 * Responder also needs server-socket state (listen_fd, accept). */
+		base += 240;
+		if (type_num == 0)
+			base += 512;  /* sign-key buffers (sk_r, pk_r data) */
+		base += 64;  /* extra: listen_fd + accept overhead */
+	}
+
 	return base;
 }
 
-static long sck_estimate_hybrid_memory(void)
+static long sck_estimate_pq_memory(int pq_type_num, int is_initiator)
 {
-	return sck_estimate_classic_memory(3) + PQ_KEM_PK_LEN + PQ_KEM_SK_LEN +
-	       PQ_KEM_CT_LEN + PQ_KEM_SS_LEN + 3*8192 + 4096;
+	/*
+	 * Shared context: pq_party_ctx has lt_pk, lt_sk, other_lt_pk,
+	 * eph_pk, eph_sk, prk1-3, th2-4, prk_out, plus thread data
+	 * with 3x 8192-byte msg_buf.
+	 *
+	 * pq_party_ctx = 3*PK + 2*SK + 4*PRK + 3*HASH + int + uint64
+	 *              = 3*1184 + 2*2400 + ... (for Type 0 with sig keys)
+	 */
+	long ctx_size = PQ_KEM_PK_LEN*3 + PQ_KEM_SK_LEN*2 +
+			PQ_PRK_LEN*4 + PQ_HASH_LEN*3 + PQ_PRK_LEN + 16;
+	if (pq_type_num == 0)
+		ctx_size += 2*PQ_SIG_PK_LEN + 2*PQ_SIG_SK_LEN; /* sig keys */
+
+	/* Thread data: 3x msg_buf[8192] + lengths + timing */
+	long thread_data = 3*8192 + 64;
+
+	/* Local stack variables differ by role */
+	long local_vars;
+
+	if (pq_type_num == 0) {
+		if (is_initiator) {
+			/*
+			 * PQ0 Initiator stack locals:
+			 * ct_R[1088], ss_R[32], k1[16]+iv1[13],
+			 * pt1[256], ct1_aead[264],
+			 * ct_eph2[1088], sig2_buf[3309], ct2_aead[520],
+			 * ss_eph[32], k2[16]+iv2[13],
+			 * pt2[512], th2_input[8192],
+			 * mac2_info[96]+mac2_exp[8],
+			 * th3_input[8192],
+			 * mac3_info[96]+mac3[8],
+			 * sig3_buf[3309], k3[16]+iv3[13],
+			 * ct3_aead[3381],
+			 * th4_in[~3413]
+			 */
+			local_vars = 1088 + 32 + 29 + 256 + 264 +
+				     1088 + 3309 + 520 + 32 + 29 +
+				     512 + 8192 + 104 + 8192 + 104 +
+				     3309 + 29 + 3381 + 3413;
+		} else {
+			/*
+			 * PQ0 Responder stack locals:
+			 * pk_eph[1184], ct_R[1088], ct1_aead[264],
+			 * ss_R[32], k1[16]+iv1[13],
+			 * pt1[256],
+			 * ct_eph2[1088]+ss_eph[32],
+			 * k2[16]+iv2[13],
+			 * th2_input[8192],
+			 * mac2_info[96]+mac2[8],
+			 * sig2_buf[3309], pt2[256], ct2_aead[520],
+			 * k3[16]+iv3[13],
+			 * pt3[3373], th3_input[8192],
+			 * mac3_info[96]+mac3_exp[8],
+			 * th4_in[~3413]
+			 */
+			local_vars = 1184 + 1088 + 264 + 32 + 29 +
+				     256 + 1088 + 32 + 29 + 8192 +
+				     104 + 3309 + 256 + 520 + 29 +
+				     3373 + 8192 + 104 + 3413;
+		}
+	} else {
+		/* PQ Type 3 (MAC-MAC, no signature keys) */
+		if (is_initiator) {
+			/*
+			 * PQ3 Initiator:
+			 * ct_R[1088], ss_R[32], k1[16]+iv1[13],
+			 * pt1[256], ct1_aead[264],
+			 * ct_eph2[1088], ct_I[1088], ct2_aead[520],
+			 * ss_eph[32], k2[16]+iv2[13],
+			 * pt2[512], th2_buf[8192],
+			 * mac2_info[96]+mac2_exp[8],
+			 * ss_I[32],
+			 * th3_buf[8192],
+			 * mac3_info[96]+mac3[8],
+			 * k3[16]+iv3[13], ct3_aead[72],
+			 * th4_in[96]
+			 */
+			local_vars = 1088 + 32 + 29 + 256 + 264 +
+				     1088 + 1088 + 520 + 32 + 29 +
+				     512 + 8192 + 104 + 32 + 8192 +
+				     104 + 29 + 72 + 96;
+		} else {
+			/*
+			 * PQ3 Responder:
+			 * pk_eph[1184], ct_R[1088], ct1_aead[264],
+			 * ss_R[32], k1[16]+iv1[13],
+			 * pt1[256],
+			 * ct_eph2[1088]+ss_eph[32],
+			 * k2[16]+iv2[13],
+			 * th2_buf[8192],
+			 * mac2_info[96]+mac2[8],
+			 * ct_I[1088]+ss_I[32],
+			 * pt2[256], ct2_aead[520],
+			 * k3[16]+iv3[13], pt3[64],
+			 * th3_buf[8192],
+			 * mac3_info[96]+mac3_exp[8],
+			 * th4_in[96]
+			 */
+			local_vars = 1184 + 1088 + 264 + 32 + 29 +
+				     256 + 1088 + 32 + 29 + 8192 +
+				     104 + 1088 + 32 + 256 + 520 +
+				     29 + 64 + 8192 + 104 + 96;
+		}
+	}
+
+	return ctx_size + thread_data + local_vars;
+}
+
+static long sck_estimate_hybrid_memory(int is_initiator)
+{
+	/*
+	 * hybrid_party_ctx: 5*32 (ECDH keys) + PQ_KEM_PK + PQ_KEM_SK +
+	 *   4*32 (PRK/TH) + prk_out[32] + int + uint64
+	 * = 160 + 1184 + 2400 + 128 + 32 + 16 = 3920
+	 */
+	long ctx_size = 5*32 + PQ_KEM_PK_LEN + PQ_KEM_SK_LEN +
+			4*32 + 32 + 16;
+
+	/* Thread data: 3x msg_buf[8192] + lengths + timing */
+	long thread_data = 3*8192 + 64;
+
+	long local_vars;
+
+	if (is_initiator) {
+		/*
+		 * Hybrid Initiator:
+		 * m1[8192],
+		 * peer_eph_pk[32], c_kem[1088], ct2_aead[520],
+		 * k_kem[32], ss_eph[32],
+		 * th2_in[8192] (block-scoped), ikm[64],
+		 * ss_bx[32], ek2[16]+iv2[13], ec[64],
+		 * pt2[512],
+		 * mk2[8]+mk2_info[96],
+		 * th3_in[8192] (block-scoped),
+		 * ek3[16]+iv3[13],
+		 * ss_ya[32],
+		 * mac3[8]+mk3_info[96],
+		 * pt3[128], ct3_aead[136],
+		 * th4_in[256]
+		 */
+		local_vars = 8192 + 32 + 1088 + 520 + 32 + 32 +
+			     8192 + 64 + 32 + 29 + 64 + 512 +
+			     104 + 8192 + 29 + 32 + 104 +
+			     128 + 136 + 256;
+	} else {
+		/*
+		 * Hybrid Responder:
+		 * peer_eph_pk[32], pk_kem[1184], k_kem[32], c_kem[1088],
+		 * ss_eph[32],
+		 * th2_in[8192] (block-scoped), ikm[64],
+		 * ss_xb[32], ek2[16]+iv2[13], ec[64],
+		 * mac2[8]+mk2_info[96],
+		 * pt2[256], ct2_aead[520],
+		 * th3_in[8192] (block-scoped),
+		 * ek3[16]+iv3[13],
+		 * pt3[128],
+		 * ss_ay[32],
+		 * mac3_exp[8]+mk3_info[96],
+		 * th4_in[256]
+		 */
+		local_vars = 32 + 1184 + 32 + 1088 + 32 +
+			     8192 + 64 + 32 + 29 + 64 + 104 +
+			     256 + 520 + 8192 + 29 + 128 +
+			     32 + 104 + 256;
+	}
+
+	return ctx_size + thread_data + local_vars;
 }
 
 /* =============================================================================
@@ -2432,9 +2627,9 @@ static int sck_run_classic_handshake(int type_num, int base_port,
 	if (proc_r < 0) proc_r = 0;
 
 	oh_init->cpu_us = proc_i;
-	oh_init->memory_bytes = sck_estimate_classic_memory(type_num);
+	oh_init->memory_bytes = sck_estimate_classic_memory(type_num, 1);
 	oh_resp->cpu_us = proc_r;
-	oh_resp->memory_bytes = sck_estimate_classic_memory(type_num);
+	oh_resp->memory_bytes = sck_estimate_classic_memory(type_num, 0);
 
 	hs_init->processing_us     = proc_i;
 	hs_init->txrx_us           = total_i_txrx / n;
@@ -2595,8 +2790,8 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 	if (proc_i < 0) proc_i = 0;
 	if (proc_r < 0) proc_r = 0;
 
-	oh_init->cpu_us = proc_i; oh_init->memory_bytes = sck_estimate_pq_memory(pq_type_num);
-	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = sck_estimate_pq_memory(pq_type_num);
+	oh_init->cpu_us = proc_i; oh_init->memory_bytes = sck_estimate_pq_memory(pq_type_num, 1);
+	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = sck_estimate_pq_memory(pq_type_num, 0);
 
 	hs_init->processing_us = proc_i; hs_init->txrx_us = total_i_txrx / n;
 	hs_init->precomputation_us = pre_i; hs_init->total_us = total_i_wall / n;
@@ -2709,8 +2904,8 @@ static int sck_run_hybrid_handshake(int base_port,
 	if (proc_i < 0) proc_i = 0;
 	if (proc_r < 0) proc_r = 0;
 
-	oh_init->cpu_us = proc_i; oh_init->memory_bytes = sck_estimate_hybrid_memory();
-	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = sck_estimate_hybrid_memory();
+	oh_init->cpu_us = proc_i; oh_init->memory_bytes = sck_estimate_hybrid_memory(1);
+	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = sck_estimate_hybrid_memory(0);
 
 	hs_init->processing_us = proc_i; hs_init->txrx_us = total_i_txrx / n;
 	hs_init->precomputation_us = pre_i; hs_init->total_us = total_i_wall / n;

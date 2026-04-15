@@ -184,9 +184,10 @@ clean:
 	rm -f $(BUILD_DIR)/edhoc_type0_classic.o $(BUILD_DIR)/edhoc_type3_classic.o
 	rm -f $(BUILD_DIR)/edhoc_pq_kem.o $(BUILD_DIR)/edhoc_type0_pq.o $(BUILD_DIR)/edhoc_type3_pq.o
 	rm -f $(BUILD_DIR)/edhoc_type3_hybrid.o
-	rm -f $(BUILD_DIR)/edhoc_type3_hybrid.o
-	rm -f $(BUILD_DIR)/edhoc_benchmark_socket.o
+	rm -f $(BUILD_DIR)/edhoc_benchmark.o
 	rm -f $(BUILD_DIR)/edhoc_benchmark_p2p.o
+	rm -f $(BUILD_DIR)/benchmark_crypto.o
+	rm -f $(BUILD_DIR)/crypto_libsodium.o
 	rm -f $(BUILD_DIR)/pqclean_*.o
 	rm -f $(BUILD_DIR)/tv_*.o $(TARGET)
 
