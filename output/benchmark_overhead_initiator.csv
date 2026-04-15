@@ -1,0 +1,6 @@
+type,role,cpu_time_us,memory_bytes,memory_note
+Type0_SigSig,Initiator,2602.669,4708,estimated_stack_heap
+Type3_MACMAC,Initiator,1755.200,4196,estimated_stack_heap
+Type0_PQ,Initiator,1210.955,64097,estimated_stack_heap_pq
+Type3_PQ,Initiator,398.941,46591,estimated_stack_heap_pq
+Type3_Hybrid,Initiator,721.296,39525,estimated_stack_heap_hybrid
