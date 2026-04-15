@@ -1379,7 +1379,7 @@ static void p2p_assemble_classic_ops(const struct p2p_prim_cache *c,
 		ops->signature    = p2p_op_zero();
 		ops->verification = p2p_op_zero();
 	}
-	ops->ecdh = p2p_op(&c->ecdh, (type_num == 0) ? 1 : 3);
+	ops->ecdh = p2p_op(&c->ecdh, (type_num == 0) ? 2 : 4);
 	ops->hkdf = p2p_op(&c->hkdf, (type_num == 0) ? 8 : 10);
 	ops->hash = p2p_op(&c->hash, 4);
 	memset(&ops->pq_keygen, 0, sizeof(struct p2p_op_result) * 9);
@@ -1415,7 +1415,7 @@ static void p2p_assemble_hybrid_ops(const struct p2p_prim_cache *c,
 	ops->aead_dec     = p2p_op(&c->aead_dec, 1);
 	ops->signature    = p2p_op_zero();
 	ops->verification = p2p_op_zero();
-	ops->ecdh         = p2p_op(&c->ecdh, 2);
+	ops->ecdh         = p2p_op(&c->ecdh, 4);
 	ops->hkdf         = p2p_op(&c->hkdf, 10);
 	ops->hash         = p2p_op(&c->hash, 3);
 	ops->pq_keygen    = p2p_op(&c->pq_keygen, is_initiator ? 1 : 0);

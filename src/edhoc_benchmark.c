@@ -683,7 +683,7 @@ static void sck_assemble_classic_ops(const struct sck_prim_cache *c,
 		ops->signature    = sck_op_zero();
 		ops->verification = sck_op_zero();
 	}
-	ops->ecdh = sck_op(&c->ecdh, (type_num == 0) ? 1 : 3);
+	ops->ecdh = sck_op(&c->ecdh, (type_num == 0) ? 2 : 4);
 	ops->hkdf = sck_op(&c->hkdf, (type_num == 0) ? 8 : 10);
 	ops->hash = sck_op(&c->hash, 4);
 	/* Zero PQ fields */
@@ -724,7 +724,7 @@ static void sck_assemble_hybrid_ops(const struct sck_prim_cache *c,
 	ops->aead_dec     = sck_op(&c->aead_dec, 1);
 	ops->signature    = sck_op_zero();
 	ops->verification = sck_op_zero();
-	ops->ecdh         = sck_op(&c->ecdh, 2);
+	ops->ecdh         = sck_op(&c->ecdh, 4);
 	ops->hkdf         = sck_op(&c->hkdf, 10);
 	ops->hash         = sck_op(&c->hash, 3);
 	/* PQ KEM encaps/decaps — actually measured */
