@@ -152,6 +152,11 @@ struct p2p_hs_accum {
 	int success_count;
 };
 
+/* Keep same type labels as socket benchmark CSVs */
+static const char *P2P_TYPE_LABELS[5] = {
+	"Type0_SigSig", "Type3_MACMAC", "Type0_PQ", "Type3_PQ", "Type3_Hybrid"
+};
+
 /* =============================================================================
  * Classic handshake — one iteration
  * ========================================================================== */
@@ -899,6 +904,92 @@ static double p2p_precomp_for_variant(int v, const struct p2p_precomp *pc)
 }
 
 /* =============================================================================
+ * Memory estimators (same methodology as socket benchmark)
+ * ========================================================================== */
+static long p2p_estimate_classic_memory(int type_num, int is_initiator)
+{
+	long shared = 1536 + 640 + 256 + 128 + 256 + 384 + 512 + 256;
+	if (is_initiator) {
+		long ctx = 228;
+		long keys = (type_num == 0) ? 512 : 0;
+		return shared + ctx + keys;
+	}
+	/* responder */
+	{
+		long ctx = 240;
+		long keys = (type_num == 0) ? 512 : 0;
+		long server = 64;
+		return shared + ctx + keys + server;
+	}
+}
+
+static long p2p_estimate_pq_memory(int pq_type_num, int is_initiator)
+{
+	long ctx_base = PQ_KEM_PK_LEN*3 + PQ_KEM_SK_LEN*2 +
+			PQ_PRK_LEN*4 + PQ_HASH_LEN*3 + PQ_PRK_LEN + 16;
+	if (pq_type_num == 0)
+		ctx_base += 2*PQ_SIG_PK_LEN + 2*PQ_SIG_SK_LEN;
+
+	long thread_data = 3 * 8192 + 64;
+	long peak_common;
+
+	if (pq_type_num == 0) {
+		peak_common = 87 + 1088 + 32 + 256 + 264 + 3309 +
+			      512 + 520 + 8192 + 104 + 3413;
+	} else {
+		peak_common = 87 + 1088 + 32 + 256 + 264 +
+			      512 + 520 + 8192 + 104 + 96;
+	}
+
+	if (is_initiator) {
+		long extra = 1088;
+		if (pq_type_num == 3)
+			extra += 1088;
+		return ctx_base + thread_data + peak_common + extra;
+	}
+
+	/* responder */
+	{
+		long extra = PQ_KEM_PK_LEN;
+		if (pq_type_num == 3)
+			extra += 1088 + 32;
+		long server = 64;
+		return ctx_base + thread_data + peak_common + extra + server;
+	}
+}
+
+static long p2p_estimate_hybrid_memory(int is_initiator)
+{
+	long ctx_size = 5*32 + PQ_KEM_PK_LEN + PQ_KEM_SK_LEN + 4*32 + 32 + 16;
+	long thread_data = 3 * 8192 + 64;
+	long peak_common = 32 + 32 + 1088 + 32 + 8192 + 64 +
+			   32 + 29 + 64 + 104 + 256 + 520 +
+			   128 + 136 + 256;
+
+	if (is_initiator)
+		return ctx_size + thread_data + peak_common;
+
+	/* responder */
+	{
+		long pk_kem_received = PQ_KEM_PK_LEN;
+		long server = 64;
+		return ctx_size + thread_data + peak_common + pk_kem_received + server;
+	}
+}
+
+static long p2p_estimate_memory_by_variant(int v, int is_initiator)
+{
+	switch (v) {
+	case 0: return p2p_estimate_classic_memory(0, is_initiator);
+	case 1: return p2p_estimate_classic_memory(3, is_initiator);
+	case 2: return p2p_estimate_pq_memory(0, is_initiator);
+	case 3: return p2p_estimate_pq_memory(3, is_initiator);
+	case 4: return p2p_estimate_hybrid_memory(is_initiator);
+	default: return 0;
+	}
+}
+
+/* =============================================================================
  * CSV writers
  * ========================================================================== */
 static void p2p_write_hs_csv(const char *path, const char *role,
@@ -921,6 +1012,66 @@ static void p2p_write_hs_csv(const char *path, const char *role,
 		fprintf(fp,"%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
 			names[i],role,processing,avg_txrx,precomp,overhead,avg_wall,acc[i].success_count);
 	}
+	fclose(fp);
+}
+
+static void p2p_write_overhead_csv(const char *path, const char *role,
+	struct p2p_hs_accum *acc, const struct p2p_precomp *pc, int is_initiator)
+{
+	FILE *fp = fopen(path, "w");
+	if (!fp) return;
+
+	fprintf(fp, "type,role,cpu_time_us,memory_bytes,memory_note\n");
+	for (int v = 0; v < 5; v++) {
+		double avg_cpu = 0.0;
+		if (acc[v].success_count > 0)
+			avg_cpu = acc[v].total_cpu / (double)acc[v].success_count;
+
+		double pre = p2p_precomp_for_variant(v, pc);
+		double processing = avg_cpu - pre;
+		if (processing < 0) processing = 0;
+
+		long mem = p2p_estimate_memory_by_variant(v, is_initiator);
+		const char *note = (v == 4) ? "estimated_stack_heap_hybrid" :
+				   ((v == 2 || v == 3) ? "estimated_stack_heap_pq" : "estimated_stack_heap");
+
+		fprintf(fp, "%s,%s,%.3f,%ld,%s\n",
+			P2P_TYPE_LABELS[v], role, processing, mem, note);
+	}
+
+	fclose(fp);
+}
+
+static void p2p_write_operations_csv(const char *path, const char *role,
+	struct p2p_hs_accum *acc, const struct p2p_precomp *pc)
+{
+	FILE *fp = fopen(path, "w");
+	if (!fp) return;
+
+	fprintf(fp, "type,role,operation,avg_time_us,calls_per_handshake,total_per_handshake_us,iterations\n");
+	for (int v = 0; v < 5; v++) {
+		double avg_wall = 0.0, avg_cpu = 0.0, avg_txrx = 0.0;
+		int n = acc[v].success_count;
+		if (n > 0) {
+			double dn = (double)n;
+			avg_wall = acc[v].total_wall / dn;
+			avg_cpu = acc[v].total_cpu / dn;
+			avg_txrx = acc[v].total_txrx / dn;
+		}
+
+		double pre = p2p_precomp_for_variant(v, pc);
+		double processing = avg_cpu - pre;
+		if (processing < 0) processing = 0;
+		double overhead = avg_wall - processing - avg_txrx - pre;
+		if (overhead < 0) overhead = 0;
+
+		/* Keep same schema, aggregate by handshake components */
+		fprintf(fp, "%s,%s,Precomputation,%.3f,1,%.3f,%d\n", P2P_TYPE_LABELS[v], role, pre, pre, n);
+		fprintf(fp, "%s,%s,Processing,%.3f,1,%.3f,%d\n", P2P_TYPE_LABELS[v], role, processing, processing, n);
+		fprintf(fp, "%s,%s,TxRx,%.3f,1,%.3f,%d\n", P2P_TYPE_LABELS[v], role, avg_txrx, avg_txrx, n);
+		fprintf(fp, "%s,%s,Overhead,%.3f,1,%.3f,%d\n", P2P_TYPE_LABELS[v], role, overhead, overhead, n);
+	}
+
 	fclose(fp);
 }
 
@@ -1034,6 +1185,8 @@ int run_p2p_responder(int port)
 
 	/* Write CSV */
 	p2p_write_hs_csv(P2P_BENCH_OUTPUT_DIR "/p2p_handshake_responder.csv","Responder",VARIANT_NAMES,acc,5,&precomp);
+	p2p_write_overhead_csv(P2P_BENCH_OUTPUT_DIR "/benchmark_overhead_responder.csv","Responder",acc,&precomp,0);
+	p2p_write_operations_csv(P2P_BENCH_OUTPUT_DIR "/benchmark_operations_responder.csv","Responder",acc,&precomp);
 
 	printf("\n"); print_header("Responder — Handshake Summary (µs, avg)");
 	printf("  %-16s %14s %14s %14s %14s %14s %6s\n","Type","Processing","TxRx","Precompute","Overhead","Total","N");
@@ -1140,6 +1293,8 @@ int run_p2p_initiator(const char *host, int port)
 
 	/* Write CSV */
 	p2p_write_hs_csv(P2P_BENCH_OUTPUT_DIR "/p2p_handshake_initiator.csv","Initiator",VARIANT_NAMES,acc,5,&precomp);
+	p2p_write_overhead_csv(P2P_BENCH_OUTPUT_DIR "/benchmark_overhead_initiator.csv","Initiator",acc,&precomp,1);
+	p2p_write_operations_csv(P2P_BENCH_OUTPUT_DIR "/benchmark_operations_initiator.csv","Initiator",acc,&precomp);
 
 	printf("\n"); print_header("Initiator — Handshake Summary (µs, avg)");
 	printf("  %-16s %14s %14s %14s %14s %14s %6s\n","Type","Processing","TxRx","Precompute","Overhead","Total","N");
