@@ -1,0 +1,416 @@
+(* =========================================================================
+ * EAP-EDHOC PQ — ProVerif Formal Verification Model
+ * =========================================================================
+ *
+ * Protocol: EAP-EDHOC with Post-Quantum KEM (ML-KEM-768 style)
+ * Parties:
+ *   I = Initiator (IoT Device)
+ *   A = Authenticator (Gateway) — transparent relay
+ *   R = Responder (AAA Server)
+ *
+ * Since the Authenticator simply relays messages, we model only
+ * the Initiator ↔ Responder interaction over a public channel.
+ *
+ * Key Exchange: KEM-based (no ECDH — pure PQ)
+ * Authentication: MAC-based (Type 3 / STAT-STAT style with KEM)
+ *
+ * Messages:
+ *   MSG1: I → R : ctR, pk_eph, AEAD(K1, Plaintext1)
+ *   MSG2: R → I : pk_eph_r, ctI, AEAD(K2, Plaintext2)
+ *   MSG3: I → R : AEAD(K3, Plaintext3)
+ *   MSG4: R → I : AEAD(K4, Plaintext4)
+ *
+ * Security Goals:
+ *   1. Secrecy of PRKout / session key (AK)
+ *   2. Mutual authentication (Initiator ↔ Responder)
+ *   3. Forward secrecy (via ephemeral KEM)
+ * =========================================================================
+ *)
+
+(* =========================================================================
+ * Types
+ * ========================================================================= *)
+type key.
+type pkey.       (* KEM public key *)
+type skey.       (* KEM secret key *)
+(* bitstring is a built-in type in ProVerif *)
+
+(* =========================================================================
+ * Channels
+ * ========================================================================= *)
+free ch: channel.           (* Public channel (attacker can read/write) *)
+free chPrivate: channel [private].  (* For checking secrecy queries *)
+
+(* =========================================================================
+ * Cryptographic Primitives
+ * ========================================================================= *)
+
+(* --- KEM (Key Encapsulation Mechanism) --- *)
+(* KEM KeyGen: generates (pk, sk) pair *)
+fun kem_pk(skey): pkey.
+
+(* KEM Encapsulate: pk → (ciphertext, shared_secret) *)
+(* We model: kem_enc(pk, randomness) → ciphertext *)
+(*           kem_ss_enc(pk, randomness) → shared_secret *)
+(*           kem_dec(ciphertext, sk) → shared_secret *)
+fun kem_enc(pkey, key): bitstring.    (* ciphertext *)
+fun kem_ss_enc(pkey, key): key.       (* shared secret from encaps side *)
+
+(* Decapsulation recovers the same shared secret *)
+reduc forall sk: skey, r: key;
+    kem_dec(kem_enc(kem_pk(sk), r), sk) = kem_ss_enc(kem_pk(sk), r).
+
+(* --- Hash --- *)
+fun H(bitstring): bitstring.
+
+(* --- HKDF-Extract --- *)
+fun hkdf_extract(key, bitstring): key.
+
+(* --- HKDF-Expand --- *)
+fun hkdf_expand(key, bitstring): key.
+
+(* --- AEAD Encryption / Decryption --- *)
+fun aead_enc(key, bitstring): bitstring.
+reduc forall k: key, m: bitstring;
+    aead_dec(k, aead_enc(k, m)) = m.
+
+(* --- MAC (modeled as keyed hash) --- *)
+fun mac(key, bitstring): bitstring.
+
+(* =========================================================================
+ * Identities and Long-term Keys
+ * ========================================================================= *)
+
+(* Initiator long-term KEM keypair *)
+free skI: skey [private].
+free skR: skey [private].
+
+letfun pkI() = kem_pk(skI).
+letfun pkR() = kem_pk(skR).
+
+(* Credential identifiers *)
+free ID_CRED_I: bitstring.
+free ID_CRED_R: bitstring.
+
+(* Method and suites (public constants) *)
+free METHOD: bitstring.
+free SUITES: bitstring.
+free C_I: bitstring.
+free C_R: bitstring.
+
+(* EAD payloads (public placeholders) *)
+free EAD1: bitstring.
+free EAD2: bitstring.
+free EAD3: bitstring.
+free EAD4: bitstring.
+
+(* Labels for HKDF-Expand domain separation *)
+free label_K1: bitstring.
+free label_K2: bitstring.
+free label_K3: bitstring.
+free label_K4: bitstring.
+free label_MAC2: bitstring.
+free label_MAC3: bitstring.
+free label_PRKout: bitstring.
+free label_AK: bitstring.
+
+(* =========================================================================
+ * Secrecy and Authentication Queries
+ * ========================================================================= *)
+
+(* Secret values we want to verify *)
+free secretAK: bitstring [private].
+
+(* Events for authentication *)
+event InitiatorSendsMsg1(pkey).
+event ResponderReceivesMsg1(pkey).
+event ResponderSendsMsg2(pkey, pkey).
+event InitiatorReceivesMsg2(pkey, pkey).
+event InitiatorSendsMsg3(pkey, pkey).
+event ResponderReceivesMsg3(pkey, pkey).
+event ResponderSendsMsg4(pkey, pkey).
+event InitiatorReceivesMsg4(pkey, pkey).
+event InitiatorDone(pkey, pkey, key).
+event ResponderDone(pkey, pkey, key).
+
+(* --- Query 1: Secrecy of AK (session key) --- *)
+query attacker(secretAK).
+
+(* --- Query 2: Mutual Authentication --- *)
+(* If Responder finishes, an Initiator must have started *)
+query pkE: pkey, pkER: pkey, ak: key;
+    event(ResponderDone(pkE, pkER, ak))
+    ==> event(InitiatorSendsMsg1(pkE)).
+
+(* If Initiator finishes, a Responder must have sent Msg2 *)
+query pkE: pkey, pkER: pkey, ak: key;
+    event(InitiatorDone(pkE, pkER, ak))
+    ==> event(ResponderSendsMsg2(pkE, pkER)).
+
+(* --- Query 3: Agreement on session key --- *)
+query pkE: pkey, pkER: pkey, ak: key;
+    event(InitiatorDone(pkE, pkER, ak))
+    ==> event(ResponderDone(pkE, pkER, ak)).
+
+query pkE: pkey, pkER: pkey, ak: key;
+    event(ResponderDone(pkE, pkER, ak))
+    ==> event(InitiatorDone(pkE, pkER, ak)).
+
+(* --- Query 4: Injective agreement (no replay) --- *)
+query pkE: pkey, pkER: pkey, ak: key;
+    inj-event(InitiatorDone(pkE, pkER, ak))
+    ==> inj-event(ResponderSendsMsg2(pkE, pkER)).
+
+query pkE: pkey, pkER: pkey, ak: key;
+    inj-event(ResponderDone(pkE, pkER, ak))
+    ==> inj-event(InitiatorSendsMsg3(pkE, pkER)).
+
+
+(* =========================================================================
+ * CLEAN REWRITE: Properly model the KEM-based protocol
+ * =========================================================================
+ *
+ * Protocol flow (KEM-based interpretation of the Mermaid diagram):
+ *
+ * MSG1: I → R
+ *   I generates ephemeral keypair: (sk_eph, pk_eph) = KEM.KeyGen()
+ *   I encapsulates to R's long-term key: (ssR, ctR) = KEM.Enc(pkR)
+ *   TH1 = H(pk_eph, ctR)
+ *   PRK1e = HKDF-Extract(ssR, TH1)
+ *   K1 = HKDF-Expand(PRK1e, label_K1 || TH1)
+ *   Plaintext1 = (METHOD, SUITES, ID_CRED_I, C_I, EAD1)
+ *   Send: ctR, pk_eph, AEAD(K1, Plaintext1)
+ *
+ * MSG2: R → I
+ *   R decapsulates: ssR = KEM.Dec(ctR, skR)
+ *   R recomputes TH1, PRK1e, K1, decrypts Plaintext1
+ *   R encapsulates to I's ephemeral key: (ss_eph, ct_eph) = KEM.Enc(pk_eph)
+ *   TH2 = H(TH1, ct_eph)
+ *   PRK2m = HKDF-Extract(ss_eph, PRK1e)
+ *   K2 = HKDF-Expand(PRK2m, label_K2 || TH2)
+ *   MAC2 = mac(PRK2m, (ID_CRED_R, TH2))
+ *   R encapsulates to I's long-term key: (ssI, ctI) = KEM.Enc(pkI)
+ *   PRK2e3m = HKDF-Extract(ssI, PRK2m)
+ *   Plaintext2 = (C_R, ID_CRED_R, EAD2, MAC2)
+ *   Send: ct_eph, ctI, AEAD(K2, Plaintext2)
+ *   TH3 = H(TH2, ct_eph, ctI, cipher2, ID_CRED_R)
+ *
+ * MSG3: I → R
+ *   I decapsulates: ss_eph = KEM.Dec(ct_eph, sk_eph)
+ *   I recomputes TH2, PRK2m, K2, decrypts Plaintext2
+ *   I decapsulates: ssI = KEM.Dec(ctI, skI)
+ *   PRK2e3m = HKDF-Extract(ssI, PRK2m)
+ *   Verify MAC2
+ *   TH3 = H(TH2, ct_eph, ctI, cipher2, ID_CRED_R)
+ *   MAC3 = mac(PRK2e3m, (ID_CRED_I, TH3))
+ *   K3 = HKDF-Expand(PRK2e3m, label_K3 || TH3)
+ *   Plaintext3 = (EAD3, MAC3)
+ *   Send: AEAD(K3, Plaintext3)
+ *   TH4 = H(TH3, cipher3, ID_CRED_I)
+ *
+ * MSG4: R → I
+ *   R computes K3, decrypts, verifies MAC3
+ *   TH4 = H(TH3, cipher3, ID_CRED_I)
+ *   PRKout = HKDF-Expand(PRK2e3m, (label_PRKout, TH4))
+ *   K4 = HKDF-Expand(PRKout, label_K4)
+ *   Plaintext4 = EAD4
+ *   Send: AEAD(K4, Plaintext4)
+ *   AK = HKDF-Expand(PRKout, label_AK)
+ *
+ * Finalization (I):
+ *   I computes K4, decrypts, verifies
+ *   PRKout = HKDF-Expand(PRK2e3m, (label_PRKout, TH4))
+ *   AK = HKDF-Expand(PRKout, label_AK)
+ * ========================================================================= *)
+
+(* =========================================================================
+ * Initiator Process (Clean)
+ * ========================================================================= *)
+
+let InitiatorClean() =
+    let pk_R: pkey = pkR() in
+    let sk_I: skey = skI in
+    let pk_I: pkey = pkI() in
+
+    (* ── MSG1: Generate & Send ── *)
+    new sk_eph: skey;
+    let pk_eph: pkey = kem_pk(sk_eph) in
+
+    new rand_R: key;
+    let ctR: bitstring = kem_enc(pk_R, rand_R) in
+    let ssR: key = kem_ss_enc(pk_R, rand_R) in
+
+    let th1: bitstring = H((pk_eph, ctR)) in
+    let prk1e: key = hkdf_extract(ssR, th1) in
+    let k1: key = hkdf_expand(prk1e, (label_K1, th1)) in
+
+    let plaintext1: bitstring = (METHOD, SUITES, ID_CRED_I, C_I, EAD1) in
+    let cipher1: bitstring = aead_enc(k1, plaintext1) in
+
+    event InitiatorSendsMsg1(pk_eph);
+    out(ch, (ctR, pk_eph, cipher1));
+
+    (* ── MSG2: Receive & Process ── *)
+    in(ch, (ct_eph_recv: bitstring, ctI_recv: bitstring, cipher2: bitstring));
+
+    (* Decapsulate ephemeral: ss_eph = KEM.Dec(ct_eph, sk_eph) *)
+    let ss_eph: key = kem_dec(ct_eph_recv, sk_eph) in
+
+    (* TH2 = H(TH1, ct_eph) *)
+    let th2: bitstring = H((th1, ct_eph_recv)) in
+
+    (* PRK2m = HKDF-Extract(ss_eph, PRK1e) *)
+    let prk2m: key = hkdf_extract(ss_eph, (prk1e, th2)) in
+
+    (* K2 = HKDF-Expand(PRK2m, TH2) *)
+    let k2: key = hkdf_expand(prk2m, (label_K2, th2)) in
+
+    (* Decrypt Plaintext2 *)
+    let (=C_R, =ID_CRED_R, ead2_r: bitstring, mac2_r: bitstring) = aead_dec(k2, cipher2) in
+
+    (* Decapsulate long-term: ssI = KEM.Dec(ctI, skI) *)
+    let ssI: key = kem_dec(ctI_recv, sk_I) in
+
+    (* PRK2e3m = HKDF-Extract(ssI, PRK2m) *)
+    let prk2e3m: key = hkdf_extract(ssI, (prk2m, th2)) in
+
+    (* Verify MAC2 *)
+    let mac2_check: bitstring = mac(prk2m, (ID_CRED_R, th2)) in
+    if mac2_r = mac2_check then
+
+    event InitiatorReceivesMsg2(pk_eph, pk_R);
+
+    (* ── MSG3: Compute & Send ── *)
+    let th3: bitstring = H((th2, ct_eph_recv, ctI_recv, cipher2, ID_CRED_R)) in
+
+    let mac3_val: bitstring = mac(prk2e3m, (ID_CRED_I, th3)) in
+    let k3: key = hkdf_expand(prk2e3m, (label_K3, th3)) in
+    let plaintext3: bitstring = (EAD3, mac3_val) in
+    let cipher3: bitstring = aead_enc(k3, plaintext3) in
+
+    event InitiatorSendsMsg3(pk_eph, pk_R);
+    out(ch, cipher3);
+
+    (* ── MSG4: Receive & Finalize ── *)
+    in(ch, cipher4: bitstring);
+
+    let th4: bitstring = H((th3, cipher3, ID_CRED_I)) in
+    let prkout: key = hkdf_expand(prk2e3m, (label_PRKout, th4)) in
+    let k4: key = hkdf_expand(prkout, (label_K4, th4)) in
+
+    let (=EAD4) = aead_dec(k4, cipher4) in
+
+    let ak: key = hkdf_expand(prkout, (label_AK, th4)) in
+
+    event InitiatorReceivesMsg4(pk_eph, pk_R);
+    event InitiatorDone(pk_eph, pk_R, ak);
+
+    (* Secrecy test: output AK on private channel for query *)
+    out(chPrivate, secretAK).
+
+
+(* =========================================================================
+ * Responder Process (Clean)
+ * ========================================================================= *)
+
+let ResponderClean() =
+    let sk_R: skey = skR in
+    let pk_R: pkey = pkR() in
+    let pk_I: pkey = pkI() in
+
+    (* ── MSG1: Receive & Process ── *)
+    in(ch, (ctR_recv: bitstring, pk_eph_recv: pkey, cipher1: bitstring));
+
+    (* Decapsulate: ssR = KEM.Dec(ctR, skR) *)
+    let ssR: key = kem_dec(ctR_recv, sk_R) in
+
+    (* TH1 = H(pk_eph, ctR) *)
+    let th1: bitstring = H((pk_eph_recv, ctR_recv)) in
+
+    (* PRK1e = HKDF-Extract(ssR, TH1) *)
+    let prk1e: key = hkdf_extract(ssR, th1) in
+
+    (* K1 = HKDF-Expand(PRK1e, TH1) *)
+    let k1: key = hkdf_expand(prk1e, (label_K1, th1)) in
+
+    (* Decrypt Plaintext1 *)
+    let (=METHOD, =SUITES, =ID_CRED_I, =C_I, =EAD1) = aead_dec(k1, cipher1) in
+
+    event ResponderReceivesMsg1(pk_eph_recv);
+
+    (* ── MSG2: Compute & Send ── *)
+
+    (* Encapsulate to Initiator's ephemeral key: (ss_eph, ct_eph) = KEM.Enc(pk_eph) *)
+    new rand_eph: key;
+    let ct_eph: bitstring = kem_enc(pk_eph_recv, rand_eph) in
+    let ss_eph: key = kem_ss_enc(pk_eph_recv, rand_eph) in
+
+    (* TH2 = H(TH1, ct_eph) *)
+    let th2: bitstring = H((th1, ct_eph)) in
+
+    (* PRK2m = HKDF-Extract(ss_eph, PRK1e) *)
+    let prk2m: key = hkdf_extract(ss_eph, (prk1e, th2)) in
+
+    (* K2 = HKDF-Expand(PRK2m, TH2) *)
+    let k2: key = hkdf_expand(prk2m, (label_K2, th2)) in
+
+    (* MAC2 *)
+    let mac2_val: bitstring = mac(prk2m, (ID_CRED_R, th2)) in
+
+    (* Encapsulate to Initiator's long-term key: (ssI, ctI) = KEM.Enc(pkI) *)
+    new rand_I: key;
+    let ctI: bitstring = kem_enc(pk_I, rand_I) in
+    let ssI: key = kem_ss_enc(pk_I, rand_I) in
+
+    (* PRK2e3m = HKDF-Extract(ssI, PRK2m) *)
+    let prk2e3m: key = hkdf_extract(ssI, (prk2m, th2)) in
+
+    (* Plaintext2 = (C_R, ID_CRED_R, EAD2, MAC2) *)
+    let plaintext2: bitstring = (C_R, ID_CRED_R, EAD2, mac2_val) in
+    let cipher2: bitstring = aead_enc(k2, plaintext2) in
+
+    event ResponderSendsMsg2(pk_eph_recv, pk_R);
+    out(ch, (ct_eph, ctI, cipher2));
+
+    (* TH3 = H(TH2, ct_eph, ctI, cipher2, ID_CRED_R) *)
+    let th3: bitstring = H((th2, ct_eph, ctI, cipher2, ID_CRED_R)) in
+
+    (* ── MSG3: Receive & Process ── *)
+    in(ch, cipher3: bitstring);
+
+    (* K3 = HKDF-Expand(PRK2e3m, TH3) *)
+    let k3: key = hkdf_expand(prk2e3m, (label_K3, th3)) in
+
+    (* Decrypt Plaintext3 *)
+    let (=EAD3, mac3_recv: bitstring) = aead_dec(k3, cipher3) in
+
+    (* Verify MAC3 *)
+    let mac3_check: bitstring = mac(prk2e3m, (ID_CRED_I, th3)) in
+    if mac3_recv = mac3_check then
+
+    event ResponderReceivesMsg3(pk_eph_recv, pk_R);
+
+    (* ── MSG4: Compute & Send ── *)
+    let th4: bitstring = H((th3, cipher3, ID_CRED_I)) in
+    let prkout: key = hkdf_expand(prk2e3m, (label_PRKout, th4)) in
+    let k4: key = hkdf_expand(prkout, (label_K4, th4)) in
+
+    let plaintext4: bitstring = EAD4 in
+    let cipher4: bitstring = aead_enc(k4, plaintext4) in
+
+    let ak: key = hkdf_expand(prkout, (label_AK, th4)) in
+
+    event ResponderSendsMsg4(pk_eph_recv, pk_R);
+    event ResponderDone(pk_eph_recv, pk_R, ak);
+    out(ch, cipher4);
+
+    (* Secrecy test *)
+    out(chPrivate, secretAK).
+
+
+(* =========================================================================
+ * Main Process
+ * ========================================================================= *)
+
+process
+    ( (!InitiatorClean()) | (!ResponderClean()) )
