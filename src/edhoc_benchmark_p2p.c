@@ -990,6 +990,446 @@ static long p2p_estimate_memory_by_variant(int v, int is_initiator)
 }
 
 /* =============================================================================
+ * Crypto primitive benchmarking (same operations as socket benchmark)
+ * ========================================================================== */
+struct p2p_op_result {
+	double avg_us;
+	int    count;
+	int    calls;
+};
+
+struct p2p_ops_benchmark {
+	struct p2p_op_result keygen;
+	struct p2p_op_result aead_enc;
+	struct p2p_op_result aead_dec;
+	struct p2p_op_result signature;
+	struct p2p_op_result verification;
+	struct p2p_op_result ecdh;
+	struct p2p_op_result hkdf;
+	struct p2p_op_result hash;
+	struct p2p_op_result pq_keygen;
+	struct p2p_op_result pq_encaps;
+	struct p2p_op_result pq_decaps;
+	struct p2p_op_result pq_sig_sign;
+	struct p2p_op_result pq_sig_verify;
+	struct p2p_op_result pq_aead_enc;
+	struct p2p_op_result pq_aead_dec;
+	struct p2p_op_result pq_hkdf;
+	struct p2p_op_result pq_hash;
+};
+
+struct p2p_prim_cache {
+	struct p2p_op_result keygen;
+	struct p2p_op_result aead_enc;
+	struct p2p_op_result aead_dec;
+	struct p2p_op_result signature;
+	struct p2p_op_result verification;
+	struct p2p_op_result ecdh;
+	struct p2p_op_result hkdf;
+	struct p2p_op_result hash;
+	struct p2p_op_result pq_keygen;
+	struct p2p_op_result pq_encaps;
+	struct p2p_op_result pq_decaps;
+	struct p2p_op_result pq_sig_sign;
+	struct p2p_op_result pq_sig_verify;
+	struct p2p_op_result pq_aead_enc;
+	struct p2p_op_result pq_aead_dec;
+	struct p2p_op_result pq_hkdf;
+	struct p2p_op_result pq_hash;
+};
+
+/* ---- Individual crypto benchmarks ---- */
+static struct p2p_op_result p2p_bench_keygen(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	for (int i = 0; i < iterations; i++) {
+		uint8_t sk[32], pk[32];
+		struct byte_array ska = {.len=32,.ptr=sk}, pka = {.len=32,.ptr=pk};
+		uint64_t s = p2p_cpu_ns();
+		enum err e = ephemeral_dh_key_gen(X25519, (uint32_t)(i*37+42), &ska, &pka);
+		uint64_t end = p2p_cpu_ns();
+		if (e == ok) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_aead_enc(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t pt[32], key[16], nonce[13], aad[16], ct[64], tag[8];
+	memset(pt,0xAA,32); memset(key,0xBB,16); memset(nonce,0xCC,13); memset(aad,0xDD,16);
+	struct byte_array pa={.len=32,.ptr=pt}, ka={.len=16,.ptr=key};
+	struct byte_array na={.len=13,.ptr=nonce}, aa={.len=16,.ptr=aad};
+	struct byte_array ca={.len=32,.ptr=ct}, ta={.len=8,.ptr=tag};
+	for (int i = 0; i < iterations; i++) {
+		ca.len=32; ta.len=8;
+		uint64_t s = p2p_cpu_ns();
+		enum err e = aead(ENCRYPT, &pa, &ka, &na, &aa, &ca, &ta);
+		uint64_t end = p2p_cpu_ns();
+		if (e == ok) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_aead_dec(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t pt[32], key[16], nonce[13], aad[16], ct[64], tag[8], dec[64];
+	memset(pt,0xAA,32); memset(key,0xBB,16); memset(nonce,0xCC,13); memset(aad,0xDD,16);
+	struct byte_array pa={.len=32,.ptr=pt}, ka={.len=16,.ptr=key};
+	struct byte_array na={.len=13,.ptr=nonce}, aa={.len=16,.ptr=aad};
+	struct byte_array ca={.len=32,.ptr=ct}, ta={.len=8,.ptr=tag};
+	if (aead(ENCRYPT, &pa, &ka, &na, &aa, &ca, &ta) != ok) return r;
+	uint8_t ct_tag[64]; memcpy(ct_tag, ct, ca.len); memcpy(ct_tag+ca.len, tag, ta.len);
+	uint32_t ctl = ca.len + ta.len;
+	struct byte_array ci={.len=ctl,.ptr=ct_tag}, da={.len=32,.ptr=dec}, dt={.len=8,.ptr=tag};
+	for (int i = 0; i < iterations; i++) {
+		da.len=32; dt.len=8;
+		uint64_t s = p2p_cpu_ns();
+		enum err e = aead(DECRYPT, &ci, &ka, &na, &aa, &da, &dt);
+		uint64_t end = p2p_cpu_ns();
+		if (e == ok) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_signature(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	struct byte_array sk={.len=T1_RFC9529__SK_I_LEN,.ptr=(uint8_t*)T1_RFC9529__SK_I};
+	struct byte_array pk={.len=T1_RFC9529__PK_I_LEN,.ptr=(uint8_t*)T1_RFC9529__PK_I};
+	uint8_t msg[64]; memset(msg,0x42,64);
+	struct byte_array ma={.len=64,.ptr=msg};
+	uint8_t sig[64];
+	for (int i = 0; i < iterations; i++) {
+		uint64_t s = p2p_cpu_ns();
+		enum err e = sign(EdDSA, &sk, &pk, &ma, sig);
+		uint64_t end = p2p_cpu_ns();
+		if (e == ok) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_verification(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	struct byte_array sk={.len=T1_RFC9529__SK_I_LEN,.ptr=(uint8_t*)T1_RFC9529__SK_I};
+	struct byte_array pk={.len=T1_RFC9529__PK_I_LEN,.ptr=(uint8_t*)T1_RFC9529__PK_I};
+	uint8_t msg[64]; memset(msg,0x42,64);
+	struct byte_array ma={.len=64,.ptr=msg}; uint8_t sig[64];
+	if (sign(EdDSA, &sk, &pk, &ma, sig) != ok) return r;
+	struct const_byte_array cm={.len=64,.ptr=msg}, cs={.len=64,.ptr=sig};
+	for (int i = 0; i < iterations; i++) {
+		bool verified = false;
+		uint64_t s = p2p_cpu_ns();
+		enum err e = verify(EdDSA, &pk, &cm, &cs, &verified);
+		uint64_t end = p2p_cpu_ns();
+		if (e == ok && verified) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_ecdh(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	struct byte_array sk={.len=T1_RFC9529__X_LEN,.ptr=(uint8_t*)T1_RFC9529__X};
+	struct byte_array pk={.len=T1_RFC9529__G_Y_LEN,.ptr=(uint8_t*)T1_RFC9529__G_Y};
+	uint8_t ss[32];
+	for (int i = 0; i < iterations; i++) {
+		uint64_t s = p2p_cpu_ns();
+		enum err e = shared_secret_derive(X25519, &sk, &pk, ss);
+		uint64_t end = p2p_cpu_ns();
+		if (e == ok) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_hkdf_op(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t salt[32], ikm[32], prk[32], info[16], okm[32];
+	memset(salt,0x11,32); memset(ikm,0x22,32); memset(info,0x33,16);
+	struct byte_array sa={.len=32,.ptr=salt}, ia={.len=32,.ptr=ikm};
+	struct byte_array pa={.len=32,.ptr=prk}, fa={.len=16,.ptr=info};
+	struct byte_array oa={.len=32,.ptr=okm};
+	for (int i = 0; i < iterations; i++) {
+		uint64_t s = p2p_cpu_ns();
+		enum err e = hkdf_extract(SHA_256, &sa, &ia, prk);
+		if (e != ok) continue;
+		oa.len = 32;
+		e = hkdf_expand(SHA_256, &pa, &fa, &oa);
+		uint64_t end = p2p_cpu_ns();
+		if (e == ok) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_hash_op(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t msg[128], out[32]; memset(msg,0x55,128);
+	struct byte_array ma={.len=128,.ptr=msg}, oa={.len=32,.ptr=out};
+	for (int i = 0; i < iterations; i++) {
+		oa.len = 32;
+		uint64_t s = p2p_cpu_ns();
+		enum err e = hash(SHA_256, &ma, &oa);
+		uint64_t end = p2p_cpu_ns();
+		if (e == ok) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_pq_keygen_op(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN];
+	for (int i = 0; i < iterations; i++) {
+		uint64_t s = p2p_cpu_ns();
+		int ret = pq_kem_keygen(pk, sk);
+		uint64_t end = p2p_cpu_ns();
+		if (ret == 0) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_pq_encaps(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN], ct[PQ_KEM_CT_LEN], ss[PQ_KEM_SS_LEN];
+	if (pq_kem_keygen(pk, sk) != 0) return r;
+	for (int i = 0; i < iterations; i++) {
+		uint64_t s = p2p_cpu_ns();
+		int ret = pq_kem_encaps(ct, ss, pk);
+		uint64_t end = p2p_cpu_ns();
+		if (ret == 0) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_pq_decaps(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN], ct[PQ_KEM_CT_LEN], ss[PQ_KEM_SS_LEN], ss2[PQ_KEM_SS_LEN];
+	if (pq_kem_keygen(pk, sk) != 0) return r;
+	if (pq_kem_encaps(ct, ss, pk) != 0) return r;
+	for (int i = 0; i < iterations; i++) {
+		uint64_t s = p2p_cpu_ns();
+		int ret = pq_kem_decaps(ss2, ct, sk);
+		uint64_t end = p2p_cpu_ns();
+		if (ret == 0) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_pq_sig_sign(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t pk[PQ_SIG_PK_LEN], sk[PQ_SIG_SK_LEN], sig[PQ_SIG_MAX_LEN], msg[64];
+	memset(msg, 0xAA, 64);
+	if (pq_sig_keygen(pk, sk) != 0) return r;
+	for (int i = 0; i < iterations; i++) {
+		size_t sl = 0;
+		uint64_t s = p2p_cpu_ns();
+		int ret = pq_sig_sign(msg, 64, sk, sig, &sl);
+		uint64_t end = p2p_cpu_ns();
+		if (ret == 0) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_pq_sig_verify(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t pk[PQ_SIG_PK_LEN], sk[PQ_SIG_SK_LEN], sig[PQ_SIG_MAX_LEN], msg[64];
+	size_t sl = 0; memset(msg, 0xAA, 64);
+	if (pq_sig_keygen(pk, sk) != 0) return r;
+	if (pq_sig_sign(msg, 64, sk, sig, &sl) != 0) return r;
+	for (int i = 0; i < iterations; i++) {
+		uint64_t s = p2p_cpu_ns();
+		int ret = pq_sig_verify(msg, 64, sig, sl, pk);
+		uint64_t end = p2p_cpu_ns();
+		if (ret == 0) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_pq_aead_enc(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t key[PQ_AEAD_KEY_LEN], iv[PQ_AEAD_NONCE_LEN], pt[32], ct[32+PQ_AEAD_TAG_LEN];
+	memset(key,0xBB,sizeof(key)); memset(iv,0xCC,sizeof(iv)); memset(pt,0xAA,32);
+	for (int i = 0; i < iterations; i++) {
+		size_t cl = 0;
+		uint64_t s = p2p_cpu_ns();
+		int ret = pq_aead_encrypt(key, iv, NULL, 0, pt, 32, ct, &cl);
+		uint64_t end = p2p_cpu_ns();
+		if (ret == 0) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_pq_aead_dec(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t key[PQ_AEAD_KEY_LEN], iv[PQ_AEAD_NONCE_LEN], pt[32], ct[32+PQ_AEAD_TAG_LEN], dec[32];
+	memset(key,0xBB,sizeof(key)); memset(iv,0xCC,sizeof(iv)); memset(pt,0xAA,32);
+	size_t cl = 0;
+	if (pq_aead_encrypt(key, iv, NULL, 0, pt, 32, ct, &cl) != 0) return r;
+	for (int i = 0; i < iterations; i++) {
+		size_t dl = 0;
+		uint64_t s = p2p_cpu_ns();
+		int ret = pq_aead_decrypt(key, iv, NULL, 0, ct, cl, dec, &dl);
+		uint64_t end = p2p_cpu_ns();
+		if (ret == 0) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_pq_hkdf_op(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t salt[32], ikm[32], prk[32], info[16], okm[32];
+	memset(salt,0x11,32); memset(ikm,0x22,32); memset(info,0x33,16);
+	for (int i = 0; i < iterations; i++) {
+		uint64_t s = p2p_cpu_ns();
+		int ret = pq_hkdf_extract(salt, 32, ikm, 32, prk);
+		if (ret == 0) ret = pq_hkdf_expand(prk, info, 16, okm, 32);
+		uint64_t end = p2p_cpu_ns();
+		if (ret == 0) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+static struct p2p_op_result p2p_bench_pq_hash_op(int iterations) {
+	struct p2p_op_result r = {0}; uint64_t total = 0;
+	uint8_t msg[128], out[32]; memset(msg,0x55,128);
+	for (int i = 0; i < iterations; i++) {
+		uint64_t s = p2p_cpu_ns();
+		int ret = pq_hash_sha256(msg, 128, out);
+		uint64_t end = p2p_cpu_ns();
+		if (ret == 0) { total += (end - s); r.count++; }
+	}
+	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
+	return r;
+}
+
+/* Bench all primitives in one go */
+static void p2p_bench_all_primitives(struct p2p_prim_cache *c)
+{
+	const int N = P2P_BENCH_ITERATIONS;
+	const int W = 20;
+
+	/* Warmup */
+	(void)p2p_bench_keygen(W);
+	(void)p2p_bench_aead_enc(W);
+	(void)p2p_bench_aead_dec(W);
+	(void)p2p_bench_signature(W);
+	(void)p2p_bench_verification(W);
+	(void)p2p_bench_ecdh(W);
+	(void)p2p_bench_hkdf_op(W);
+	(void)p2p_bench_hash_op(W);
+	(void)p2p_bench_pq_keygen_op(W);
+	(void)p2p_bench_pq_encaps(W);
+	(void)p2p_bench_pq_decaps(W);
+	(void)p2p_bench_pq_sig_sign(W);
+	(void)p2p_bench_pq_sig_verify(W);
+	(void)p2p_bench_pq_aead_enc(W);
+	(void)p2p_bench_pq_aead_dec(W);
+	(void)p2p_bench_pq_hkdf_op(W);
+	(void)p2p_bench_pq_hash_op(W);
+
+	/* Measurement */
+	c->keygen       = p2p_bench_keygen(N);
+	c->aead_enc     = p2p_bench_aead_enc(N);
+	c->aead_dec     = p2p_bench_aead_dec(N);
+	c->signature    = p2p_bench_signature(N);
+	c->verification = p2p_bench_verification(N);
+	c->ecdh         = p2p_bench_ecdh(N);
+	c->hkdf         = p2p_bench_hkdf_op(N);
+	c->hash         = p2p_bench_hash_op(N);
+	c->pq_keygen    = p2p_bench_pq_keygen_op(N);
+	c->pq_encaps    = p2p_bench_pq_encaps(N);
+	c->pq_decaps    = p2p_bench_pq_decaps(N);
+	c->pq_sig_sign  = p2p_bench_pq_sig_sign(N);
+	c->pq_sig_verify = p2p_bench_pq_sig_verify(N);
+	c->pq_aead_enc  = p2p_bench_pq_aead_enc(N);
+	c->pq_aead_dec  = p2p_bench_pq_aead_dec(N);
+	c->pq_hkdf      = p2p_bench_pq_hkdf_op(N);
+	c->pq_hash      = p2p_bench_pq_hash_op(N);
+}
+
+/* Helper: copy timing from cache with call count */
+static struct p2p_op_result p2p_op(const struct p2p_op_result *src, int calls) {
+	if (calls <= 0) return (struct p2p_op_result){0};
+	struct p2p_op_result r = *src; r.calls = calls; return r;
+}
+static struct p2p_op_result p2p_op_zero(void) { return (struct p2p_op_result){0}; }
+
+/* Assemble ops per variant + role (same call counts as socket benchmark) */
+static void p2p_assemble_classic_ops(const struct p2p_prim_cache *c,
+	int type_num, int is_initiator, struct p2p_ops_benchmark *ops)
+{
+	ops->keygen       = p2p_op(&c->keygen, 1);
+	ops->aead_enc     = p2p_op(&c->aead_enc, is_initiator ? 1 : 0);
+	ops->aead_dec     = p2p_op(&c->aead_dec, is_initiator ? 0 : 1);
+	if (type_num == 0) {
+		ops->signature    = p2p_op(&c->signature, 1);
+		ops->verification = p2p_op(&c->verification, 1);
+	} else {
+		ops->signature    = p2p_op_zero();
+		ops->verification = p2p_op_zero();
+	}
+	ops->ecdh = p2p_op(&c->ecdh, (type_num == 0) ? 1 : 3);
+	ops->hkdf = p2p_op(&c->hkdf, (type_num == 0) ? 8 : 10);
+	ops->hash = p2p_op(&c->hash, 4);
+	memset(&ops->pq_keygen, 0, sizeof(struct p2p_op_result) * 9);
+}
+
+static void p2p_assemble_pq_ops(const struct p2p_prim_cache *c,
+	int pq_type_num, int is_initiator, struct p2p_ops_benchmark *ops)
+{
+	ops->pq_keygen = p2p_op(&c->pq_keygen, 1);
+	ops->pq_encaps = p2p_op(&c->pq_encaps,
+		(pq_type_num == 0) ? 1 : (is_initiator ? 1 : 2));
+	ops->pq_decaps = p2p_op(&c->pq_decaps,
+		(pq_type_num == 0) ? 1 : (is_initiator ? 2 : 1));
+	if (pq_type_num == 0) {
+		ops->pq_sig_sign   = p2p_op(&c->pq_sig_sign, 1);
+		ops->pq_sig_verify = p2p_op(&c->pq_sig_verify, 1);
+	} else {
+		ops->pq_sig_sign   = p2p_op_zero();
+		ops->pq_sig_verify = p2p_op_zero();
+	}
+	ops->pq_aead_enc = p2p_op(&c->pq_aead_enc, is_initiator ? 2 : 1);
+	ops->pq_aead_dec = p2p_op(&c->pq_aead_dec, is_initiator ? 1 : 2);
+	ops->pq_hkdf     = p2p_op(&c->pq_hkdf, 8);
+	ops->pq_hash     = p2p_op(&c->pq_hash, 3);
+	memset(&ops->keygen, 0, sizeof(struct p2p_op_result) * 8);
+}
+
+static void p2p_assemble_hybrid_ops(const struct p2p_prim_cache *c,
+	int is_initiator, struct p2p_ops_benchmark *ops)
+{
+	ops->keygen       = p2p_op(&c->keygen, 1);
+	ops->aead_enc     = p2p_op(&c->aead_enc, 1);
+	ops->aead_dec     = p2p_op(&c->aead_dec, 1);
+	ops->signature    = p2p_op_zero();
+	ops->verification = p2p_op_zero();
+	ops->ecdh         = p2p_op(&c->ecdh, 2);
+	ops->hkdf         = p2p_op(&c->hkdf, 10);
+	ops->hash         = p2p_op(&c->hash, 3);
+	ops->pq_keygen    = p2p_op(&c->pq_keygen, is_initiator ? 1 : 0);
+	ops->pq_encaps    = p2p_op(&c->pq_encaps, is_initiator ? 0 : 1);
+	ops->pq_decaps    = p2p_op(&c->pq_decaps, is_initiator ? 1 : 0);
+	ops->pq_sig_sign  = p2p_op_zero();
+	ops->pq_sig_verify = p2p_op_zero();
+	ops->pq_aead_enc  = p2p_op_zero();
+	ops->pq_aead_dec  = p2p_op_zero();
+	ops->pq_hkdf      = p2p_op_zero();
+	ops->pq_hash      = p2p_op_zero();
+}
+
+/* =============================================================================
  * CSV writers
  * ========================================================================== */
 static void p2p_write_hs_csv(const char *path, const char *role,
@@ -1043,34 +1483,88 @@ static void p2p_write_overhead_csv(const char *path, const char *role,
 }
 
 static void p2p_write_operations_csv(const char *path, const char *role,
-	struct p2p_hs_accum *acc, const struct p2p_precomp *pc)
+	int is_initiator, const struct p2p_prim_cache *cache)
 {
 	FILE *fp = fopen(path, "w");
 	if (!fp) return;
 
 	fprintf(fp, "type,role,operation,avg_time_us,calls_per_handshake,total_per_handshake_us,iterations\n");
-	for (int v = 0; v < 5; v++) {
-		double avg_wall = 0.0, avg_cpu = 0.0, avg_txrx = 0.0;
-		int n = acc[v].success_count;
-		if (n > 0) {
-			double dn = (double)n;
-			avg_wall = acc[v].total_wall / dn;
-			avg_cpu = acc[v].total_cpu / dn;
-			avg_txrx = acc[v].total_txrx / dn;
-		}
 
-		double pre = p2p_precomp_for_variant(v, pc);
-		double processing = avg_cpu - pre;
-		if (processing < 0) processing = 0;
-		double overhead = avg_wall - processing - avg_txrx - pre;
-		if (overhead < 0) overhead = 0;
+#define P2P_WROP(TYPE, ROLE, OP_NAME, OP) \
+	fprintf(fp, "%s,%s,%s,%.3f,%d,%.3f,%d\n", \
+		TYPE, ROLE, OP_NAME, (OP).avg_us, (OP).calls, \
+		(OP).avg_us * (double)(OP).calls, (OP).count)
 
-		/* Keep same schema, aggregate by handshake components */
-		fprintf(fp, "%s,%s,Precomputation,%.3f,1,%.3f,%d\n", P2P_TYPE_LABELS[v], role, pre, pre, n);
-		fprintf(fp, "%s,%s,Processing,%.3f,1,%.3f,%d\n", P2P_TYPE_LABELS[v], role, processing, processing, n);
-		fprintf(fp, "%s,%s,TxRx,%.3f,1,%.3f,%d\n", P2P_TYPE_LABELS[v], role, avg_txrx, avg_txrx, n);
-		fprintf(fp, "%s,%s,Overhead,%.3f,1,%.3f,%d\n", P2P_TYPE_LABELS[v], role, overhead, overhead, n);
-	}
+	struct p2p_ops_benchmark ops;
+
+	/* Classic Type 0 */
+	memset(&ops, 0, sizeof(ops));
+	p2p_assemble_classic_ops(cache, 0, is_initiator, &ops);
+	P2P_WROP("Type0_SigSig", role, "KeyGen", ops.keygen);
+	P2P_WROP("Type0_SigSig", role, "Encap", ops.pq_encaps);
+	P2P_WROP("Type0_SigSig", role, "Decap", ops.pq_decaps);
+	P2P_WROP("Type0_SigSig", role, "AEAD_Enc", ops.aead_enc);
+	P2P_WROP("Type0_SigSig", role, "AEAD_Dec", ops.aead_dec);
+	P2P_WROP("Type0_SigSig", role, "Signature", ops.signature);
+	P2P_WROP("Type0_SigSig", role, "Verification", ops.verification);
+	P2P_WROP("Type0_SigSig", role, "ECDH", ops.ecdh);
+	P2P_WROP("Type0_SigSig", role, "HKDF", ops.hkdf);
+	P2P_WROP("Type0_SigSig", role, "Hash", ops.hash);
+
+	/* Classic Type 3 */
+	memset(&ops, 0, sizeof(ops));
+	p2p_assemble_classic_ops(cache, 3, is_initiator, &ops);
+	P2P_WROP("Type3_MACMAC", role, "KeyGen", ops.keygen);
+	P2P_WROP("Type3_MACMAC", role, "Encap", ops.pq_encaps);
+	P2P_WROP("Type3_MACMAC", role, "Decap", ops.pq_decaps);
+	P2P_WROP("Type3_MACMAC", role, "AEAD_Enc", ops.aead_enc);
+	P2P_WROP("Type3_MACMAC", role, "AEAD_Dec", ops.aead_dec);
+	P2P_WROP("Type3_MACMAC", role, "Signature", ops.signature);
+	P2P_WROP("Type3_MACMAC", role, "Verification", ops.verification);
+	P2P_WROP("Type3_MACMAC", role, "ECDH", ops.ecdh);
+	P2P_WROP("Type3_MACMAC", role, "HKDF", ops.hkdf);
+	P2P_WROP("Type3_MACMAC", role, "Hash", ops.hash);
+
+	/* PQ Type 0 */
+	memset(&ops, 0, sizeof(ops));
+	p2p_assemble_pq_ops(cache, 0, is_initiator, &ops);
+	P2P_WROP("Type0_PQ", role, "PQ_KeyGen", ops.pq_keygen);
+	P2P_WROP("Type0_PQ", role, "PQ_Encaps", ops.pq_encaps);
+	P2P_WROP("Type0_PQ", role, "PQ_Decaps", ops.pq_decaps);
+	P2P_WROP("Type0_PQ", role, "PQ_Signature", ops.pq_sig_sign);
+	P2P_WROP("Type0_PQ", role, "PQ_Verification", ops.pq_sig_verify);
+	P2P_WROP("Type0_PQ", role, "PQ_AEAD_Enc", ops.pq_aead_enc);
+	P2P_WROP("Type0_PQ", role, "PQ_AEAD_Dec", ops.pq_aead_dec);
+	P2P_WROP("Type0_PQ", role, "PQ_HKDF", ops.pq_hkdf);
+	P2P_WROP("Type0_PQ", role, "PQ_Hash", ops.pq_hash);
+
+	/* PQ Type 3 */
+	memset(&ops, 0, sizeof(ops));
+	p2p_assemble_pq_ops(cache, 3, is_initiator, &ops);
+	P2P_WROP("Type3_PQ", role, "PQ_KeyGen", ops.pq_keygen);
+	P2P_WROP("Type3_PQ", role, "PQ_Encaps", ops.pq_encaps);
+	P2P_WROP("Type3_PQ", role, "PQ_Decaps", ops.pq_decaps);
+	P2P_WROP("Type3_PQ", role, "PQ_Signature", ops.pq_sig_sign);
+	P2P_WROP("Type3_PQ", role, "PQ_Verification", ops.pq_sig_verify);
+	P2P_WROP("Type3_PQ", role, "PQ_AEAD_Enc", ops.pq_aead_enc);
+	P2P_WROP("Type3_PQ", role, "PQ_AEAD_Dec", ops.pq_aead_dec);
+	P2P_WROP("Type3_PQ", role, "PQ_HKDF", ops.pq_hkdf);
+	P2P_WROP("Type3_PQ", role, "PQ_Hash", ops.pq_hash);
+
+	/* Hybrid Type 3 */
+	memset(&ops, 0, sizeof(ops));
+	p2p_assemble_hybrid_ops(cache, is_initiator, &ops);
+	P2P_WROP("Type3_Hybrid", role, "KeyGen", ops.keygen);
+	P2P_WROP("Type3_Hybrid", role, "AEAD_Enc", ops.aead_enc);
+	P2P_WROP("Type3_Hybrid", role, "AEAD_Dec", ops.aead_dec);
+	P2P_WROP("Type3_Hybrid", role, "ECDH", ops.ecdh);
+	P2P_WROP("Type3_Hybrid", role, "HKDF", ops.hkdf);
+	P2P_WROP("Type3_Hybrid", role, "Hash", ops.hash);
+	P2P_WROP("Type3_Hybrid", role, "PQ_KeyGen", ops.pq_keygen);
+	P2P_WROP("Type3_Hybrid", role, "PQ_Encaps", ops.pq_encaps);
+	P2P_WROP("Type3_Hybrid", role, "PQ_Decaps", ops.pq_decaps);
+
+#undef P2P_WROP
 
 	fclose(fp);
 }
@@ -1100,6 +1594,12 @@ int run_p2p_responder(int port)
 	snprintf(buf,sizeof(buf),"  Precomp: X25519 keygen=%.3f µs, ML-KEM-768 keygen=%.3f µs",
 		precomp.classic_keygen_us, precomp.pq_keygen_us);
 	print_info(buf);
+
+	/* Benchmark all crypto primitives for operations CSV */
+	print_info("  Benchmarking crypto primitives...");
+	struct p2p_prim_cache prim_cache;
+	p2p_bench_all_primitives(&prim_cache);
+	print_success("  Crypto primitives benchmarked.");
 
 	/* Pre-generate PQ key material (shared across iterations) */
 	uint8_t r_lt_pk[PQ_KEM_PK_LEN],r_lt_sk[PQ_KEM_SK_LEN];
@@ -1186,7 +1686,7 @@ int run_p2p_responder(int port)
 	/* Write CSV */
 	p2p_write_hs_csv(P2P_BENCH_OUTPUT_DIR "/p2p_handshake_responder.csv","Responder",VARIANT_NAMES,acc,5,&precomp);
 	p2p_write_overhead_csv(P2P_BENCH_OUTPUT_DIR "/p2p_overhead_responder.csv","Responder",acc,&precomp,0);
-	p2p_write_operations_csv(P2P_BENCH_OUTPUT_DIR "/p2p_operations_responder.csv","Responder",acc,&precomp);
+	p2p_write_operations_csv(P2P_BENCH_OUTPUT_DIR "/p2p_operations_responder.csv","Responder",0,&prim_cache);
 
 	printf("\n"); print_header("Responder — Handshake Summary (µs, avg)");
 	printf("  %-16s %14s %14s %14s %14s %14s %6s\n","Type","Processing","TxRx","Precompute","Overhead","Total","N");
@@ -1221,6 +1721,12 @@ int run_p2p_initiator(const char *host, int port)
 	snprintf(buf,sizeof(buf),"  Precomp: X25519 keygen=%.3f µs, ML-KEM-768 keygen=%.3f µs",
 		precomp.classic_keygen_us, precomp.pq_keygen_us);
 	print_info(buf);
+
+	/* Benchmark all crypto primitives for operations CSV */
+	print_info("  Benchmarking crypto primitives...");
+	struct p2p_prim_cache prim_cache;
+	p2p_bench_all_primitives(&prim_cache);
+	print_success("  Crypto primitives benchmarked.");
 
 	/* Pre-generate own key material */
 	uint8_t i_lt_pk[PQ_KEM_PK_LEN],i_lt_sk[PQ_KEM_SK_LEN];
@@ -1294,7 +1800,7 @@ int run_p2p_initiator(const char *host, int port)
 	/* Write CSV */
 	p2p_write_hs_csv(P2P_BENCH_OUTPUT_DIR "/p2p_handshake_initiator.csv","Initiator",VARIANT_NAMES,acc,5,&precomp);
 	p2p_write_overhead_csv(P2P_BENCH_OUTPUT_DIR "/p2p_overhead_initiator.csv","Initiator",acc,&precomp,1);
-	p2p_write_operations_csv(P2P_BENCH_OUTPUT_DIR "/p2p_operations_initiator.csv","Initiator",acc,&precomp);
+	p2p_write_operations_csv(P2P_BENCH_OUTPUT_DIR "/p2p_operations_initiator.csv","Initiator",1,&prim_cache);
 
 	printf("\n"); print_header("Initiator — Handshake Summary (µs, avg)");
 	printf("  %-16s %14s %14s %14s %14s %14s %6s\n","Type","Processing","TxRx","Precompute","Overhead","Total","N");
@@ -1364,13 +1870,13 @@ int run_p2p_benchmark(int argc, char *argv[])
 
 	/* ── Phase C: P2P Network Handshake Benchmark ──────────────────── */
 	print_header("Phase C: P2P Network Benchmark (Initiator ↔ Responder)");
-	printf("  → p2p_handshake_%s.csv\n\n", role_tag);
+	printf("  → p2p_handshake_%s.csv, p2p_overhead_%s.csv, p2p_operations_%s.csv\n\n", role_tag, role_tag, role_tag);
 	rc = role ? run_p2p_initiator(host,port) : run_p2p_responder(port);
 	if (rc != 0) {
 		print_error("P2P benchmark failed!");
 		return rc;
 	}
-	print_success("Phase C complete — P2P CSV file written.");
+	print_success("Phase C complete — P2P CSV files written.");
 	printf("\n");
 
 	/* ── Summary ───────────────────────────────────────────────────── */
@@ -1383,6 +1889,8 @@ int run_p2p_benchmark(int argc, char *argv[])
 	printf("    ✓ output/benchmark_overhead_%s.csv\n", role_tag);
 	printf("    ✓ output/benchmark_handshake_%s.csv\n", role_tag);
 	printf("    ✓ output/p2p_handshake_%s.csv\n", role_tag);
+	printf("    ✓ output/p2p_overhead_%s.csv\n", role_tag);
+	printf("    ✓ output/p2p_operations_%s.csv\n", role_tag);
 	printf("\n");
 
 	return 0;
