@@ -1,6 +1,0 @@
-type,role,processing_us,txrx_us,total_us,success_count
-Classic_Type0,Responder,285.382,10815.969,11053.231,1000
-Classic_Type3,Responder,249.363,8776.384,8984.410,1000
-PQ_Type0,Responder,704.835,8936.585,9605.138,1000
-PQ_Type3,Responder,221.522,6784.122,6958.761,1000
-Hybrid_Type3,Responder,260.765,7594.013,7809.113,1000

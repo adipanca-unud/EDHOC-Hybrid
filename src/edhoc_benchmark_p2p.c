@@ -837,21 +837,89 @@ done:
 }
 
 /* =============================================================================
+ * Precomputation: keygen cost per variant (measured once, reused)
+ * ========================================================================== */
+struct p2p_precomp {
+	double classic_keygen_us;   /* X25519 DH keygen */
+	double pq_keygen_us;        /* ML-KEM-768 keygen */
+};
+
+static struct p2p_precomp p2p_measure_precomp(void)
+{
+	struct p2p_precomp pc = {0};
+	const int WARM = 50, N = 200;
+
+	/* X25519 keygen */
+	for (int i = 0; i < WARM; i++) {
+		uint8_t sk[32], pk[32];
+		struct byte_array ska = {.len=32,.ptr=sk}, pka = {.len=32,.ptr=pk};
+		ephemeral_dh_key_gen(X25519, 9000+i, &ska, &pka);
+	}
+	{
+		uint64_t t0 = p2p_cpu_ns();
+		for (int i = 0; i < N; i++) {
+			uint8_t sk[32], pk[32];
+			struct byte_array ska = {.len=32,.ptr=sk}, pka = {.len=32,.ptr=pk};
+			ephemeral_dh_key_gen(X25519, 9500+i, &ska, &pka);
+		}
+		pc.classic_keygen_us = p2p_us(t0, p2p_cpu_ns()) / (double)N;
+	}
+
+	/* ML-KEM-768 keygen */
+	for (int i = 0; i < WARM; i++) {
+		uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN];
+		pq_kem_keygen(pk, sk);
+	}
+	{
+		uint64_t t0 = p2p_cpu_ns();
+		for (int i = 0; i < N; i++) {
+			uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN];
+			pq_kem_keygen(pk, sk);
+		}
+		pc.pq_keygen_us = p2p_us(t0, p2p_cpu_ns()) / (double)N;
+	}
+
+	return pc;
+}
+
+/*
+ * Return precomputation cost (µs) for a given variant index:
+ *   0,1 = Classic (1x X25519 keygen)
+ *   2,3 = PQ      (1x ML-KEM-768 keygen)
+ *   4   = Hybrid  (1x X25519 + 1x ML-KEM-768 keygen)
+ */
+static double p2p_precomp_for_variant(int v, const struct p2p_precomp *pc)
+{
+	switch (v) {
+	case 0: case 1: return pc->classic_keygen_us;
+	case 2: case 3: return pc->pq_keygen_us;
+	case 4:         return pc->classic_keygen_us + pc->pq_keygen_us;
+	default:        return 0;
+	}
+}
+
+/* =============================================================================
  * CSV writers
  * ========================================================================== */
 static void p2p_write_hs_csv(const char *path, const char *role,
-	const char **names, struct p2p_hs_accum *acc, int n_variants)
+	const char **names, struct p2p_hs_accum *acc, int n_variants,
+	const struct p2p_precomp *pc)
 {
 	FILE *fp=fopen(path,"w"); if(!fp) return;
-	fprintf(fp,"type,role,processing_us,txrx_us,total_us,success_count\n");
+	fprintf(fp,"type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us,success_count\n");
 	for(int i=0;i<n_variants;i++){
 		double avg_wall=0,avg_cpu=0,avg_txrx=0;
 		if(acc[i].success_count>0){
 			double n=(double)acc[i].success_count;
 			avg_wall=acc[i].total_wall/n;avg_cpu=acc[i].total_cpu/n;avg_txrx=acc[i].total_txrx/n;
 		}
-		fprintf(fp,"%s,%s,%.3f,%.3f,%.3f,%d\n",
-			names[i],role,avg_cpu,avg_txrx,avg_wall,acc[i].success_count);
+		double precomp = p2p_precomp_for_variant(i, pc);
+		double processing = avg_cpu - precomp;
+		if (processing < 0) processing = 0;
+		double overhead = avg_wall - processing - avg_txrx - precomp;
+		if (overhead < 0) { overhead = 0; avg_wall = processing + avg_txrx + precomp; }
+		fprintf(fp,"%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
+			names[i],role,processing,avg_txrx,precomp,overhead,avg_wall,acc[i].success_count);
 	}
 	fclose(fp);
 }
@@ -874,6 +942,13 @@ int run_p2p_responder(int port)
 	snprintf(buf,sizeof(buf),"  Listening on 0.0.0.0:%d  |  %d iterations per variant",port,P2P_BENCH_HANDSHAKE_ITERATIONS);
 	print_info(buf);
 	mkdir(P2P_BENCH_OUTPUT_DIR,0755);
+
+	/* Measure keygen precomputation costs */
+	print_info("  Measuring keygen precomputation costs...");
+	struct p2p_precomp precomp = p2p_measure_precomp();
+	snprintf(buf,sizeof(buf),"  Precomp: X25519 keygen=%.3f µs, ML-KEM-768 keygen=%.3f µs",
+		precomp.classic_keygen_us, precomp.pq_keygen_us);
+	print_info(buf);
 
 	/* Pre-generate PQ key material (shared across iterations) */
 	uint8_t r_lt_pk[PQ_KEM_PK_LEN],r_lt_sk[PQ_KEM_SK_LEN];
@@ -958,14 +1033,18 @@ int run_p2p_responder(int port)
 	ctrl_s(cfd,P2P_TAG_DONE); close(cfd);
 
 	/* Write CSV */
-	p2p_write_hs_csv(P2P_BENCH_OUTPUT_DIR "/p2p_handshake_responder.csv","Responder",VARIANT_NAMES,acc,5);
+	p2p_write_hs_csv(P2P_BENCH_OUTPUT_DIR "/p2p_handshake_responder.csv","Responder",VARIANT_NAMES,acc,5,&precomp);
 
 	printf("\n"); print_header("Responder — Handshake Summary (µs, avg)");
-	printf("  %-16s %14s %14s %14s %6s\n","Type","CPU","TxRx","Total","N");
+	printf("  %-16s %14s %14s %14s %14s %14s %6s\n","Type","Processing","TxRx","Precompute","Overhead","Total","N");
 	for(int v=0;v<5;v++){
 		double n=(acc[v].success_count>0)?(double)acc[v].success_count:1;
-		printf("  %-16s %14.1f %14.1f %14.1f %6d\n",VARIANT_NAMES[v],
-			acc[v].total_cpu/n,acc[v].total_txrx/n,acc[v].total_wall/n,acc[v].success_count);
+		double avg_cpu=acc[v].total_cpu/n, avg_txrx=acc[v].total_txrx/n, avg_wall=acc[v].total_wall/n;
+		double pre=p2p_precomp_for_variant(v,&precomp);
+		double proc=avg_cpu-pre; if(proc<0) proc=0;
+		double ovh=avg_wall-proc-avg_txrx-pre; if(ovh<0) ovh=0;
+		printf("  %-16s %14.1f %14.1f %14.1f %14.1f %14.1f %6d\n",VARIANT_NAMES[v],
+			proc,avg_txrx,pre,ovh,avg_wall,acc[v].success_count);
 	}
 	printf("\n"); print_success("P2P Responder benchmark completed!");
 	return 0;
@@ -982,6 +1061,13 @@ int run_p2p_initiator(const char *host, int port)
 	snprintf(buf,sizeof(buf),"  Connecting to %s:%d  |  %d iterations per variant",host,port,P2P_BENCH_HANDSHAKE_ITERATIONS);
 	print_info(buf);
 	mkdir(P2P_BENCH_OUTPUT_DIR,0755);
+
+	/* Measure keygen precomputation costs */
+	print_info("  Measuring keygen precomputation costs...");
+	struct p2p_precomp precomp = p2p_measure_precomp();
+	snprintf(buf,sizeof(buf),"  Precomp: X25519 keygen=%.3f µs, ML-KEM-768 keygen=%.3f µs",
+		precomp.classic_keygen_us, precomp.pq_keygen_us);
+	print_info(buf);
 
 	/* Pre-generate own key material */
 	uint8_t i_lt_pk[PQ_KEM_PK_LEN],i_lt_sk[PQ_KEM_SK_LEN];
@@ -1053,14 +1139,18 @@ int run_p2p_initiator(const char *host, int port)
 	ctrl_r(cfd,cb,sizeof(cb)); close(cfd);
 
 	/* Write CSV */
-	p2p_write_hs_csv(P2P_BENCH_OUTPUT_DIR "/p2p_handshake_initiator.csv","Initiator",VARIANT_NAMES,acc,5);
+	p2p_write_hs_csv(P2P_BENCH_OUTPUT_DIR "/p2p_handshake_initiator.csv","Initiator",VARIANT_NAMES,acc,5,&precomp);
 
 	printf("\n"); print_header("Initiator — Handshake Summary (µs, avg)");
-	printf("  %-16s %14s %14s %14s %6s\n","Type","CPU","TxRx","Total","N");
+	printf("  %-16s %14s %14s %14s %14s %14s %6s\n","Type","Processing","TxRx","Precompute","Overhead","Total","N");
 	for(int v=0;v<5;v++){
 		double n=(acc[v].success_count>0)?(double)acc[v].success_count:1;
-		printf("  %-16s %14.1f %14.1f %14.1f %6d\n",VARIANT_NAMES[v],
-			acc[v].total_cpu/n,acc[v].total_txrx/n,acc[v].total_wall/n,acc[v].success_count);
+		double avg_cpu=acc[v].total_cpu/n, avg_txrx=acc[v].total_txrx/n, avg_wall=acc[v].total_wall/n;
+		double pre=p2p_precomp_for_variant(v,&precomp);
+		double proc=avg_cpu-pre; if(proc<0) proc=0;
+		double ovh=avg_wall-proc-avg_txrx-pre; if(ovh<0) ovh=0;
+		printf("  %-16s %14.1f %14.1f %14.1f %14.1f %14.1f %6d\n",VARIANT_NAMES[v],
+			proc,avg_txrx,pre,ovh,avg_wall,acc[v].success_count);
 	}
 	printf("\n"); print_success("P2P Initiator benchmark completed!");
 	return 0;

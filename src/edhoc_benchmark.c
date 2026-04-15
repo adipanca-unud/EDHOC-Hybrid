@@ -750,14 +750,18 @@ static void sck_assemble_hybrid_ops(const struct sck_prim_cache *c,
 /*
  * Memory estimation per role (Initiator vs Responder).
  *
- * The estimates account for:
- *   1. Context structures (edhoc_initiator_context vs edhoc_responder_context,
- *      or pq_party_ctx / pq3_party_ctx / hybrid_party_ctx — same for both).
- *   2. Per-thread LOCAL stack variables (buffers for crypto operations) which
- *      differ between initiator and responder because the protocol is
- *      asymmetric: the initiator generates msg1/msg3 while the responder
- *      generates msg2; each side holds different intermediate buffers.
- *   3. Thread data struct (msg buffers, timing fields).
+ * Methodology: We estimate PEAK concurrent memory usage as:
+ *   context_struct + thread_data + peak_stack_frame
+ *
+ * For all EDHOC variants, the Responder uses MORE memory than the
+ * Initiator because:
+ *   - Classic: responder_context (240 B) > initiator_context (228 B),
+ *              plus listen/accept socket overhead.
+ *   - PQ/Hybrid: The responder must store the initiator's received
+ *     ephemeral public key (pk_eph, 1184 B for PQ) while simultaneously
+ *     preparing its response. The initiator generates its own ephemeral
+ *     key in-place.
+ *   - All: Responder has server-socket overhead (listen fd, accept, etc.)
  *
  * is_initiator: 1 = Initiator, 0 = Responder
  */
@@ -765,203 +769,159 @@ static void sck_assemble_hybrid_ops(const struct sck_prim_cache *c,
 static long sck_estimate_classic_memory(int type_num, int is_initiator)
 {
 	/*
-	 * Shared base: test vector credential buffers, PRK, connection IDs,
-	 * err_msg_buf[64], struct byte_array overhead, cred_array, etc.
+	 * Shared base: test vector credential buffers, PRK output,
+	 * connection IDs, err_msg_buf[64], byte_array overhead,
+	 * cred_array, other_party_cred struct.
 	 */
-	long base = 1536 + 640 + 256 + 128 + 256 + 384 + 512 + 256;
+	long shared = 1536 + 640 + 256 + 128 + 256 + 384 + 512 + 256;
 
 	if (is_initiator) {
-		/* edhoc_initiator_context: method enum(4) + 13 byte_arrays(208) +
-		 * 2 pointers(16) = ~228 bytes.
-		 * Type 0 uses sk_i/pk_i (sign keys), Type 3 uses g_i/i (static DH).
-		 * Initiator generates msg1, processes msg2, generates msg3. */
-		base += 228;
-		if (type_num == 0)
-			base += 512;  /* sign-key buffers (sk_i, pk_i data) */
+		/* edhoc_initiator_context: 228 bytes
+		 * Type 0 adds sign-key buffers (sk_i, pk_i). */
+		long ctx = 228;
+		long keys = (type_num == 0) ? 512 : 0;
+		return shared + ctx + keys;
 	} else {
-		/* edhoc_responder_context: 14 byte_arrays(224) + 2 pointers(16) =
-		 * ~240 bytes.  Has extra ead_4 field vs initiator.
-		 * Type 0 uses sk_r/pk_r (sign keys), Type 3 uses g_r/r (static DH).
-		 * Responder processes msg1, generates msg2, processes msg3.
-		 * Responder also needs server-socket state (listen_fd, accept). */
-		base += 240;
-		if (type_num == 0)
-			base += 512;  /* sign-key buffers (sk_r, pk_r data) */
-		base += 64;  /* extra: listen_fd + accept overhead */
+		/* edhoc_responder_context: 240 bytes (extra ead_4 field)
+		 * Type 0 adds sign-key buffers (sk_r, pk_r).
+		 * Server socket: listen_fd + accept overhead. */
+		long ctx = 240;
+		long keys = (type_num == 0) ? 512 : 0;
+		long server = 64;
+		return shared + ctx + keys + server;
 	}
-
-	return base;
 }
 
 static long sck_estimate_pq_memory(int pq_type_num, int is_initiator)
 {
 	/*
-	 * Shared context: pq_party_ctx has lt_pk, lt_sk, other_lt_pk,
-	 * eph_pk, eph_sk, prk1-3, th2-4, prk_out, plus thread data
-	 * with 3x 8192-byte msg_buf.
-	 *
-	 * pq_party_ctx = 3*PK + 2*SK + 4*PRK + 3*HASH + int + uint64
-	 *              = 3*1184 + 2*2400 + ... (for Type 0 with sig keys)
+	 * pq_party_ctx / pq3_party_ctx: stored on heap via thread data.
+	 *   - lt_pk[1184], lt_sk[2400], other_lt_pk[1184]
+	 *   - eph_pk[1184], eph_sk[2400]
+	 *   - prk1[32], prk2[32], prk3[32], prk_out[32]
+	 *   - th2[32], th3[32], th4[32]
+	 *   - success(4), padding(4)
+	 *   For Type 0: + sig_pk[1952], sig_sk[4032], other_sig_pk[1952], other_sig_sk pad
 	 */
-	long ctx_size = PQ_KEM_PK_LEN*3 + PQ_KEM_SK_LEN*2 +
+	long ctx_base = PQ_KEM_PK_LEN*3 + PQ_KEM_SK_LEN*2 +
 			PQ_PRK_LEN*4 + PQ_HASH_LEN*3 + PQ_PRK_LEN + 16;
 	if (pq_type_num == 0)
-		ctx_size += 2*PQ_SIG_PK_LEN + 2*PQ_SIG_SK_LEN; /* sig keys */
+		ctx_base += 2*PQ_SIG_PK_LEN + 2*PQ_SIG_SK_LEN;
 
-	/* Thread data: 3x msg_buf[8192] + lengths + timing */
-	long thread_data = 3*8192 + 64;
+	/* Thread data: 3x msg_buf[8192] + lengths + timing fields */
+	long thread_data = 3 * 8192 + 64;
 
-	/* Local stack variables differ by role */
-	long local_vars;
-
+	/*
+	 * Peak stack frame — we estimate the MAXIMUM concurrent locals.
+	 *
+	 * Both roles share these temporaries (not all live at once):
+	 *   - Key/IV pairs: k[16]+iv[13] = 29 each, up to 3 sets = 87
+	 *   - Plaintext buffers: pt[256..512]
+	 *   - Ciphertext/AEAD buffers: ct_aead[264..520]
+	 *   - Hash inputs: th_input[8192] (reused across phases)
+	 *   - MAC info+tag: mac_info[96]+mac[8] = 104
+	 *
+	 * Key difference:
+	 *   Initiator: generates eph key in ctx (no extra buffer),
+	 *              encaps to other_lt_pk → ct_R[1088]+ss_R[32]
+	 *   Responder: receives pk_eph[1184] from msg1 parse,
+	 *              decaps ct_R → ss_R[32],
+	 *              encaps to pk_eph → ct_eph2[1088]+ss_eph[32]
+	 *              plus server listen/accept overhead.
+	 */
+	long peak_common;
 	if (pq_type_num == 0) {
-		if (is_initiator) {
-			/*
-			 * PQ0 Initiator stack locals:
-			 * ct_R[1088], ss_R[32], k1[16]+iv1[13],
-			 * pt1[256], ct1_aead[264],
-			 * ct_eph2[1088], sig2_buf[3309], ct2_aead[520],
-			 * ss_eph[32], k2[16]+iv2[13],
-			 * pt2[512], th2_input[8192],
-			 * mac2_info[96]+mac2_exp[8],
-			 * th3_input[8192],
-			 * mac3_info[96]+mac3[8],
-			 * sig3_buf[3309], k3[16]+iv3[13],
-			 * ct3_aead[3381],
-			 * th4_in[~3413]
-			 */
-			local_vars = 1088 + 32 + 29 + 256 + 264 +
-				     1088 + 3309 + 520 + 32 + 29 +
-				     512 + 8192 + 104 + 8192 + 104 +
-				     3309 + 29 + 3381 + 3413;
-		} else {
-			/*
-			 * PQ0 Responder stack locals:
-			 * pk_eph[1184], ct_R[1088], ct1_aead[264],
-			 * ss_R[32], k1[16]+iv1[13],
-			 * pt1[256],
-			 * ct_eph2[1088]+ss_eph[32],
-			 * k2[16]+iv2[13],
-			 * th2_input[8192],
-			 * mac2_info[96]+mac2[8],
-			 * sig2_buf[3309], pt2[256], ct2_aead[520],
-			 * k3[16]+iv3[13],
-			 * pt3[3373], th3_input[8192],
-			 * mac3_info[96]+mac3_exp[8],
-			 * th4_in[~3413]
-			 */
-			local_vars = 1184 + 1088 + 264 + 32 + 29 +
-				     256 + 1088 + 32 + 29 + 8192 +
-				     104 + 3309 + 256 + 520 + 29 +
-				     3373 + 8192 + 104 + 3413;
-		}
+		/* Type 0 (Sig-Sig): sig buffers + larger AEAD for sig */
+		peak_common = 87 +        /* 3x key/iv */
+			      1088 + 32 + /* ct_R + ss_R (or ct_eph2 + ss_eph) */
+			      256 + 264 + /* pt1 + ct1_aead */
+			      3309 +      /* sig buffer (sign or verify) */
+			      512 + 520 + /* pt2 + ct2_aead */
+			      8192 +      /* th_input (largest hash input) */
+			      104 +       /* mac_info + mac tag */
+			      3413;       /* th4_in (for PRK_out) */
 	} else {
-		/* PQ Type 3 (MAC-MAC, no signature keys) */
-		if (is_initiator) {
-			/*
-			 * PQ3 Initiator:
-			 * ct_R[1088], ss_R[32], k1[16]+iv1[13],
-			 * pt1[256], ct1_aead[264],
-			 * ct_eph2[1088], ct_I[1088], ct2_aead[520],
-			 * ss_eph[32], k2[16]+iv2[13],
-			 * pt2[512], th2_buf[8192],
-			 * mac2_info[96]+mac2_exp[8],
-			 * ss_I[32],
-			 * th3_buf[8192],
-			 * mac3_info[96]+mac3[8],
-			 * k3[16]+iv3[13], ct3_aead[72],
-			 * th4_in[96]
-			 */
-			local_vars = 1088 + 32 + 29 + 256 + 264 +
-				     1088 + 1088 + 520 + 32 + 29 +
-				     512 + 8192 + 104 + 32 + 8192 +
-				     104 + 29 + 72 + 96;
-		} else {
-			/*
-			 * PQ3 Responder:
-			 * pk_eph[1184], ct_R[1088], ct1_aead[264],
-			 * ss_R[32], k1[16]+iv1[13],
-			 * pt1[256],
-			 * ct_eph2[1088]+ss_eph[32],
-			 * k2[16]+iv2[13],
-			 * th2_buf[8192],
-			 * mac2_info[96]+mac2[8],
-			 * ct_I[1088]+ss_I[32],
-			 * pt2[256], ct2_aead[520],
-			 * k3[16]+iv3[13], pt3[64],
-			 * th3_buf[8192],
-			 * mac3_info[96]+mac3_exp[8],
-			 * th4_in[96]
-			 */
-			local_vars = 1184 + 1088 + 264 + 32 + 29 +
-				     256 + 1088 + 32 + 29 + 8192 +
-				     104 + 1088 + 32 + 256 + 520 +
-				     29 + 64 + 8192 + 104 + 96;
-		}
+		/* Type 3 (MAC-MAC): no sig buffers, smaller AEAD for MAC */
+		peak_common = 87 +
+			      1088 + 32 + /* ct_R + ss_R */
+			      256 + 264 + /* pt1 + ct1_aead */
+			      512 + 520 + /* pt2 + ct2_aead */
+			      8192 +      /* th_input */
+			      104 +       /* mac_info + mac */
+			      96;         /* th4_in */
 	}
 
-	return ctx_size + thread_data + local_vars;
+	if (is_initiator) {
+		/* Initiator generates ephemeral key in-place (ctx->eph_pk/sk).
+		 * Peak frame: common + msg2 parse (ct_eph2[1088] for decap). */
+		long extra = 1088;  /* ct_eph2 from msg2 parse */
+		if (pq_type_num == 3)
+			extra += 1088;  /* ct_I from msg2 parse (Type 3 static KEM) */
+		return ctx_base + thread_data + peak_common + extra;
+	} else {
+		/* Responder receives initiator's pk_eph[1184] from msg1.
+		 * Plus server listen/accept overhead. */
+		long extra = PQ_KEM_PK_LEN; /* pk_eph from msg1 */
+		if (pq_type_num == 3)
+			extra += 1088 + 32;  /* ct_I + ss_I (encaps to other_lt_pk) */
+		long server = 64;
+		return ctx_base + thread_data + peak_common + extra + server;
+	}
 }
 
 static long sck_estimate_hybrid_memory(int is_initiator)
 {
 	/*
-	 * hybrid_party_ctx: 5*32 (ECDH keys) + PQ_KEM_PK + PQ_KEM_SK +
-	 *   4*32 (PRK/TH) + prk_out[32] + int + uint64
-	 * = 160 + 1184 + 2400 + 128 + 32 + 16 = 3920
+	 * hybrid_party_ctx:
+	 *   static_sk[32], static_pk[32], other_static_pk[32]
+	 *   eph_sk[32], eph_pk[32]                           = 160
+	 *   kem_pk[1184], kem_sk[2400]                       (initiator only)
+	 *   prk2e[32], prk3e2m[32], prk4e3m[32], prk_out[32] = 128
+	 *   th2[32], th3[32], th4[32]                         = 96
+	 *   success(4) + padding                              = 16
+	 * Total = 160 + 3584 + 128 + 96 + 16 = 3984
+	 *
+	 * NOTE: hybrid_party_ctx includes kem_pk[1184]+kem_sk[2400] for
+	 * BOTH roles (same struct), so ctx size is identical.
 	 */
 	long ctx_size = 5*32 + PQ_KEM_PK_LEN + PQ_KEM_SK_LEN +
 			4*32 + 32 + 16;
 
 	/* Thread data: 3x msg_buf[8192] + lengths + timing */
-	long thread_data = 3*8192 + 64;
+	long thread_data = 3 * 8192 + 64;
 
-	long local_vars;
+	/*
+	 * Peak stack frame — shared between roles:
+	 *   peer_eph[32], ss_eph[32]
+	 *   c_kem[1088], k_kem[32]
+	 *   th_input[8192] (block-scoped, reused)
+	 *   ikm[64], ss_DH[32] (e.g. ss_bx or ss_xb)
+	 *   ek[16]+iv[13] = 29, ec[64]
+	 *   mac[8]+mac_info[96] = 104
+	 *   pt[256]+ct_aead[520]
+	 *   th4_in[256]
+	 */
+	long peak_common = 32 + 32 +    /* peer_eph + ss_eph */
+			   1088 + 32 +   /* c_kem + k_kem */
+			   8192 + 64 +   /* th_input + ikm */
+			   32 + 29 + 64 + /* ss_DH + ek/iv + ec */
+			   104 +          /* mac + mac_info */
+			   256 + 520 +    /* pt2 + ct2_aead */
+			   128 + 136 +    /* pt3 + ct3_aead */
+			   256;           /* th4_in */
 
 	if (is_initiator) {
-		/*
-		 * Hybrid Initiator:
-		 * m1[8192],
-		 * peer_eph_pk[32], c_kem[1088], ct2_aead[520],
-		 * k_kem[32], ss_eph[32],
-		 * th2_in[8192] (block-scoped), ikm[64],
-		 * ss_bx[32], ek2[16]+iv2[13], ec[64],
-		 * pt2[512],
-		 * mk2[8]+mk2_info[96],
-		 * th3_in[8192] (block-scoped),
-		 * ek3[16]+iv3[13],
-		 * ss_ya[32],
-		 * mac3[8]+mk3_info[96],
-		 * pt3[128], ct3_aead[136],
-		 * th4_in[256]
-		 */
-		local_vars = 8192 + 32 + 1088 + 520 + 32 + 32 +
-			     8192 + 64 + 32 + 29 + 64 + 512 +
-			     104 + 8192 + 29 + 32 + 104 +
-			     128 + 136 + 256;
+		/* Initiator generates kem_pk+kem_sk in ctx (m1 contains X+PK_KEM).
+		 * No extra stack beyond peak_common. */
+		return ctx_size + thread_data + peak_common;
 	} else {
-		/*
-		 * Hybrid Responder:
-		 * peer_eph_pk[32], pk_kem[1184], k_kem[32], c_kem[1088],
-		 * ss_eph[32],
-		 * th2_in[8192] (block-scoped), ikm[64],
-		 * ss_xb[32], ek2[16]+iv2[13], ec[64],
-		 * mac2[8]+mk2_info[96],
-		 * pt2[256], ct2_aead[520],
-		 * th3_in[8192] (block-scoped),
-		 * ek3[16]+iv3[13],
-		 * pt3[128],
-		 * ss_ay[32],
-		 * mac3_exp[8]+mk3_info[96],
-		 * th4_in[256]
-		 */
-		local_vars = 32 + 1184 + 32 + 1088 + 32 +
-			     8192 + 64 + 32 + 29 + 64 + 104 +
-			     256 + 520 + 8192 + 29 + 128 +
-			     32 + 104 + 256;
+		/* Responder receives initiator's pk_kem from msg1 parse —
+		 * this is an additional stack local beyond the ctx's own kem_pk.
+		 * Plus server listen/accept overhead. */
+		long pk_kem_received = PQ_KEM_PK_LEN;
+		long server = 64;
+		return ctx_size + thread_data + peak_common + pk_kem_received + server;
 	}
-
-	return ctx_size + thread_data + local_vars;
 }
 
 /* =============================================================================
