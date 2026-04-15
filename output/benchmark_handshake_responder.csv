@@ -1,6 +1,0 @@
-type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us
-Type0_SigSig,Responder,139.067,235.926,13.358,0.000,388.351
-Type3_MACMAC,Responder,124.709,155.478,13.358,0.000,293.545
-Type0_PQ,Responder,528.759,912.079,27.008,0.000,1467.845
-Type3_PQ,Responder,140.934,236.284,27.008,0.000,404.225
-Type3_Hybrid,Responder,167.967,210.602,13.358,0.000,391.927
