@@ -1,0 +1,6 @@
+type,role,cpu_time_us,memory_bytes,memory_note
+Type0_SigSig,Responder,241.609,592,actual_heap
+Type3_MACMAC,Responder,193.793,464,actual_heap
+Type0_PQ,Responder,2648.188,6984,actual_heap
+Type3_PQ,Responder,698.419,424,actual_heap
+Type3_Hybrid,Responder,196.168,424,actual_heap
