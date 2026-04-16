@@ -14,6 +14,9 @@
  *   2. shared_secret_derive(X25519, …) — X25519 ECDH shared secret
  *   3. sign(EdDSA, …)                 — Ed25519 signature
  *   4. verify(EdDSA, …)               — Ed25519 signature verification
+ *   5. hash(SHA_256, …)               — SHA-256 hash
+ *   6. hkdf_extract(SHA_256, …)       — HKDF-Extract (HMAC-SHA256)
+ *   7. hkdf_expand(SHA_256, …)        — HKDF-Expand (HMAC-SHA256)
  */
 
 #include <string.h>
@@ -25,9 +28,6 @@
 
 #include "edhoc/suites.h"
 #include "edhoc/buffer_sizes.h"
-
-/* PSA Crypto for the SHA-256 seed expansion (same API the library uses) */
-#include <psa/crypto.h>
 
 /* ========================================================================
  * 1.  ephemeral_dh_key_gen  —  X25519 key pair from a seed
@@ -44,13 +44,9 @@ enum err ephemeral_dh_key_gen(enum ecdh_alg alg, uint32_t seed,
 	 * Then use crypto_scalarmult_base() for the public key.
 	 */
 	uint8_t seed_hash[32];
-	size_t hash_len = 0;
 
-	psa_status_t st = psa_hash_compute(PSA_ALG_SHA_256,
-					   (const uint8_t *)&seed, sizeof(seed),
-					   seed_hash, sizeof(seed_hash),
-					   &hash_len);
-	if (st != PSA_SUCCESS || hash_len != 32)
+	if (crypto_hash_sha256(seed_hash,
+			       (const uint8_t *)&seed, sizeof(seed)) != 0)
 		return sha_failed;
 
 	/* X25519 clamp (RFC 7748 §5) */
@@ -126,5 +122,77 @@ enum err verify(enum sign_alg alg, const struct byte_array *pk,
 	int rc = crypto_sign_verify_detached(sgn->ptr, msg->ptr, msg->len,
 					     pk->ptr);
 	*result = (rc == 0);
+	return ok;
+}
+
+/* ========================================================================
+ * 5.  hash  —  SHA-256 via libsodium
+ * ======================================================================== */
+enum err hash(enum hash_alg alg, const struct byte_array *in,
+	      struct byte_array *out)
+{
+	if (alg != SHA_256)
+		return crypto_operation_not_implemented;
+
+	if (crypto_hash_sha256(out->ptr, in->ptr, in->len) != 0)
+		return sha_failed;
+
+	out->len = 32;
+	return ok;
+}
+
+/* ========================================================================
+ * 6.  hkdf_extract  —  HMAC-SHA256 via libsodium
+ * ======================================================================== */
+enum err hkdf_extract(enum hash_alg alg, const struct byte_array *salt,
+		      struct byte_array *ikm, uint8_t *out)
+{
+	if (alg != SHA_256)
+		return crypto_operation_not_implemented;
+
+	crypto_auth_hmacsha256_state st;
+	if (salt->ptr && salt->len > 0) {
+		crypto_auth_hmacsha256_init(&st, salt->ptr, salt->len);
+	} else {
+		uint8_t zero_salt[32] = { 0 };
+		crypto_auth_hmacsha256_init(&st, zero_salt, 32);
+	}
+	crypto_auth_hmacsha256_update(&st, ikm->ptr, ikm->len);
+	crypto_auth_hmacsha256_final(&st, out);
+
+	return ok;
+}
+
+/* ========================================================================
+ * 7.  hkdf_expand  —  HMAC-SHA256 via libsodium
+ * ======================================================================== */
+enum err hkdf_expand(enum hash_alg alg, const struct byte_array *prk,
+		     const struct byte_array *info, struct byte_array *out)
+{
+	if (alg != SHA_256)
+		return crypto_operation_not_implemented;
+
+	uint32_t iterations = (out->len + 31) / 32;
+	if (iterations > 255)
+		return hkdf_failed;
+
+	uint8_t t[32];
+	size_t t_len = 0;
+
+	for (uint8_t i = 1; i <= (uint8_t)iterations; i++) {
+		crypto_auth_hmacsha256_state st;
+		crypto_auth_hmacsha256_init(&st, prk->ptr, prk->len);
+		if (i > 1)
+			crypto_auth_hmacsha256_update(&st, t, t_len);
+		crypto_auth_hmacsha256_update(&st, info->ptr, info->len);
+		crypto_auth_hmacsha256_update(&st, &i, 1);
+		crypto_auth_hmacsha256_final(&st, t);
+		t_len = 32;
+
+		size_t remain = out->len - ((size_t)(i - 1) * 32);
+		size_t chunk = (remain > 32) ? 32 : remain;
+		memcpy(out->ptr + ((size_t)(i - 1) * 32), t, chunk);
+	}
+
 	return ok;
 }

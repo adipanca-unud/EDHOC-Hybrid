@@ -21,8 +21,10 @@
 #else
 #include <oqs/oqs.h>
 #endif
-/* mbedTLS PSA for symmetric crypto */
+/* mbedTLS PSA for AEAD (AES-CCM) */
 #include "psa/crypto.h"
+/* libsodium for SHA-256 and HKDF (consistency with classic EDHOC) */
+#include <sodium.h>
 
 /* AES-CCM with 8-byte tag (AES-CCM-16-64-128) */
 #define PQ_CCM_ALG PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_CCM, PQ_AEAD_TAG_LEN)
@@ -98,97 +100,48 @@ int pq_hkdf_extract(const uint8_t *salt, size_t salt_len,
                      const uint8_t *ikm, size_t ikm_len,
                      uint8_t *prk)
 {
-	if (ensure_psa_init() != 0)
-		return -1;
-
 	/*
 	 * HKDF-Extract = HMAC-SHA256(salt, ikm)
-	 * Using PSA MAC API with HMAC-SHA256.
+	 * Using libsodium HMAC-SHA256 for consistency with classic EDHOC.
 	 */
-	psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
-	psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_SIGN_MESSAGE);
-	psa_set_key_algorithm(&attrs, PSA_ALG_HMAC(PSA_ALG_SHA_256));
-	psa_set_key_type(&attrs, PSA_KEY_TYPE_HMAC);
-
-	/* If salt is NULL, use zero salt */
-	uint8_t zero_salt[PQ_PRK_LEN];
-	if (salt == NULL || salt_len == 0) {
+	crypto_auth_hmacsha256_state st;
+	if (salt != NULL && salt_len > 0) {
+		crypto_auth_hmacsha256_init(&st, salt, salt_len);
+	} else {
+		uint8_t zero_salt[PQ_PRK_LEN];
 		memset(zero_salt, 0, PQ_PRK_LEN);
-		salt = zero_salt;
-		salt_len = PQ_PRK_LEN;
+		crypto_auth_hmacsha256_init(&st, zero_salt, PQ_PRK_LEN);
 	}
+	crypto_auth_hmacsha256_update(&st, ikm, ikm_len);
+	crypto_auth_hmacsha256_final(&st, prk);
 
-	psa_key_id_t key_id;
-	psa_status_t status = psa_import_key(&attrs, salt, salt_len, &key_id);
-	if (status != PSA_SUCCESS)
-		return -1;
-
-	size_t mac_len = 0;
-	status = psa_mac_compute(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
-	                         ikm, ikm_len,
-	                         prk, PQ_PRK_LEN, &mac_len);
-
-	psa_destroy_key(key_id);
-	return (status == PSA_SUCCESS && mac_len == PQ_PRK_LEN) ? 0 : -1;
+	return 0;
 }
 
 int pq_hkdf_expand(const uint8_t *prk,
                     const uint8_t *info, size_t info_len,
                     uint8_t *okm, size_t okm_len)
 {
-	if (ensure_psa_init() != 0)
-		return -1;
-
 	/*
-	 * HKDF-Expand: T(1) = HMAC(PRK, info || 0x01)
-	 * For okm_len <= 32 (one block), this is straightforward.
-	 * For larger, we iterate.
+	 * HKDF-Expand using libsodium HMAC-SHA256.
+	 * T(1) = HMAC(PRK, info || 0x01), T(i) = HMAC(PRK, T(i-1) || info || i)
 	 */
-	psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
-	psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_SIGN_MESSAGE);
-	psa_set_key_algorithm(&attrs, PSA_ALG_HMAC(PSA_ALG_SHA_256));
-	psa_set_key_type(&attrs, PSA_KEY_TYPE_HMAC);
-
-	psa_key_id_t key_id;
-	psa_status_t status = psa_import_key(&attrs, prk, PQ_PRK_LEN, &key_id);
-	if (status != PSA_SUCCESS)
-		return -1;
-
 	uint8_t T[PQ_HASH_LEN];
 	size_t T_len = 0;
 	size_t offset = 0;
 	uint8_t counter = 1;
-	int ret = 0;
 
 	while (offset < okm_len) {
-		psa_mac_operation_t op = PSA_MAC_OPERATION_INIT;
-		status = psa_mac_sign_setup(&op, key_id,
-		                            PSA_ALG_HMAC(PSA_ALG_SHA_256));
-		if (status != PSA_SUCCESS) { ret = -1; break; }
+		crypto_auth_hmacsha256_state st;
+		crypto_auth_hmacsha256_init(&st, prk, PQ_PRK_LEN);
 
-		/* T(i) = HMAC(PRK, T(i-1) || info || counter) */
-		if (counter > 1) {
-			status = psa_mac_update(&op, T, T_len);
-			if (status != PSA_SUCCESS) {
-				psa_mac_abort(&op);
-				ret = -1; break;
-			}
-		}
-		if (info_len > 0) {
-			status = psa_mac_update(&op, info, info_len);
-			if (status != PSA_SUCCESS) {
-				psa_mac_abort(&op);
-				ret = -1; break;
-			}
-		}
-		status = psa_mac_update(&op, &counter, 1);
-		if (status != PSA_SUCCESS) {
-			psa_mac_abort(&op);
-			ret = -1; break;
-		}
-
-		status = psa_mac_sign_finish(&op, T, PQ_HASH_LEN, &T_len);
-		if (status != PSA_SUCCESS) { ret = -1; break; }
+		if (counter > 1)
+			crypto_auth_hmacsha256_update(&st, T, T_len);
+		if (info_len > 0)
+			crypto_auth_hmacsha256_update(&st, info, info_len);
+		crypto_auth_hmacsha256_update(&st, &counter, 1);
+		crypto_auth_hmacsha256_final(&st, T);
+		T_len = PQ_HASH_LEN;
 
 		size_t copy_len = okm_len - offset;
 		if (copy_len > T_len)
@@ -198,8 +151,7 @@ int pq_hkdf_expand(const uint8_t *prk,
 		counter++;
 	}
 
-	psa_destroy_key(key_id);
-	return ret;
+	return 0;
 }
 
 int pq_aead_encrypt(const uint8_t *key, const uint8_t *nonce,
@@ -262,15 +214,10 @@ int pq_aead_decrypt(const uint8_t *key, const uint8_t *nonce,
 
 int pq_hash_sha256(const uint8_t *data, size_t data_len, uint8_t *hash_out)
 {
-	if (ensure_psa_init() != 0)
+	if (crypto_hash_sha256(hash_out, data, data_len) != 0)
 		return -1;
 
-	size_t hash_len = 0;
-	psa_status_t status = psa_hash_compute(PSA_ALG_SHA_256,
-	                                       data, data_len,
-	                                       hash_out, PQ_HASH_LEN, &hash_len);
-
-	return (status == PSA_SUCCESS && hash_len == PQ_HASH_LEN) ? 0 : -1;
+	return 0;
 }
 
 /* =============================================================================
