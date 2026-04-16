@@ -41,8 +41,8 @@
 /* Output directory */
 #define P2P_BENCH_OUTPUT_DIR   "output"
 
-/* Default TCP port */
-#define P2P_BENCH_DEFAULT_PORT  19000
+/* Default TCP port — must not overlap with SOCK_BENCH_BASE_PORT range (19000-30999) */
+#define P2P_BENCH_DEFAULT_PORT  15000
 
 /* Maximum host string length */
 #define P2P_MAX_HOST_LEN        256

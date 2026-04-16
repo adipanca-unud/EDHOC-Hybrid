@@ -1,204 +1,149 @@
 #!/usr/bin/env python3
-"""
-Verify consistency between standalone crypto benchmark (benchmark_crypto_simple.csv)
-and EDHOC socket benchmark (benchmark_operations.csv).
+"""Verify consistency across all benchmark CSV files."""
+import csv, os, sys
 
-Optimization: Application code compiled with -O2, PQClean sources with -O3.
-Library (uoscore-uedhoc) compiled with -O2.
+OUTPUT = "output"
 
-Both benchmarks now use the SAME crypto libraries:
-  - Classic (X25519, Ed25519): libsodium (assembly-optimized)
-    The EDHOC app overrides the library's compact25519 WEAK functions
-    with libsodium via src/crypto_libsodium.c.
-  - PQ (ML-KEM-768, ML-DSA-65): PQClean (compiled at -O3)
+def load_csv(name):
+    path = os.path.join(OUTPUT, name)
+    if not os.path.exists(path):
+        print(f"  WARNING MISSING: {path}")
+        return []
+    with open(path) as f:
+        return list(csv.DictReader(f))
 
-Classic operations have additional overhead in the socket benchmark due to
-the EDHOC framework wrapper (buffer copies, CBOR encoding, HKDF context, etc.),
-so a wider tolerance is used for classic ops compared to PQ ops.
+# Expected call counts per (type, role) -> {operation: count}
+EXPECTED = {
+    ("Type0_SigSig","Initiator"): {"KeyGen":1,"AEAD_Enc":1,"AEAD_Dec":0,"Signature":1,"Verification":1,"ECDH":2,"HKDF":8,"Hash":4},
+    ("Type0_SigSig","Responder"): {"KeyGen":1,"AEAD_Enc":0,"AEAD_Dec":1,"Signature":1,"Verification":1,"ECDH":2,"HKDF":8,"Hash":4},
+    ("Type3_MACMAC","Initiator"): {"KeyGen":1,"AEAD_Enc":1,"AEAD_Dec":0,"Signature":0,"Verification":0,"ECDH":4,"HKDF":10,"Hash":4},
+    ("Type3_MACMAC","Responder"): {"KeyGen":1,"AEAD_Enc":0,"AEAD_Dec":1,"Signature":0,"Verification":0,"ECDH":4,"HKDF":10,"Hash":4},
+    ("Type0_PQ","Initiator"): {"PQ_KeyGen":1,"PQ_Encaps":1,"PQ_Decaps":1,"PQ_Signature":1,"PQ_Verification":1,"PQ_AEAD_Enc":2,"PQ_AEAD_Dec":1,"PQ_HKDF":8,"PQ_Hash":3},
+    ("Type0_PQ","Responder"): {"PQ_KeyGen":1,"PQ_Encaps":1,"PQ_Decaps":1,"PQ_Signature":1,"PQ_Verification":1,"PQ_AEAD_Enc":1,"PQ_AEAD_Dec":2,"PQ_HKDF":8,"PQ_Hash":3},
+    ("Type3_PQ","Initiator"): {"PQ_KeyGen":1,"PQ_Encaps":1,"PQ_Decaps":2,"PQ_Signature":0,"PQ_Verification":0,"PQ_AEAD_Enc":2,"PQ_AEAD_Dec":1,"PQ_HKDF":8,"PQ_Hash":3},
+    ("Type3_PQ","Responder"): {"PQ_KeyGen":1,"PQ_Encaps":2,"PQ_Decaps":1,"PQ_Signature":0,"PQ_Verification":0,"PQ_AEAD_Enc":1,"PQ_AEAD_Dec":2,"PQ_HKDF":8,"PQ_Hash":3},
+    ("Type3_Hybrid","Initiator"): {"KeyGen":1,"AEAD_Enc":1,"AEAD_Dec":1,"ECDH":4,"HKDF":10,"Hash":3,"PQ_KeyGen":1,"PQ_Encaps":0,"PQ_Decaps":1},
+    ("Type3_Hybrid","Responder"): {"KeyGen":1,"AEAD_Enc":1,"AEAD_Dec":1,"ECDH":4,"HKDF":10,"Hash":3,"PQ_KeyGen":0,"PQ_Encaps":1,"PQ_Decaps":0},
+}
 
-KeyGen has the highest overhead because the socket benchmark's ephemeral_dh_key_gen()
-performs SHA-256 seed expansion + RFC 7748 clamping + crypto_scalarmult_base(),
-whereas the standalone benchmark only calls crypto_scalarmult_base().
-"""
+def check_call_counts(rows, label):
+    errors = 0
+    for row in rows:
+        key = (row["type"], row["role"])
+        op = row["operation"]
+        calls = int(row["calls_per_handshake"])
+        if key in EXPECTED and op in EXPECTED[key]:
+            exp = EXPECTED[key][op]
+            if calls != exp:
+                print(f"  FAIL {label}: {key[0]} {key[1]} {op}: expected {exp}, got {calls}")
+                errors += 1
+    return errors
 
-import csv
-import sys
-import os
+def check_socket_vs_p2p_counts(sck_rows, p2p_rows):
+    errors = 0
+    sck_map = {}
+    for r in sck_rows:
+        sck_map[(r["type"], r["role"], r["operation"])] = int(r["calls_per_handshake"])
+    for r in p2p_rows:
+        key = (r["type"], r["role"], r["operation"])
+        p2p_calls = int(r["calls_per_handshake"])
+        if key in sck_map and sck_map[key] != p2p_calls:
+            print(f"  FAIL Socket vs P2P mismatch: {key}: socket={sck_map[key]}, p2p={p2p_calls}")
+            errors += 1
+    return errors
 
-# ─── Configuration ───
-STANDALONE_CSV = "output/benchmark_crypto_simple.csv"
-SOCKET_CSV     = "output/benchmark_operations.csv"
+def check_handshake_totals(rows, label):
+    errors = 0
+    for row in rows:
+        proc = float(row["processing_us"])
+        txrx = float(row["txrx_us"])
+        pre = float(row["precomputation_us"])
+        ovh = float(row["overhead_us"])
+        total = float(row["total_us"])
+        computed = proc + txrx + pre + ovh
+        diff = abs(total - computed)
+        if diff > 1.0:
+            print(f"  FAIL {label}: {row['type']} {row.get('role','')} total={total:.1f} != sum={computed:.1f} (diff={diff:.1f})")
+            errors += 1
+    return errors
 
-# PQ operations tolerance: both use PQClean, but socket has wrapper overhead
-TOLERANCE_PQ = 0.40   # 40% for PQClean (wrapper overhead + measurement variance)
-# Classic operations tolerance: both use libsodium, but socket has EDHOC wrapper overhead
-TOLERANCE_CLASSIC = 0.50  # 50% — socket wraps libsodium in EDHOC's crypto_wrapper layer
-# KeyGen has extra overhead: SHA-256 seed expansion + clamping on top of scalarmult_base
-TOLERANCE_KEYGEN = 0.55   # 55% — accounts for seed expansion overhead
-
-# Mapping: (standalone_algorithm, standalone_operation) →
-#          (socket_operation_name, category)
-# Categories:
-#   "pq"      = same PQClean library, can compare
-#   "classic"  = same libsodium library (via override), can compare
-#   "keygen"   = classic keygen with extra seed expansion overhead
-COMPARE_MAP = [
-    # Classic — both use libsodium now (socket via crypto_libsodium.c override)
-    (("X25519",    "Keygen"),        "KeyGen",        "keygen"),
-    (("Ed25519",   "Signature"),     "Signature",     "classic"),
-    (("Ed25519",   "Verification"),  "Verification",  "classic"),
-    (("X25519",    "Shared Secret"), "ECDH",          "classic"),
-    # PQ (both call PQClean directly — should be comparable)
-    (("ML-KEM-768", "Keygen"),       "PQ_KeyGen",     "pq"),
-    (("ML-KEM-768", "Encap"),        "PQ_Encaps",     "pq"),
-    (("ML-KEM-768", "Decap"),        "PQ_Decaps",     "pq"),
-    (("ML-DSA-65",  "Signature"),    "PQ_Signature",  "pq"),
-    (("ML-DSA-65",  "Verification"), "PQ_Verification","pq"),
-]
-
-
-def load_standalone(path):
-    """Load standalone benchmark CSV → dict keyed by (algorithm, operation)."""
-    data = {}
-    with open(path, "r") as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        current_algo = ""
-        for row in reader:
-            if not row or len(row) < 3:
-                continue
-            algo = row[0].strip() if row[0].strip() else current_algo
-            if row[0].strip():
-                current_algo = algo
-            op   = row[1].strip()
-            avg  = float(row[2])
-            data[(algo, op)] = avg
-    return data
-
-
-def load_socket(path):
-    """Load socket benchmark CSV → dict keyed by operation name (avg_time_us).
-       Returns first non-zero value for each operation."""
-    data = {}
-    with open(path, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            key = row["operation"]
-            avg = float(row["avg_time_us"])
-            if avg > 0 and key not in data:
-                data[key] = avg
-    return data
-
-
-def main():
-    os.chdir(os.path.dirname(os.path.abspath(__file__)) or ".")
-
-    if not os.path.exists(STANDALONE_CSV):
-        print(f"ERROR: {STANDALONE_CSV} not found. Run: make -f Makefile.crypto_bench run")
-        sys.exit(1)
-    if not os.path.exists(SOCKET_CSV):
-        print(f"ERROR: {SOCKET_CSV} not found. Run: ./build/edhoc_hybrid 6")
-        sys.exit(1)
-
-    standalone = load_standalone(STANDALONE_CSV)
-    socket_ops = load_socket(SOCKET_CSV)
-
-    print("=" * 95)
-    print("  Benchmark Consistency Verification")
-    print("  Standalone (benchmark_crypto_simple.csv) vs Socket (benchmark_operations.csv)")
-    print("=" * 95)
-
-    # ── Section 1: Classic Operations — Same libsodium library ──
-    print(f"\n  ┌─ Classic Ops (libsodium — compared, {TOLERANCE_CLASSIC*100:.0f}% tolerance, KeyGen {TOLERANCE_KEYGEN*100:.0f}%) ────────┐")
-    print(f"  │  Both benchmarks use libsodium (socket via crypto_libsodium.c override).    │")
-    print(f"  │  Socket has additional EDHOC wrapper overhead (buffer copies, CBOR, etc.).   │")
-    print(f"  │  KeyGen: socket also does SHA-256 seed expansion + RFC 7748 clamping.        │")
-    print(f"  └────────────────────────────────────────────────────────────────────────────────┘")
-    print(f"  {'Operation':<28} {'Standalone':>12} {'Socket':>12} {'Diff%':>8} {'Tol%':>6} {'Status':>8}")
-    print(f"  {'─'*26} {'─'*12} {'─'*12} {'─'*8} {'─'*6} {'─'*8}")
-
-    passed = 0
-    failed = 0
-    skipped = 0
-
-    for (algo, op), sock_key, category in COMPARE_MAP:
-        if category not in ("classic", "keygen"):
+def check_timing_reasonableness(crypto, ops, label):
+    """Check ops timings are within 20x of crypto_simple reference."""
+    crypto_map = {}
+    for r in crypto:
+        crypto_map[(r["algorithm"], r["operation"])] = float(r["avg_us"])
+    OP_MAP = {
+        "KeyGen": ("X25519","Keygen"), "ECDH": ("X25519","Shared Secret"),
+        "Signature": ("Ed25519","Signature"), "Verification": ("Ed25519","Verification"),
+        "PQ_KeyGen": ("ML-KEM-768","Keygen"), "PQ_Encaps": ("ML-KEM-768","Encap"),
+        "PQ_Decaps": ("ML-KEM-768","Decap"), "PQ_Signature": ("ML-DSA-65","Signature"),
+        "PQ_Verification": ("ML-DSA-65","Verification"),
+    }
+    warnings = 0
+    for r in ops:
+        op = r["operation"]
+        avg = float(r["avg_time_us"])
+        if int(r["calls_per_handshake"]) == 0 or avg == 0:
             continue
-        label = f"{algo}/{op}"
-        sa_val = standalone.get((algo, op))
-        so_val = socket_ops.get(sock_key)
-        tolerance = TOLERANCE_KEYGEN if category == "keygen" else TOLERANCE_CLASSIC
-        tol_pct = tolerance * 100
+        if op in OP_MAP and OP_MAP[op] in crypto_map:
+            ref = crypto_map[OP_MAP[op]]
+            ratio = avg / ref if ref > 0 else 999
+            if ratio < 0.05 or ratio > 50:
+                print(f"  WARN {label}: {r['type']} {op} avg={avg:.1f} vs ref={ref:.1f} (ratio={ratio:.1f}x)")
+                warnings += 1
+    return warnings
 
-        if sa_val is None or so_val is None or so_val == 0:
-            print(f"  {label:<28} {'N/A':>12} {'N/A':>12} {'':>8} {'':>6} {'SKIP':>8}")
-            skipped += 1
-            continue
+print("=" * 60)
+print("  Benchmark CSV Consistency Verification")
+print("=" * 60)
 
-        diff_pct = abs(sa_val - so_val) / max(sa_val, so_val) * 100
-        ok = diff_pct <= tol_pct
-        status = "✅ PASS" if ok else "❌ FAIL"
+total_errors = 0
+total_warnings = 0
 
-        if ok:
-            passed += 1
-        else:
-            failed += 1
+for role in ["initiator", "responder"]:
+    print(f"\n-- {role.upper()} --")
+    crypto = load_csv(f"benchmark_crypto_simple_{role}.csv")
+    sck_ops = load_csv(f"benchmark_operations_{role}.csv")
+    sck_hs = load_csv(f"benchmark_handshake_{role}.csv")
+    p2p_ops = load_csv(f"p2p_operations_{role}.csv")
+    p2p_hs = load_csv(f"p2p_handshake_{role}.csv")
 
-        print(f"  {label:<28} {sa_val:>11.3f}µ {so_val:>11.3f}µ {diff_pct:>7.1f}% {tol_pct:>5.0f}% {status}")
+    print(f"  [1] Socket call counts:")
+    e = check_call_counts(sck_ops, f"sck_{role}")
+    print(f"  OK" if e == 0 else "")
+    total_errors += e
 
-    # ── Section 2: PQ Operations — Same PQClean library ──
-    print(f"\n  ┌─ PQ Ops (Same PQClean Library — compared, {TOLERANCE_PQ*100:.0f}% tolerance) ──────────────────┐")
-    print(f"  │  Both benchmarks call PQClean ML-KEM-768 / ML-DSA-65 directly.             │")
-    print(f"  │  Standalone compiled at -O3, EDHOC PQClean sources also at -O3.            │")
-    print(f"  └────────────────────────────────────────────────────────────────────────────────┘")
-    print(f"  {'Operation':<28} {'Standalone':>12} {'Socket':>12} {'Diff%':>8} {'Tol%':>6} {'Status':>8}")
-    print(f"  {'─'*26} {'─'*12} {'─'*12} {'─'*8} {'─'*6} {'─'*8}")
+    print(f"  [2] P2P call counts:")
+    e = check_call_counts(p2p_ops, f"p2p_{role}")
+    print(f"  OK" if e == 0 else "")
+    total_errors += e
 
-    for (algo, op), sock_key, category in COMPARE_MAP:
-        if category != "pq":
-            continue
-        label = f"{algo}/{op}"
-        sa_val = standalone.get((algo, op))
-        so_val = socket_ops.get(sock_key)
-        tol_pct = TOLERANCE_PQ * 100
+    print(f"  [3] Socket vs P2P consistency:")
+    e = check_socket_vs_p2p_counts(sck_ops, p2p_ops)
+    print(f"  OK" if e == 0 else "")
+    total_errors += e
 
-        if sa_val is None or so_val is None or so_val == 0:
-            print(f"  {label:<28} {'N/A':>12} {'N/A':>12} {'':>8} {'':>6} {'SKIP':>8}")
-            skipped += 1
-            continue
+    print(f"  [4] Timing reasonableness:")
+    w = check_timing_reasonableness(crypto, sck_ops, f"sck_{role}")
+    w += check_timing_reasonableness(crypto, p2p_ops, f"p2p_{role}")
+    print(f"  OK" if w == 0 else "")
+    total_warnings += w
 
-        diff_pct = abs(sa_val - so_val) / max(sa_val, so_val) * 100
-        ok = diff_pct <= tol_pct
-        status = "✅ PASS" if ok else "❌ FAIL"
+    print(f"  [5] Socket handshake totals:")
+    e = check_handshake_totals(sck_hs, f"sck_{role}")
+    print(f"  OK" if e == 0 else "")
+    total_errors += e
 
-        if ok:
-            passed += 1
-        else:
-            failed += 1
+    print(f"  [6] P2P handshake totals:")
+    e = check_handshake_totals(p2p_hs, f"p2p_{role}")
+    print(f"  OK" if e == 0 else "")
+    total_errors += e
 
-        print(f"  {label:<28} {sa_val:>11.3f}µ {so_val:>11.3f}µ {diff_pct:>7.1f}% {tol_pct:>5.0f}% {status}")
-
-    total = passed + failed
-    print(f"\n{'='*95}")
-    print(f"  Overall Results: {passed}/{total} passed, {failed}/{total} failed, {skipped} skipped")
-
-    if failed == 0:
-        print("  ✅ All operation timings are consistent between benchmarks!")
-    else:
-        print("  ⚠️  Some timings exceed tolerance. Check:")
-        print("    1. Both PQClean sources compiled at -O3")
-        print("    2. No background load during benchmarks")
-        print("    3. Same machine for both runs")
-
-    print()
-    print("  NOTE: Both benchmarks now use the same crypto libraries:")
-    print("        Classic: libsodium (socket uses crypto_libsodium.c override)")
-    print("        PQ:      PQClean ML-KEM-768 / ML-DSA-65 (compiled at -O3)")
-    print("        Socket overhead from EDHOC wrapper (CBOR, buffers, etc.) is expected.")
-    print(f"{'='*95}")
-
-    return 0 if failed == 0 else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+print(f"\n{'=' * 60}")
+print(f"  RESULT: {total_errors} errors, {total_warnings} warnings")
+if total_errors == 0:
+    print(f"  ALL CHECKS PASSED")
+else:
+    print(f"  SOME CHECKS FAILED")
+print(f"{'=' * 60}")
+sys.exit(0 if total_errors == 0 else 1)

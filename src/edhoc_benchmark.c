@@ -3128,6 +3128,7 @@ static int sck_write_handshake_csv(const char *path,
 
 int run_edhoc_benchmark_socket(const char *role_suffix)
 {
+	setvbuf(stdout, NULL, _IONBF, 0); /* disable buffering for crash debugging */
 	print_header("EDHOC Socket-based Benchmark (TCP localhost, All 5 Variants)");
 	printf("\n");
 	char buf[256];
@@ -3277,8 +3278,8 @@ int run_edhoc_benchmark_socket(const char *role_suffix)
 	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n", "Type", "Role", "Processing", "TxRx", "Precompute", "Overhead", "Total");
 	printf("  %-16s %-12s %14s %14s %14s %14s %14s\n", "────────────────", "────────────", "──────────────", "──────────────", "──────────────", "──────────────", "──────────────");
 
-	#define PROW(T,R,D) printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n", T, R, \
-		(D).processing_us, (D).txrx_us, (D).precomputation_us, (D).overhead_us, (D).total_us)
+	#define PROW(T,R,D) do { printf("  %-16s %-12s %14.3f %14.3f %14.3f %14.3f %14.3f\n", T, R, \
+		(D).processing_us, (D).txrx_us, (D).precomputation_us, (D).overhead_us, (D).total_us); fflush(stdout); } while(0)
 
 	PROW("Type0_SigSig","Initiator",t0_hi); PROW("Type0_SigSig","Responder",t0_hr);
 	PROW("Type3_MACMAC","Initiator",t3_hi); PROW("Type3_MACMAC","Responder",t3_hr);

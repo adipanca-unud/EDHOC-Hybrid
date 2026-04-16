@@ -1,6 +1,0 @@
-type,role,cpu_time_us,memory_bytes,memory_note
-Type0_SigSig,Responder,125.259,4784,estimated_stack_heap
-Type3_MACMAC,Responder,133.717,4272,estimated_stack_heap
-Type0_PQ,Responder,628.858,64257,estimated_stack_heap_pq
-Type3_PQ,Responder,150.933,46783,estimated_stack_heap_pq
-Type3_Hybrid,Responder,213.491,40773,estimated_stack_heap_hybrid
