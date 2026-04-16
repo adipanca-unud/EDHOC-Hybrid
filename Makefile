@@ -91,8 +91,8 @@ CFLAGS += -DSUITES_I_SIZE=1
 CFLAGS += -Wno-unused-parameter -Wno-sign-conversion -Wno-conversion
 CFLAGS += -Wno-cast-qual -Wno-missing-field-initializers -Wno-pointer-arith
 
-# PQClean sources benefit from -O3 (ML-KEM-768/ML-DSA-65 lattice math)
-PQCLEAN_CFLAGS = $(subst -O2,-O3,$(CFLAGS))
+# Keep PQClean build flags aligned with global CFLAGS (no extra -O3 boost)
+PQCLEAN_CFLAGS = $(CFLAGS)
 
 C_INCLUDES  = -I$(INC_DIR)
 C_INCLUDES += -I$(LIB_DIR)/inc

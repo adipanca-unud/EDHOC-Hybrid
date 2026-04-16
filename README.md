@@ -352,4 +352,3 @@ EDHOC-Hybrid/
 ## License
 
 uoscore-uedhoc is dual-licensed under Apache-2.0 and MIT; follow upstream terms.
-
