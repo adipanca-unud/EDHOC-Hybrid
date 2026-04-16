@@ -1,0 +1,6 @@
+type,role,cpu_time_us,memory_bytes,memory_note
+Type0_SigSig,Initiator,4998.336,576,actual_heap
+Type3_MACMAC,Initiator,4016.462,464,actual_heap
+Type0_PQ,Initiator,5885.308,6984,actual_heap
+Type3_PQ,Initiator,1773.727,424,actual_heap
+Type3_Hybrid,Initiator,758.334,424,actual_heap
