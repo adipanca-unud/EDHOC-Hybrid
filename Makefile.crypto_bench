@@ -63,8 +63,8 @@ CFLAGS += -Wno-unused-parameter -Wno-sign-conversion -Wno-conversion
 CFLAGS += -Wno-cast-qual -Wno-missing-field-initializers
 CFLAGS += -DMBEDTLS
 
-# Keep PQClean flags identical to baseline build flags (no -O3 override)
-PQCLEAN_CFLAGS = $(CFLAGS)
+# Force PQClean to build without optimization (always -O0)
+PQCLEAN_CFLAGS = $(filter-out -O%,$(CFLAGS)) -O0
 
 # Include paths
 C_INCLUDES  = -I$(PQCLEAN_DIR)

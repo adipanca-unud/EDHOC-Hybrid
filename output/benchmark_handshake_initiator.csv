@@ -1,6 +1,0 @@
-type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us
-Type0_SigSig,Initiator,5136.211,5033.016,55.911,2040.121,12265.259
-Type3_MACMAC,Initiator,3845.381,3300.907,55.911,1664.990,8867.189
-Type0_PQ,Initiator,1486.007,1148.236,80.011,0.000,2714.255
-Type3_PQ,Initiator,428.559,395.744,80.011,0.000,904.314
-Type3_Hybrid,Initiator,571.889,508.025,135.922,0.000,1215.836
