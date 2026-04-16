@@ -1,0 +1,6 @@
+type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us,success_count
+Classic_Type0,Initiator,3484.086,5963.159,55.869,0.000,9503.114,1000
+Classic_Type3,Initiator,2866.511,4725.303,55.869,0.000,7647.683,1000
+PQ_Type0,Initiator,2114.021,7186.908,72.004,0.000,9372.933,1000
+PQ_Type3,Initiator,627.561,6402.873,72.004,0.000,7102.438,1000
+Hybrid_Type3,Initiator,886.936,5102.686,127.873,0.000,6117.495,1000
