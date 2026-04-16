@@ -1120,9 +1120,9 @@ static struct p2p_op_result p2p_bench_keygen(int iterations) {
 	for (int i = 0; i < iterations; i++) {
 		uint8_t sk[32], pk[32];
 		struct byte_array ska = {.len=32,.ptr=sk}, pka = {.len=32,.ptr=pk};
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		enum err e = ephemeral_dh_key_gen(X25519, (uint32_t)(i*37+42), &ska, &pka);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (e == ok) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1138,9 +1138,9 @@ static struct p2p_op_result p2p_bench_aead_enc(int iterations) {
 	struct byte_array ca={.len=32,.ptr=ct}, ta={.len=8,.ptr=tag};
 	for (int i = 0; i < iterations; i++) {
 		ca.len=32; ta.len=8;
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		enum err e = aead(ENCRYPT, &pa, &ka, &na, &aa, &ca, &ta);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (e == ok) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1160,9 +1160,9 @@ static struct p2p_op_result p2p_bench_aead_dec(int iterations) {
 	struct byte_array ci={.len=ctl,.ptr=ct_tag}, da={.len=32,.ptr=dec}, dt={.len=8,.ptr=tag};
 	for (int i = 0; i < iterations; i++) {
 		da.len=32; dt.len=8;
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		enum err e = aead(DECRYPT, &ci, &ka, &na, &aa, &da, &dt);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (e == ok) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1177,9 +1177,9 @@ static struct p2p_op_result p2p_bench_signature(int iterations) {
 	struct byte_array ma={.len=64,.ptr=msg};
 	uint8_t sig[64];
 	for (int i = 0; i < iterations; i++) {
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		enum err e = sign(EdDSA, &sk, &pk, &ma, sig);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (e == ok) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1196,9 +1196,9 @@ static struct p2p_op_result p2p_bench_verification(int iterations) {
 	struct const_byte_array cm={.len=64,.ptr=msg}, cs={.len=64,.ptr=sig};
 	for (int i = 0; i < iterations; i++) {
 		bool verified = false;
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		enum err e = verify(EdDSA, &pk, &cm, &cs, &verified);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (e == ok && verified) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1211,9 +1211,9 @@ static struct p2p_op_result p2p_bench_ecdh(int iterations) {
 	struct byte_array pk={.len=T1_RFC9529__G_Y_LEN,.ptr=(uint8_t*)T1_RFC9529__G_Y};
 	uint8_t ss[32];
 	for (int i = 0; i < iterations; i++) {
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		enum err e = shared_secret_derive(X25519, &sk, &pk, ss);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (e == ok) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1228,12 +1228,12 @@ static struct p2p_op_result p2p_bench_hkdf_op(int iterations) {
 	struct byte_array pa={.len=32,.ptr=prk}, fa={.len=16,.ptr=info};
 	struct byte_array oa={.len=32,.ptr=okm};
 	for (int i = 0; i < iterations; i++) {
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		enum err e = hkdf_extract(SHA_256, &sa, &ia, prk);
 		if (e != ok) continue;
 		oa.len = 32;
 		e = hkdf_expand(SHA_256, &pa, &fa, &oa);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (e == ok) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1246,9 +1246,9 @@ static struct p2p_op_result p2p_bench_hash_op(int iterations) {
 	struct byte_array ma={.len=128,.ptr=msg}, oa={.len=32,.ptr=out};
 	for (int i = 0; i < iterations; i++) {
 		oa.len = 32;
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		enum err e = hash(SHA_256, &ma, &oa);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (e == ok) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1259,9 +1259,9 @@ static struct p2p_op_result p2p_bench_pq_keygen_op(int iterations) {
 	struct p2p_op_result r = {0}; uint64_t total = 0;
 	uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN];
 	for (int i = 0; i < iterations; i++) {
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		int ret = pq_kem_keygen(pk, sk);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (ret == 0) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1273,9 +1273,9 @@ static struct p2p_op_result p2p_bench_pq_encaps(int iterations) {
 	uint8_t pk[PQ_KEM_PK_LEN], sk[PQ_KEM_SK_LEN], ct[PQ_KEM_CT_LEN], ss[PQ_KEM_SS_LEN];
 	if (pq_kem_keygen(pk, sk) != 0) return r;
 	for (int i = 0; i < iterations; i++) {
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		int ret = pq_kem_encaps(ct, ss, pk);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (ret == 0) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1288,9 +1288,9 @@ static struct p2p_op_result p2p_bench_pq_decaps(int iterations) {
 	if (pq_kem_keygen(pk, sk) != 0) return r;
 	if (pq_kem_encaps(ct, ss, pk) != 0) return r;
 	for (int i = 0; i < iterations; i++) {
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		int ret = pq_kem_decaps(ss2, ct, sk);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (ret == 0) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1304,9 +1304,9 @@ static struct p2p_op_result p2p_bench_pq_sig_sign(int iterations) {
 	if (pq_sig_keygen(pk, sk) != 0) return r;
 	for (int i = 0; i < iterations; i++) {
 		size_t sl = 0;
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		int ret = pq_sig_sign(msg, 64, sk, sig, &sl);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (ret == 0) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1320,9 +1320,9 @@ static struct p2p_op_result p2p_bench_pq_sig_verify(int iterations) {
 	if (pq_sig_keygen(pk, sk) != 0) return r;
 	if (pq_sig_sign(msg, 64, sk, sig, &sl) != 0) return r;
 	for (int i = 0; i < iterations; i++) {
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		int ret = pq_sig_verify(msg, 64, sig, sl, pk);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (ret == 0) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1335,9 +1335,9 @@ static struct p2p_op_result p2p_bench_pq_aead_enc(int iterations) {
 	memset(key,0xBB,sizeof(key)); memset(iv,0xCC,sizeof(iv)); memset(pt,0xAA,32);
 	for (int i = 0; i < iterations; i++) {
 		size_t cl = 0;
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		int ret = pq_aead_encrypt(key, iv, NULL, 0, pt, 32, ct, &cl);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (ret == 0) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1352,9 +1352,9 @@ static struct p2p_op_result p2p_bench_pq_aead_dec(int iterations) {
 	if (pq_aead_encrypt(key, iv, NULL, 0, pt, 32, ct, &cl) != 0) return r;
 	for (int i = 0; i < iterations; i++) {
 		size_t dl = 0;
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		int ret = pq_aead_decrypt(key, iv, NULL, 0, ct, cl, dec, &dl);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (ret == 0) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1366,10 +1366,10 @@ static struct p2p_op_result p2p_bench_pq_hkdf_op(int iterations) {
 	uint8_t salt[32], ikm[32], prk[32], info[16], okm[32];
 	memset(salt,0x11,32); memset(ikm,0x22,32); memset(info,0x33,16);
 	for (int i = 0; i < iterations; i++) {
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		int ret = pq_hkdf_extract(salt, 32, ikm, 32, prk);
 		if (ret == 0) ret = pq_hkdf_expand(prk, info, 16, okm, 32);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (ret == 0) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
@@ -1380,9 +1380,9 @@ static struct p2p_op_result p2p_bench_pq_hash_op(int iterations) {
 	struct p2p_op_result r = {0}; uint64_t total = 0;
 	uint8_t msg[128], out[32]; memset(msg,0x55,128);
 	for (int i = 0; i < iterations; i++) {
-		uint64_t s = p2p_cpu_ns();
+		uint64_t s = p2p_time_ns();
 		int ret = pq_hash_sha256(msg, 128, out);
-		uint64_t end = p2p_cpu_ns();
+		uint64_t end = p2p_time_ns();
 		if (ret == 0) { total += (end - s); r.count++; }
 	}
 	if (r.count > 0) r.avg_us = (double)total / (double)r.count / 1000.0;
