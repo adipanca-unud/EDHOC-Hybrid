@@ -1,6 +1,0 @@
-type,role,processing_us,txrx_us,precomputation_us,overhead_us,total_us,success_count
-Classic_Type0,Responder,94.600,115.815,12.033,0.000,222.449,1000
-Classic_Type3,Responder,103.202,123.528,12.033,0.000,238.763,1000
-PQ_Type0,Responder,531.523,593.350,26.555,0.000,1151.427,1000
-PQ_Type3,Responder,130.835,209.325,26.555,0.000,366.715,1000
-Hybrid_Type3,Responder,195.063,373.801,38.588,0.000,607.452,1000
