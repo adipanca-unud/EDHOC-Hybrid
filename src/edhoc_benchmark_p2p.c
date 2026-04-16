@@ -51,6 +51,7 @@
 #include "edhoc_pq_kem.h"
 #include "edhoc_test_vectors_rfc9529.h"
 #include "edhoc_type3_x25519_testvec.h"
+#include "heap_tracker.h"
 
 /* Low-level crypto APIs (same as edhoc_benchmark.c) */
 #include "common/crypto_wrapper.h"
@@ -196,11 +197,13 @@ static enum err p2p_rx(void *sock, struct byte_array *data) {
  * ========================================================================== */
 struct p2p_hs_result {
 	double wall_us, cpu_us, txrx_us;
+	size_t heap_peak_bytes;
 	int success;
 };
 
 struct p2p_hs_accum {
 	double total_wall, total_cpu, total_txrx;
+	size_t max_heap_peak;
 	int success_count;
 };
 
@@ -224,6 +227,7 @@ static struct p2p_hs_result p2p_classic_initiator(int type, const char *host, in
 	uint8_t prk_buf[32]; struct byte_array prk_out={.ptr=prk_buf,.len=32};
 	enum err result;
 
+	heap_tracker_reset();
 	uint64_t cs = p2p_cpu_ns(), ws = p2p_time_ns();
 
 	if (type == 0) {
@@ -282,7 +286,7 @@ static struct p2p_hs_result p2p_classic_initiator(int type, const char *host, in
 	uint64_t we=p2p_time_ns(), ce=p2p_cpu_ns();
 	close(_p2p_fd); _p2p_fd=-1;
 	res.wall_us=p2p_us(ws,we); res.cpu_us=p2p_us(cs,ce); res.txrx_us=(double)_p2p_txrx/1000.0;
-	res.success=(result==ok)?1:0; return res;
+	res.heap_peak_bytes=heap_tracker_get_peak(); res.success=(result==ok)?1:0; return res;
 }
 
 static struct p2p_hs_result p2p_classic_responder(int type, int listen_fd)
@@ -297,6 +301,7 @@ static struct p2p_hs_result p2p_classic_responder(int type, int listen_fd)
 	uint8_t prk_buf[32]; struct byte_array prk_out={.ptr=prk_buf,.len=32};
 	enum err result;
 
+	heap_tracker_reset();
 	uint64_t cs=p2p_cpu_ns(), ws=p2p_time_ns();
 
 	if (type == 0) {
@@ -355,7 +360,7 @@ static struct p2p_hs_result p2p_classic_responder(int type, int listen_fd)
 	uint64_t we=p2p_time_ns(), ce=p2p_cpu_ns();
 	close(_p2p_fd); _p2p_fd=-1;
 	res.wall_us=p2p_us(ws,we); res.cpu_us=p2p_us(cs,ce); res.txrx_us=(double)_p2p_txrx/1000.0;
-	res.success=(result==ok)?1:0; return res;
+	res.heap_peak_bytes=heap_tracker_get_peak(); res.success=(result==ok)?1:0; return res;
 }
 
 /* =============================================================================
@@ -396,6 +401,7 @@ static struct p2p_hs_result p2p_pq0_initiator(const char *host, int port,
 	uint64_t txrx=0;
 	int ret;
 
+	heap_tracker_reset();
 	uint64_t cs=p2p_cpu_ns(), ws=p2p_time_ns();
 
 	/* Keygen ephemeral */
@@ -471,7 +477,7 @@ static struct p2p_hs_result p2p_pq0_initiator(const char *host, int port,
 done:
 	{uint64_t we=p2p_time_ns(),ce=p2p_cpu_ns();
 	 res.wall_us=p2p_us(ws,we);res.cpu_us=p2p_us(cs,ce);res.txrx_us=(double)txrx/1000.0;
-	 res.success=ctx.success;}
+	 res.heap_peak_bytes=heap_tracker_get_peak(); res.success=ctx.success;}
 	close(fd); return res;
 }
 
@@ -491,6 +497,7 @@ static struct p2p_hs_result p2p_pq0_responder(int listen_fd,
 	uint8_t msg1[P2P_PQ_BUF],msg2[P2P_PQ_BUF],msg3[P2P_PQ_BUF];
 	uint32_t msg1_len=0,msg2_len=0,msg3_len=0;
 	uint64_t txrx=0; int ret;
+	heap_tracker_reset();
 	uint64_t cs=p2p_cpu_ns(),ws=p2p_time_ns();
 	/* Recv msg1 */
 	{uint64_t t=p2p_time_ns();ret=p2p_recv(fd,msg1,P2P_PQ_BUF,&msg1_len);txrx+=(p2p_time_ns()-t);if(ret)goto done;}
@@ -558,7 +565,7 @@ static struct p2p_hs_result p2p_pq0_responder(int listen_fd,
 done:
 	{uint64_t we=p2p_time_ns(),ce=p2p_cpu_ns();
 	 res.wall_us=p2p_us(ws,we);res.cpu_us=p2p_us(cs,ce);res.txrx_us=(double)txrx/1000.0;
-	 res.success=ctx.success;}
+	 res.heap_peak_bytes=heap_tracker_get_peak(); res.success=ctx.success;}
 	close(fd); return res;
 }
 
@@ -579,6 +586,7 @@ static struct p2p_hs_result p2p_pq3_initiator(const char *host, int port,
 	memcpy(ctx.other_lt_pk,r_pk,PQ_KEM_PK_LEN);
 	uint8_t msg1[P2P_PQ_BUF],msg2[P2P_PQ_BUF];uint32_t msg1_len=0,msg2_len=0;
 	uint64_t txrx=0;int ret;
+	heap_tracker_reset();
 	uint64_t cs=p2p_cpu_ns(),ws=p2p_time_ns();
 	ret=pq_kem_keygen(ctx.eph_pk,ctx.eph_sk);if(ret)goto done;
 	uint8_t ct_R[PQ_KEM_CT_LEN],ss_R[PQ_KEM_SS_LEN];
@@ -639,7 +647,7 @@ static struct p2p_hs_result p2p_pq3_initiator(const char *host, int port,
 done:
 	{uint64_t we=p2p_time_ns(),ce=p2p_cpu_ns();
 	 res.wall_us=p2p_us(ws,we);res.cpu_us=p2p_us(cs,ce);res.txrx_us=(double)txrx/1000.0;
-	 res.success=ctx.success;}
+	 res.heap_peak_bytes=heap_tracker_get_peak(); res.success=ctx.success;}
 	close(fd); return res;
 }
 
@@ -655,6 +663,7 @@ static struct p2p_hs_result p2p_pq3_responder(int lfd,
 	uint8_t msg1[P2P_PQ_BUF],msg2[P2P_PQ_BUF],msg3[P2P_PQ_BUF];
 	uint32_t msg1_len=0,msg2_len=0,msg3_len=0;
 	uint64_t txrx=0;int ret;
+	heap_tracker_reset();
 	uint64_t cs=p2p_cpu_ns(),ws=p2p_time_ns();
 	{uint64_t t=p2p_time_ns();ret=p2p_recv(fd,msg1,P2P_PQ_BUF,&msg1_len);txrx+=(p2p_time_ns()-t);if(ret)goto done;}
 	uint8_t *m1=msg1;uint32_t m1o=0;
@@ -713,7 +722,7 @@ static struct p2p_hs_result p2p_pq3_responder(int lfd,
 done:
 	{uint64_t we=p2p_time_ns(),ce=p2p_cpu_ns();
 	 res.wall_us=p2p_us(ws,we);res.cpu_us=p2p_us(cs,ce);res.txrx_us=(double)txrx/1000.0;
-	 res.success=ctx.success;}
+	 res.heap_peak_bytes=heap_tracker_get_peak(); res.success=ctx.success;}
 	close(fd); return res;
 }
 
@@ -782,6 +791,7 @@ static struct p2p_hs_result p2p_hyb_initiator(const char *host, int port,
 	memcpy(ctx.kem_pk,i_kpk,PQ_KEM_PK_LEN);memcpy(ctx.kem_sk,i_ksk,PQ_KEM_SK_LEN);
 	uint8_t m1b[P2P_HYB_BUF],m2b[P2P_HYB_BUF];uint32_t m1l=0,m2l=0;
 	uint64_t txrx=0;int ret;
+	heap_tracker_reset();
 	uint64_t cs=p2p_cpu_ns(),ws=p2p_time_ns();
 	/* Build M1 */
 	uint8_t m1[P2P_HYB_BUF];uint32_t m1_len=0;
@@ -841,7 +851,7 @@ static struct p2p_hs_result p2p_hyb_initiator(const char *host, int port,
 done:
 	{uint64_t we=p2p_time_ns(),ce=p2p_cpu_ns();
 	 res.wall_us=p2p_us(ws,we);res.cpu_us=p2p_us(cs,ce);res.txrx_us=(double)txrx/1000.0;
-	 res.success=ctx.success;}
+	 res.heap_peak_bytes=heap_tracker_get_peak(); res.success=ctx.success;}
 	close(fd);return res;
 }
 
@@ -859,6 +869,7 @@ static struct p2p_hs_result p2p_hyb_responder(int lfd,
 	uint8_t m1b[P2P_HYB_BUF],m2b[P2P_HYB_BUF],m3b[P2P_HYB_BUF];
 	uint32_t m1l=0,m2l=0,m3l=0;
 	uint64_t txrx=0;int ret;
+	heap_tracker_reset();
 	uint64_t cs=p2p_cpu_ns(),ws=p2p_time_ns();
 	{uint64_t t=p2p_time_ns();ret=p2p_recv(fd,m1b,P2P_HYB_BUF,&m1l);txrx+=(p2p_time_ns()-t);if(ret)goto done;}
 	uint32_t off=3;uint8_t peer_eph[32];memcpy(peer_eph,m1b+off,32);off+=32;
@@ -913,7 +924,7 @@ static struct p2p_hs_result p2p_hyb_responder(int lfd,
 done:
 	{uint64_t we=p2p_time_ns(),ce=p2p_cpu_ns();
 	 res.wall_us=p2p_us(ws,we);res.cpu_us=p2p_us(cs,ce);res.txrx_us=(double)txrx/1000.0;
-	 res.success=ctx.success;}
+	 res.heap_peak_bytes=heap_tracker_get_peak(); res.success=ctx.success;}
 	close(fd);return res;
 }
 
@@ -1547,9 +1558,9 @@ static void p2p_write_overhead_csv(const char *path, const char *role,
 		double processing = avg_cpu - pre;
 		if (processing < 0) processing = 0;
 
-		long mem = p2p_estimate_memory_by_variant(v, is_initiator);
-		const char *note = (v == 4) ? "estimated_stack_heap_hybrid" :
-				   ((v == 2 || v == 3) ? "estimated_stack_heap_pq" : "estimated_stack_heap");
+		long mem = (long)acc[v].max_heap_peak;
+		const char *note = (v == 4) ? "actual_heap" :
+				   ((v == 2 || v == 3) ? "actual_heap" : "actual_heap");
 
 		fprintf(fp, "%s,%s,%.3f,%ld,%s\n",
 			P2P_TYPE_LABELS[v], role, processing, mem, note);
@@ -1749,7 +1760,9 @@ int run_p2p_responder(int port)
 			}
 			if(r.success){
 				acc[v].total_wall+=r.wall_us; acc[v].total_cpu+=r.cpu_us;
-				acc[v].total_txrx+=r.txrx_us; acc[v].success_count++;
+				acc[v].total_txrx+=r.txrx_us;
+				if(r.heap_peak_bytes>acc[v].max_heap_peak) acc[v].max_heap_peak=r.heap_peak_bytes;
+				acc[v].success_count++;
 			}
 			ctrl_r(cfd,cb,sizeof(cb)); /* ITER_OK */
 		}
@@ -1864,7 +1877,9 @@ int run_p2p_initiator(const char *host, int port)
 			}
 			if(r.success){
 				acc[var_id].total_wall+=r.wall_us; acc[var_id].total_cpu+=r.cpu_us;
-				acc[var_id].total_txrx+=r.txrx_us; acc[var_id].success_count++;
+				acc[var_id].total_txrx+=r.txrx_us;
+				if(r.heap_peak_bytes>acc[var_id].max_heap_peak) acc[var_id].max_heap_peak=r.heap_peak_bytes;
+				acc[var_id].success_count++;
 			}
 			ctrl_s(cfd,P2P_TAG_ITER_OK);
 		}

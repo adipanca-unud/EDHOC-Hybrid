@@ -41,6 +41,7 @@
 #include "edhoc_pq_kem.h"
 #include "edhoc_test_vectors_rfc9529.h"
 #include "edhoc_type3_x25519_testvec.h"
+#include "heap_tracker.h"
 
 /* Low-level crypto APIs */
 #include "common/crypto_wrapper.h"
@@ -993,6 +994,7 @@ struct sck_classic_thread_data {
 	uint64_t cpu_start_ns, cpu_end_ns;
 	uint64_t wall_start_ns, wall_end_ns;
 	uint64_t txrx_ns;
+	size_t   heap_peak_bytes;
 };
 
 /* Classic Initiator thread (client: connects to Responder) */
@@ -1012,6 +1014,7 @@ static void *sck_classic_initiator_thread(void *arg)
 	setsockopt(tl_sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
 	tl_sock_txrx_ns = 0;
+	heap_tracker_reset();
 
 	if (d->type_num == 0) {
 		struct edhoc_initiator_context c_i;
@@ -1072,6 +1075,7 @@ static void *sck_classic_initiator_thread(void *arg)
 		cred_r.ca.len = 0; cred_r.ca.ptr = NULL; cred_r.ca_pk.len = 0; cred_r.ca_pk.ptr = NULL;
 		struct cred_array ca = {.len = 1, .ptr = &cred_r};
 
+		heap_tracker_reset();
 		d->cpu_start_ns = sck_get_thread_cpu_ns();
 		d->wall_start_ns = sck_get_time_ns();
 		d->error = edhoc_initiator_run(&c_i, &ca, &err_msg, &d->prk_out,
@@ -1081,6 +1085,7 @@ static void *sck_classic_initiator_thread(void *arg)
 	}
 
 	d->txrx_ns = tl_sock_txrx_ns;
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	close(tl_sock_fd);
 	tl_sock_fd = -1;
 	return NULL;
@@ -1107,6 +1112,7 @@ static void *sck_classic_responder_thread(void *arg)
 	setsockopt(tl_sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
 	tl_sock_txrx_ns = 0;
+	heap_tracker_reset();
 
 	if (d->type_num == 0) {
 		struct edhoc_responder_context c_r;
@@ -1165,6 +1171,7 @@ static void *sck_classic_responder_thread(void *arg)
 		cred_i.ca.len = 0; cred_i.ca.ptr = NULL; cred_i.ca_pk.len = 0; cred_i.ca_pk.ptr = NULL;
 		struct cred_array ca = {.len = 1, .ptr = &cred_i};
 
+		heap_tracker_reset();
 		d->cpu_start_ns = sck_get_thread_cpu_ns();
 		d->wall_start_ns = sck_get_time_ns();
 		d->error = edhoc_responder_run(&c_r, &ca, &err_msg, &d->prk_out,
@@ -1174,6 +1181,7 @@ static void *sck_classic_responder_thread(void *arg)
 	}
 
 	d->txrx_ns = tl_sock_txrx_ns;
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	close(tl_sock_fd);
 	tl_sock_fd = -1;
 	return NULL;
@@ -1234,6 +1242,7 @@ struct sck_pq_thread_data {
 	uint8_t msg1_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg1_len;
 	uint8_t msg2_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg2_len;
 	uint8_t msg3_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg3_len;
+	size_t  heap_peak_bytes;
 };
 
 /* ── PQ Type 0 Initiator (socket-based, client) ─────────────────────── */
@@ -1251,6 +1260,7 @@ static void *sck_pq0_initiator_thread(void *arg)
 	int opt = 1;
 	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+	heap_tracker_reset();
 	d->cpu_start_ns = sck_get_thread_cpu_ns();
 	d->wall_start_ns = sck_get_time_ns();
 
@@ -1412,12 +1422,14 @@ static void *sck_pq0_initiator_thread(void *arg)
 	d->error = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	close(d->sock_fd); d->sock_fd = -1;
 	return NULL;
 fail:
 	ctx->success = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
 	return NULL;
 }
@@ -1440,6 +1452,7 @@ static void *sck_pq0_responder_thread(void *arg)
 	int opt = 1;
 	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+	heap_tracker_reset();
 	d->cpu_start_ns = sck_get_thread_cpu_ns();
 	d->wall_start_ns = sck_get_time_ns();
 
@@ -1594,12 +1607,14 @@ static void *sck_pq0_responder_thread(void *arg)
 	d->error = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	close(d->sock_fd); d->sock_fd = -1;
 	return NULL;
 fail:
 	ctx->success = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
 	return NULL;
 }
@@ -1640,6 +1655,7 @@ struct sck_pq3_thread_data {
 	uint8_t msg1_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg1_len;
 	uint8_t msg2_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg2_len;
 	uint8_t msg3_buf[SCK_PQ_MSG_BUF_SIZE]; uint32_t msg3_len;
+	size_t  heap_peak_bytes;
 };
 
 /* ── PQ Type 3 Initiator (socket-based, client) ─────────────────────── */
@@ -1657,6 +1673,7 @@ static void *sck_pq3_initiator_thread(void *arg)
 	int opt = 1;
 	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+	heap_tracker_reset();
 	d->cpu_start_ns = sck_get_thread_cpu_ns();
 	d->wall_start_ns = sck_get_time_ns();
 
@@ -1812,12 +1829,14 @@ static void *sck_pq3_initiator_thread(void *arg)
 	d->error = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	close(d->sock_fd); d->sock_fd = -1;
 	return NULL;
 fail:
 	ctx->success = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
 	return NULL;
 }
@@ -1840,6 +1859,7 @@ static void *sck_pq3_responder_thread(void *arg)
 	int opt = 1;
 	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+	heap_tracker_reset();
 	d->cpu_start_ns = sck_get_thread_cpu_ns();
 	d->wall_start_ns = sck_get_time_ns();
 
@@ -1992,12 +2012,14 @@ static void *sck_pq3_responder_thread(void *arg)
 	d->error = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	close(d->sock_fd); d->sock_fd = -1;
 	return NULL;
 fail:
 	ctx->success = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
 	return NULL;
 }
@@ -2116,6 +2138,7 @@ struct sck_hyb_thread_data {
 	uint8_t msg1_buf[SCK_HYB_MSG_BUF_SIZE]; uint32_t msg1_len;
 	uint8_t msg2_buf[SCK_HYB_MSG_BUF_SIZE]; uint32_t msg2_len;
 	uint8_t msg3_buf[SCK_HYB_MSG_BUF_SIZE]; uint32_t msg3_len;
+	size_t  heap_peak_bytes;
 };
 
 /* ── Hybrid Initiator (socket-based, client) ────────────────────────── */
@@ -2133,6 +2156,7 @@ static void *sck_hyb_initiator_thread(void *arg)
 	int opt = 1;
 	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+	heap_tracker_reset();
 	d->cpu_start_ns = sck_get_thread_cpu_ns();
 	d->wall_start_ns = sck_get_time_ns();
 
@@ -2304,12 +2328,14 @@ static void *sck_hyb_initiator_thread(void *arg)
 	d->error = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	close(d->sock_fd); d->sock_fd = -1;
 	return NULL;
 fail:
 	ctx->success = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
 	return NULL;
 }
@@ -2332,6 +2358,7 @@ static void *sck_hyb_responder_thread(void *arg)
 	int opt = 1;
 	setsockopt(d->sock_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+	heap_tracker_reset();
 	d->cpu_start_ns = sck_get_thread_cpu_ns();
 	d->wall_start_ns = sck_get_time_ns();
 
@@ -2504,12 +2531,14 @@ static void *sck_hyb_responder_thread(void *arg)
 	d->error = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	close(d->sock_fd); d->sock_fd = -1;
 	return NULL;
 fail:
 	ctx->success = 0;
 	d->wall_end_ns = sck_get_time_ns();
 	d->cpu_end_ns = sck_get_thread_cpu_ns();
+	d->heap_peak_bytes = heap_tracker_get_peak();
 	if (d->sock_fd >= 0) { close(d->sock_fd); d->sock_fd = -1; }
 	return NULL;
 }
@@ -2536,6 +2565,7 @@ static int sck_run_classic_handshake(int type_num, int base_port,
 	double total_i_wall = 0, total_r_wall = 0;
 	double total_i_cpu  = 0, total_r_cpu  = 0;
 	double total_i_txrx = 0, total_r_txrx = 0;
+	size_t max_heap_i = 0, max_heap_r = 0;
 	int success_count = 0;
 
 	for (int iter = 0; iter < SOCK_BENCH_HANDSHAKE_ITERATIONS; iter++) {
@@ -2565,6 +2595,8 @@ static int sck_run_classic_handshake(int type_num, int base_port,
 			total_r_cpu  += sck_elapsed_us(r_data.cpu_start_ns,  r_data.cpu_end_ns);
 			total_i_txrx += (double)i_data.txrx_ns / 1000.0;
 			total_r_txrx += (double)r_data.txrx_ns / 1000.0;
+			if (i_data.heap_peak_bytes > max_heap_i) max_heap_i = i_data.heap_peak_bytes;
+			if (r_data.heap_peak_bytes > max_heap_r) max_heap_r = r_data.heap_peak_bytes;
 			success_count++;
 		}
 	}
@@ -2587,9 +2619,9 @@ static int sck_run_classic_handshake(int type_num, int base_port,
 	if (proc_r < 0) proc_r = 0;
 
 	oh_init->cpu_us = proc_i;
-	oh_init->memory_bytes = sck_estimate_classic_memory(type_num, 1);
+	oh_init->memory_bytes = (long)max_heap_i;
 	oh_resp->cpu_us = proc_r;
-	oh_resp->memory_bytes = sck_estimate_classic_memory(type_num, 0);
+	oh_resp->memory_bytes = (long)max_heap_r;
 
 	hs_init->processing_us     = proc_i;
 	hs_init->txrx_us           = total_i_txrx / n;
@@ -2652,6 +2684,7 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 	double total_i_wall = 0, total_r_wall = 0;
 	double total_i_cpu  = 0, total_r_cpu  = 0;
 	double total_i_txrx = 0, total_r_txrx = 0;
+	size_t max_heap_i = 0, max_heap_r = 0;
 	int success_count = 0;
 
 	/* PQ threads need a large stack (ML-DSA-65 polyvec matrices ≈ 55 KB) */
@@ -2699,6 +2732,8 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 				total_r_cpu  += sck_elapsed_us(rd.cpu_start_ns,  rd.cpu_end_ns);
 				total_i_txrx += (double)id.txrx_ns / 1000.0;
 				total_r_txrx += (double)rd.txrx_ns / 1000.0;
+				if (id.heap_peak_bytes > max_heap_i) max_heap_i = id.heap_peak_bytes;
+				if (rd.heap_peak_bytes > max_heap_r) max_heap_r = rd.heap_peak_bytes;
 				success_count++;
 			}
 		} else {
@@ -2732,6 +2767,8 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 				total_r_cpu  += sck_elapsed_us(rd.cpu_start_ns,  rd.cpu_end_ns);
 				total_i_txrx += (double)id.txrx_ns / 1000.0;
 				total_r_txrx += (double)rd.txrx_ns / 1000.0;
+				if (id.heap_peak_bytes > max_heap_i) max_heap_i = id.heap_peak_bytes;
+				if (rd.heap_peak_bytes > max_heap_r) max_heap_r = rd.heap_peak_bytes;
 				success_count++;
 			}
 		}
@@ -2750,8 +2787,8 @@ static int sck_run_pq_handshake(int pq_type_num, int base_port,
 	if (proc_i < 0) proc_i = 0;
 	if (proc_r < 0) proc_r = 0;
 
-	oh_init->cpu_us = proc_i; oh_init->memory_bytes = sck_estimate_pq_memory(pq_type_num, 1);
-	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = sck_estimate_pq_memory(pq_type_num, 0);
+	oh_init->cpu_us = proc_i; oh_init->memory_bytes = (long)max_heap_i;
+	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = (long)max_heap_r;
 
 	hs_init->processing_us = proc_i; hs_init->txrx_us = total_i_txrx / n;
 	hs_init->precomputation_us = pre_i; hs_init->total_us = total_i_wall / n;
@@ -2796,6 +2833,7 @@ static int sck_run_hybrid_handshake(int base_port,
 	double total_i_wall = 0, total_r_wall = 0;
 	double total_i_cpu  = 0, total_r_cpu  = 0;
 	double total_i_txrx = 0, total_r_txrx = 0;
+	size_t max_heap_i = 0, max_heap_r = 0;
 	int success_count = 0;
 
 	/* Hybrid threads use ML-KEM-768 which needs extra stack on ARM */
@@ -2846,6 +2884,8 @@ static int sck_run_hybrid_handshake(int base_port,
 			total_r_cpu  += sck_elapsed_us(rd.cpu_start_ns,  rd.cpu_end_ns);
 			total_i_txrx += (double)id.txrx_ns / 1000.0;
 			total_r_txrx += (double)rd.txrx_ns / 1000.0;
+			if (id.heap_peak_bytes > max_heap_i) max_heap_i = id.heap_peak_bytes;
+			if (rd.heap_peak_bytes > max_heap_r) max_heap_r = rd.heap_peak_bytes;
 			success_count++;
 		}
 	}
@@ -2864,8 +2904,8 @@ static int sck_run_hybrid_handshake(int base_port,
 	if (proc_i < 0) proc_i = 0;
 	if (proc_r < 0) proc_r = 0;
 
-	oh_init->cpu_us = proc_i; oh_init->memory_bytes = sck_estimate_hybrid_memory(1);
-	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = sck_estimate_hybrid_memory(0);
+	oh_init->cpu_us = proc_i; oh_init->memory_bytes = (long)max_heap_i;
+	oh_resp->cpu_us = proc_r; oh_resp->memory_bytes = (long)max_heap_r;
 
 	hs_init->processing_us = proc_i; hs_init->txrx_us = total_i_txrx / n;
 	hs_init->precomputation_us = pre_i; hs_init->total_us = total_i_wall / n;
@@ -3062,25 +3102,25 @@ static int sck_write_overhead_csv(const char *path,
 		write_initiator = 0;
 
 	if (write_initiator)
-		fprintf(fp, "Type0_SigSig,Initiator,%.3f,%ld,estimated_stack_heap\n", t0i->cpu_us, t0i->memory_bytes);
+		fprintf(fp, "Type0_SigSig,Initiator,%.3f,%ld,actual_heap\n", t0i->cpu_us, t0i->memory_bytes);
 	if (write_responder)
-		fprintf(fp, "Type0_SigSig,Responder,%.3f,%ld,estimated_stack_heap\n", t0r->cpu_us, t0r->memory_bytes);
+		fprintf(fp, "Type0_SigSig,Responder,%.3f,%ld,actual_heap\n", t0r->cpu_us, t0r->memory_bytes);
 	if (write_initiator)
-		fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%ld,estimated_stack_heap\n", t3i->cpu_us, t3i->memory_bytes);
+		fprintf(fp, "Type3_MACMAC,Initiator,%.3f,%ld,actual_heap\n", t3i->cpu_us, t3i->memory_bytes);
 	if (write_responder)
-		fprintf(fp, "Type3_MACMAC,Responder,%.3f,%ld,estimated_stack_heap\n", t3r->cpu_us, t3r->memory_bytes);
+		fprintf(fp, "Type3_MACMAC,Responder,%.3f,%ld,actual_heap\n", t3r->cpu_us, t3r->memory_bytes);
 	if (write_initiator)
-		fprintf(fp, "Type0_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n", t0pi->cpu_us, t0pi->memory_bytes);
+		fprintf(fp, "Type0_PQ,Initiator,%.3f,%ld,actual_heap\n", t0pi->cpu_us, t0pi->memory_bytes);
 	if (write_responder)
-		fprintf(fp, "Type0_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n", t0pr->cpu_us, t0pr->memory_bytes);
+		fprintf(fp, "Type0_PQ,Responder,%.3f,%ld,actual_heap\n", t0pr->cpu_us, t0pr->memory_bytes);
 	if (write_initiator)
-		fprintf(fp, "Type3_PQ,Initiator,%.3f,%ld,estimated_stack_heap_pq\n", t3pi->cpu_us, t3pi->memory_bytes);
+		fprintf(fp, "Type3_PQ,Initiator,%.3f,%ld,actual_heap\n", t3pi->cpu_us, t3pi->memory_bytes);
 	if (write_responder)
-		fprintf(fp, "Type3_PQ,Responder,%.3f,%ld,estimated_stack_heap_pq\n", t3pr->cpu_us, t3pr->memory_bytes);
+		fprintf(fp, "Type3_PQ,Responder,%.3f,%ld,actual_heap\n", t3pr->cpu_us, t3pr->memory_bytes);
 	if (write_initiator)
-		fprintf(fp, "Type3_Hybrid,Initiator,%.3f,%ld,estimated_stack_heap_hybrid\n", thi->cpu_us, thi->memory_bytes);
+		fprintf(fp, "Type3_Hybrid,Initiator,%.3f,%ld,actual_heap\n", thi->cpu_us, thi->memory_bytes);
 	if (write_responder)
-		fprintf(fp, "Type3_Hybrid,Responder,%.3f,%ld,estimated_stack_heap_hybrid\n", thr->cpu_us, thr->memory_bytes);
+		fprintf(fp, "Type3_Hybrid,Responder,%.3f,%ld,actual_heap\n", thr->cpu_us, thr->memory_bytes);
 	fclose(fp);
 	return 0;
 }

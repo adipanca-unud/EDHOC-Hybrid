@@ -1,0 +1,11 @@
+type,role,cpu_time_us,memory_bytes,memory_note
+Type0_SigSig,Initiator,137.901,576,actual_heap
+Type0_SigSig,Responder,132.784,576,actual_heap
+Type3_MACMAC,Initiator,122.926,464,actual_heap
+Type3_MACMAC,Responder,124.218,464,actual_heap
+Type0_PQ,Initiator,2892.029,6984,actual_heap
+Type0_PQ,Responder,2091.244,6984,actual_heap
+Type3_PQ,Initiator,603.920,424,actual_heap
+Type3_PQ,Responder,434.443,424,actual_heap
+Type3_Hybrid,Initiator,163.705,424,actual_heap
+Type3_Hybrid,Responder,287.926,424,actual_heap

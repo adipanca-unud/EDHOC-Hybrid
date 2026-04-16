@@ -47,6 +47,7 @@ APP_SRCS += $(SRC_DIR)/edhoc_benchmark.c
 APP_SRCS += $(SRC_DIR)/edhoc_benchmark_p2p.c
 APP_SRCS += $(SRC_DIR)/benchmark_crypto.c
 APP_SRCS += $(SRC_DIR)/crypto_libsodium.c
+APP_SRCS += $(SRC_DIR)/heap_tracker.c
 
 TV_SRCS = $(TV_DIR)/edhoc_test_vectors_rfc9529.c
 
@@ -115,10 +116,13 @@ else
 C_INCLUDES += -I$(LIBOQS_BUILD)/include
 endif
 
+# Heap tracker: intercept malloc/free/calloc/realloc for actual memory measurement
+WRAP_FLAGS = -Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc
+
 ifeq ($(USE_PQCLEAN),1)
-LDFLAGS  = -L$(LIB_BUILD) -luoscore-uedhoc -lsodium -lpthread -lm
+LDFLAGS  = -L$(LIB_BUILD) -luoscore-uedhoc -lsodium -lpthread -lm $(WRAP_FLAGS)
 else
-LDFLAGS  = -L$(LIB_BUILD) -luoscore-uedhoc -L$(LIBOQS_BUILD)/lib -loqs -lsodium -lpthread -lm
+LDFLAGS  = -L$(LIB_BUILD) -luoscore-uedhoc -L$(LIBOQS_BUILD)/lib -loqs -lsodium -lpthread -lm $(WRAP_FLAGS)
 endif
 
 .PHONY: all clean lib lib-clean run help
