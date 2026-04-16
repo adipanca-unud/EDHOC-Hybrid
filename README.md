@@ -13,13 +13,29 @@ Classic paths use libsodium for X25519/Ed25519/HKDF-SHA256; PQ paths use PQClean
 | 4    | Type 3 PQ (KEM MAC-MAC)  | ML-KEM-768 (PQClean)                        | MAC with KEM-derived keys | HKDF-HMAC-SHA256 (libsodium)/SHA256 | AES-CCM-16-64-128 (mbedTLS) |
 | 5    | Type 3 Hybrid (MAC-MAC)  | X25519 ECDHE + ML-KEM-768 KEM (chained HKDF)| MAC from hybrid secrets   | HKDF-HMAC-SHA256 (libsodium)        | AES-CCM-16-64-128 (mbedTLS) |
 
+## Algorithm → Library Mapping (Benchmark Fairness)
+
+Untuk memastikan benchmark fair dan konsisten antar varian, implementasi saat ini menggunakan mapping berikut:
+
+| Algorithm | Library yang digunakan | Keterangan |
+|---|---|---|
+| X25519 | libsodium | `crypto_scalarmult*` untuk keygen/ECDH classic + hybrid |
+| ML-KEM-768 | PQClean | KEM keygen/encaps/decaps untuk varian PQ + hybrid |
+| Ed25519 (sign/verify) | libsodium | `crypto_sign_*` untuk Type 0/3 classic |
+| ML-DSA-65 | PQClean | Signature/verification untuk Type 0 PQ |
+| AEAD | mbedTLS PSA (AES-CCM-16-64-128) | `psa_aead_encrypt/decrypt` di semua varian |
+| SHA-256 | libsodium | `crypto_hash_sha256` di semua varian benchmark |
+| HKDF (Extract/Expand) | libsodium (HMAC-SHA256) | Implementasi HKDF berbasis `crypto_auth_hmacsha256_*` |
+
+> Catatan: Mapping ini diselaraskan agar jalur benchmark Classic, PQ, dan Hybrid memakai backend simetris yang sama untuk Hash/HKDF, sehingga tidak terjadi bias perbandingan antar varian.
+
 Menu **6** runs the benchmark (TCP client-server) across all 5 variants. Menu **7** runs a standalone hybrid handshake. Menu **8** runs full benchmarks across classic, PQ, and hybrid, writing CSVs under `output/`. Menu **9** runs the **All-in-One Benchmark** (crypto + socket + P2P network) producing 9 role-suffixed CSV files (`_initiator` / `_responder`) in a single run on each machine.
 
 ## Prerequisites
 
 - GCC (C11), GNU Make
 - Git (for submodules)
-- `libsodium-dev` (X25519, Ed25519, HKDF-SHA256)
+- `libsodium-dev` (X25519, Ed25519, HKDF-SHA256, SHA-256)
 - pthreads (POSIX threads)
 - Python 3 (for `verify_benchmark.py`)
 
@@ -45,7 +61,7 @@ The easiest way to build — especially on Raspberry Pi — is to use the **setu
 ### Manual Build
 
 ```bash
-make                    # Build (default: USE_PQCLEAN=1, libsodium HKDF)
+make                    # Build (default: USE_PQCLEAN=1, libsodium HKDF+SHA-256)
 make USE_PQCLEAN=1 -j$(nproc)   # Explicit PQClean path
 make clean              # Clean application objects
 make lib-clean          # Clean everything (app + uoscore-uedhoc build)
@@ -203,13 +219,13 @@ All five variants share the same underlying libraries to ensure a fair compariso
 | Operation         | Classic (Type 0/3)                        | PQ (Type 0/3)                | Hybrid (Type 3)                        |
 |-------------------|--------------------------------------------|------------------------------|-----------------------------------------|
 | **ECDH / KeyGen** | libsodium `crypto_scalarmult`              | —                            | libsodium `crypto_scalarmult`           |
-| **HKDF**          | libsodium HMAC-SHA256                      | mbedTLS PSA HMAC             | libsodium HMAC-SHA256                   |
-| **Hash (SHA-256)**| mbedTLS PSA `psa_hash_compute`             | mbedTLS PSA `psa_hash_compute`| mbedTLS PSA `psa_hash_compute`          |
+| **HKDF**          | libsodium HMAC-SHA256                      | libsodium HMAC-SHA256        | libsodium HMAC-SHA256                   |
+| **Hash (SHA-256)**| libsodium `crypto_hash_sha256`             | libsodium `crypto_hash_sha256`| libsodium `crypto_hash_sha256`          |
 | **AEAD (AES-CCM)**| mbedTLS PSA `psa_aead_*`                   | mbedTLS PSA `psa_aead_*`     | mbedTLS PSA `psa_aead_*`                |
 | **KEM (ML-KEM-768)**| —                                       | PQClean                      | PQClean                                 |
 | **Signature**     | libsodium Ed25519                          | PQClean ML-DSA-65            | — (MAC-only)                            |
 
-The hybrid handshake (`edhoc_type3_hybrid.c`) calls the same `crypto_wrapper.h` functions (libsodium HKDF, mbedTLS AEAD/Hash) as classic Type 3, and PQClean KEM as PQ Type 3. The benchmark micro-benchmarks (`bench_ecdh`, `bench_hkdf`, `bench_hash`, `bench_encap`, `bench_decap`, `bench_pq_*`) use the identical call path, so measured times reflect the same overhead.
+The hybrid handshake (`edhoc_type3_hybrid.c`) calls the same `crypto_wrapper.h` functions (libsodium HKDF/Hash, mbedTLS AEAD) as classic Type 3, and PQClean KEM as PQ Type 3. The benchmark micro-benchmarks (`bench_ecdh`, `bench_hkdf`, `bench_hash`, `bench_encap`, `bench_decap`, `bench_pq_*`) use the identical call path, so measured times reflect the same overhead.
 
 - **Scope of timings.** Benchmarks measure crypto only (no CBOR encode/decode, no network I/O, no PSA setup in the handshake itself).
 
