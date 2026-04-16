@@ -36,6 +36,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <signal.h>
 
 #include "edhoc_benchmark_p2p.h"
@@ -67,6 +68,57 @@ static inline uint64_t p2p_cpu_ns(void) {
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 static inline double p2p_us(uint64_t a, uint64_t b) { return (double)(b-a)/1000.0; }
+
+/* =============================================================================
+ * Quiet guard (suppress library debug/dump prints during benchmark hot paths)
+ * ========================================================================== */
+struct p2p_quiet_guard {
+	int stdout_saved;
+	int stderr_saved;
+	int null_fd;
+};
+
+static void p2p_quiet_begin(struct p2p_quiet_guard *g)
+{
+	g->stdout_saved = -1;
+	g->stderr_saved = -1;
+	g->null_fd = -1;
+
+	fflush(stdout);
+	fflush(stderr);
+
+	g->stdout_saved = dup(STDOUT_FILENO);
+	g->stderr_saved = dup(STDERR_FILENO);
+	g->null_fd = open("/dev/null", O_WRONLY);
+
+	if (g->null_fd >= 0) {
+		if (g->stdout_saved >= 0)
+			dup2(g->null_fd, STDOUT_FILENO);
+		if (g->stderr_saved >= 0)
+			dup2(g->null_fd, STDERR_FILENO);
+	}
+}
+
+static void p2p_quiet_end(struct p2p_quiet_guard *g)
+{
+	fflush(stdout);
+	fflush(stderr);
+
+	if (g->stdout_saved >= 0) {
+		dup2(g->stdout_saved, STDOUT_FILENO);
+		close(g->stdout_saved);
+		g->stdout_saved = -1;
+	}
+	if (g->stderr_saved >= 0) {
+		dup2(g->stderr_saved, STDERR_FILENO);
+		close(g->stderr_saved);
+		g->stderr_saved = -1;
+	}
+	if (g->null_fd >= 0) {
+		close(g->null_fd);
+		g->null_fd = -1;
+	}
+}
 
 /* =============================================================================
  * TCP helpers (P2P: server uses INADDR_ANY, client uses remote IP)
@@ -193,7 +245,13 @@ static struct p2p_hs_result p2p_classic_initiator(int type, const char *host, in
 		cr.pk.len=T1_RFC9529__PK_R_LEN; cr.pk.ptr=(uint8_t*)T1_RFC9529__PK_R;
 		cr.g.len=0; cr.g.ptr=NULL; cr.ca.len=0; cr.ca.ptr=NULL; cr.ca_pk.len=0; cr.ca_pk.ptr=NULL;
 		struct cred_array ca={.len=1,.ptr=&cr};
-		result = edhoc_initiator_run(&ci, &ca, &err_msg, &prk_out, p2p_tx, p2p_rx, ead_process);
+		{
+			struct p2p_quiet_guard qg;
+			p2p_quiet_begin(&qg);
+			result = edhoc_initiator_run(&ci, &ca, &err_msg, &prk_out,
+						     p2p_tx, p2p_rx, ead_process);
+			p2p_quiet_end(&qg);
+		}
 	} else {
 		struct edhoc_initiator_context ci; memset(&ci,0,sizeof(ci));
 		ci.sock=NULL; ci.method=(enum method_type)T3_X25519_METHOD;
@@ -213,7 +271,13 @@ static struct p2p_hs_result p2p_classic_initiator(int type, const char *host, in
 		cr.g.len=T3_X25519_G_R_LEN; cr.g.ptr=(uint8_t*)T3_X25519_G_R;
 		cr.pk.len=0; cr.pk.ptr=NULL; cr.ca.len=0; cr.ca.ptr=NULL; cr.ca_pk.len=0; cr.ca_pk.ptr=NULL;
 		struct cred_array ca={.len=1,.ptr=&cr};
-		result = edhoc_initiator_run(&ci, &ca, &err_msg, &prk_out, p2p_tx, p2p_rx, ead_process);
+		{
+			struct p2p_quiet_guard qg;
+			p2p_quiet_begin(&qg);
+			result = edhoc_initiator_run(&ci, &ca, &err_msg, &prk_out,
+						     p2p_tx, p2p_rx, ead_process);
+			p2p_quiet_end(&qg);
+		}
 	}
 	uint64_t we=p2p_time_ns(), ce=p2p_cpu_ns();
 	close(_p2p_fd); _p2p_fd=-1;
@@ -254,7 +318,13 @@ static struct p2p_hs_result p2p_classic_responder(int type, int listen_fd)
 		ci.pk.len=T1_RFC9529__PK_I_LEN; ci.pk.ptr=(uint8_t*)T1_RFC9529__PK_I;
 		ci.g.len=0; ci.g.ptr=NULL; ci.ca.len=0; ci.ca.ptr=NULL; ci.ca_pk.len=0; ci.ca_pk.ptr=NULL;
 		struct cred_array ca={.len=1,.ptr=&ci};
-		result = edhoc_responder_run(&cr, &ca, &err_msg, &prk_out, p2p_tx, p2p_rx, ead_process);
+		{
+			struct p2p_quiet_guard qg;
+			p2p_quiet_begin(&qg);
+			result = edhoc_responder_run(&cr, &ca, &err_msg, &prk_out,
+						     p2p_tx, p2p_rx, ead_process);
+			p2p_quiet_end(&qg);
+		}
 	} else {
 		struct edhoc_responder_context cr; memset(&cr,0,sizeof(cr));
 		cr.sock=NULL;
@@ -274,7 +344,13 @@ static struct p2p_hs_result p2p_classic_responder(int type, int listen_fd)
 		ci.g.len=T3_X25519_G_I_LEN; ci.g.ptr=(uint8_t*)T3_X25519_G_I;
 		ci.pk.len=0; ci.pk.ptr=NULL; ci.ca.len=0; ci.ca.ptr=NULL; ci.ca_pk.len=0; ci.ca_pk.ptr=NULL;
 		struct cred_array ca={.len=1,.ptr=&ci};
-		result = edhoc_responder_run(&cr, &ca, &err_msg, &prk_out, p2p_tx, p2p_rx, ead_process);
+		{
+			struct p2p_quiet_guard qg;
+			p2p_quiet_begin(&qg);
+			result = edhoc_responder_run(&cr, &ca, &err_msg, &prk_out,
+						     p2p_tx, p2p_rx, ead_process);
+			p2p_quiet_end(&qg);
+		}
 	}
 	uint64_t we=p2p_time_ns(), ce=p2p_cpu_ns();
 	close(_p2p_fd); _p2p_fd=-1;
