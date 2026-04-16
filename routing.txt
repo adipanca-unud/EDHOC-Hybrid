@@ -11,7 +11,7 @@ echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-edhoc-forward.conf
 
 sudo sysctl --system
 
-sudo iptables -t nat -A PREROUTING -p tcp -d 192.168.0.116 --dport 15000:20849 -j DNAT --to-destination 192.168.64.33
+sudo iptables -t nat -A PREROUTING -p tcp -d 192.168.200.155 --dport 15000:20849 -j DNAT --to-destination 192.168.64.33
 
 sudo iptables -A FORWARD -p tcp -d 192.168.64.33 --dport 15000:20849 -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
 
